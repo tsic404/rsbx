@@ -122,3 +122,17 @@ func TestParseShareNetwork(t *testing.T) {
 		t.Fatal("non-boolean accepted")
 	}
 }
+
+func TestParseUnshareUser(t *testing.T) {
+	cfg, err := Parse("[sandbox]\nunshare_user = false\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sandbox.UnshareUser {
+		t.Fatal("unshare_user = false not applied")
+	}
+	d := Default()
+	if !d.Sandbox.UnshareUser {
+		t.Fatal("unshare_user must default to true")
+	}
+}

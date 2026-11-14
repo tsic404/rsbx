@@ -138,6 +138,9 @@ jobs:
           # keeps the host one. Only the network is shared; mounts, pid, ipc
           # and uts are still unshared.
           share_network = true
+          # Likewise for the user namespace: the outer runtime already
+          # created one, and GitHub refuses a nested uid map.
+          unshare_user = false
           CFG
           docker run --rm --privileged \
             -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \

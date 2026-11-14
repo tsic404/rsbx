@@ -70,6 +70,11 @@ type Sandbox struct {
 	// over the network (the ssh transport does this automatically), or when
 	// the host cannot create a network namespace, as some containers cannot.
 	ShareNetwork bool `json:"share_network"`
+	// UnshareUser creates a user namespace for the sandbox. Outside a
+	// container that is what allows it to run unprivileged. Inside one the
+	// runtime has already done it, and nested creation is refused on some
+	// hosts (GitHub Actions refuses the uid map outright), so it is skipped.
+	UnshareUser bool `json:"unshare_user"`
 }
 
 // Default returns a working configuration for a first run.
@@ -81,8 +86,12 @@ func Default() *Config {
 			Allow: []string{"/usr/bin", "/bin", "/usr/lib", "/lib", "/usr/lib64", "/lib64"},
 			Entry: "/bin/sh",
 		},
-		Remote:  Remote{Root: "/"},
-		Sandbox: Sandbox{Mount: filepath.Join(home, ".rsbx", "sandbox"), Share: filepath.Join(home, ".rsbx", "share")},
+		Remote: Remote{Root: "/"},
+		Sandbox: Sandbox{
+			Mount:       filepath.Join(home, ".rsbx", "sandbox"),
+			Share:       filepath.Join(home, ".rsbx", "share"),
+			UnshareUser: true,
+		},
 	}
 }
 
@@ -225,6 +234,13 @@ func assign(cfg *Config, table, key, raw string) error {
 				return err
 			}
 			cfg.Sandbox.ShareNetwork = v
+			return nil
+		case "unshare_user":
+			v, err := parseBool(raw)
+			if err != nil {
+				return err
+			}
+			cfg.Sandbox.UnshareUser = v
 			return nil
 		}
 	case "":

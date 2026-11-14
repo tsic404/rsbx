@@ -306,16 +306,17 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 	args = append(args,
 		"--proc", "/proc",
 		"--dev", "/dev",
-		// -try variants degrade instead of refusing to start. Inside a
-		// container the outer runtime already provides these namespaces and
-		// nested creation is often forbidden; the sandbox then keeps what it
-		// was given, which is strictly more isolation than the host.
-		"--unshare-user-try",
+		// pid, ipc and uts never need elevated rights, so they are always
+		// created. The other namespaces may already exist in an outer
+		// runtime, where creating them again is sometimes refused.
 		"--unshare-pid",
 		"--unshare-ipc",
 		"--unshare-uts",
 		"--unshare-cgroup-try",
 	)
+	if p.Cfg.Sandbox.UnshareUser {
+		args = append(args, "--unshare-user-try")
+	}
 	// A sandbox gets its own network namespace unless the caller needs the
 	// host one: the ssh transport always does, and some containers cannot
 	// create a namespace at all.
