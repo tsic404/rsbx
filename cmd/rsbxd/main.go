@@ -3,6 +3,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -11,12 +12,20 @@ import (
 	"rsbx/internal/daemon"
 )
 
+// version is injected at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
+	showVer := flag.Bool("version", false, "print the version and exit")
 	sock := flag.String("socket", "", "unix socket to listen on (empty = stdio)")
 	root := flag.String("root", "", "remote root directory")
 	stdio := flag.Bool("stdio", false, "serve a single session over stdin/stdout")
 	flag.Parse()
 
+	if *showVer {
+		fmt.Println("rsbxd", version)
+		return
+	}
 	if *root == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {

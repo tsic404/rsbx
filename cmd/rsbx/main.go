@@ -13,13 +13,22 @@ import (
 	"rsbx/internal/sandbox"
 )
 
+// version is injected at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	var (
 		cfgPath = flag.String("config", "", "configuration file (default ~/.rsbx/config.toml)")
 		noMount = flag.Bool("no-mount", false, "print the computed plan and exit")
 		serve   = flag.Bool("serve", false, "mount the sandbox root and stay running (test aid)")
+		showVer = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
+
+	if *showVer {
+		fmt.Println("rsbx", version)
+		return
+	}
 
 	exe, err := os.Executable()
 	if err != nil {

@@ -98,8 +98,9 @@ func Parse(src string) (*Config, error) {
 	cfg := Default()
 	cfg.Local.Allow = nil
 	table := ""
-	for i, raw := range strings.Split(src, "\n") {
-		line := strings.TrimSpace(raw)
+	lines := strings.Split(src, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -116,6 +117,22 @@ func Parse(src string) (*Config, error) {
 		}
 		key := strings.TrimSpace(line[:eq])
 		val := strings.TrimSpace(line[eq+1:])
+
+		// An array may span lines; keep consuming until the brackets balance,
+		// counting only brackets that are outside a quoted string.
+		if strings.HasPrefix(val, "[") && !balanced(val) {
+			start := i + 1
+			for i+1 < len(lines) {
+				i++
+				val += "\n" + strings.TrimSpace(stripComment(lines[i]))
+				if balanced(val) {
+					break
+				}
+			}
+			if !balanced(val) {
+				return nil, fmt.Errorf("line %d: unterminated array", start)
+			}
+		}
 		if err := assign(cfg, table, key, val); err != nil {
 			return nil, fmt.Errorf("line %d: %w", i+1, err)
 		}
@@ -202,6 +219,46 @@ func assign(cfg *Config, table, key, raw string) error {
 		return fmt.Errorf("key %q outside a table", key)
 	}
 	return fmt.Errorf("unknown key %s.%s", table, key)
+}
+
+// balanced reports whether every '[' in s is matched by a ']', ignoring
+// brackets inside double quotes.
+func balanced(s string) bool {
+	depth, inQuote, escaped := 0, false, false
+	for _, r := range s {
+		switch {
+		case escaped:
+			escaped = false
+		case r == '\\' && inQuote:
+			escaped = true
+		case r == '"':
+			inQuote = !inQuote
+		case inQuote:
+		case r == '[':
+			depth++
+		case r == ']':
+			depth--
+		}
+	}
+	return depth == 0 && !inQuote
+}
+
+// stripComment removes a trailing # comment that is outside a quoted string.
+func stripComment(s string) string {
+	inQuote, escaped := false, false
+	for i, r := range s {
+		switch {
+		case escaped:
+			escaped = false
+		case r == '\\' && inQuote:
+			escaped = true
+		case r == '"':
+			inQuote = !inQuote
+		case r == '#' && !inQuote:
+			return s[:i]
+		}
+	}
+	return s
 }
 
 func parseString(raw string) (string, error) {

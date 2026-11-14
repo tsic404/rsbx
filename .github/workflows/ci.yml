@@ -1,0 +1,168 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # The sandbox itself needs unprivileged user namespaces and /dev/fuse,
+      # which a normal runner does not provide. The unit tests cover the
+      # policies and the protocol, so they run here; the sandbox test runs in
+      # the docker job below, where the container can be given the devices.
+      - name: go test
+        run: go test -race ./...
+
+  binaries:
+    name: static binaries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X main.version=${{ github.sha }}" -o dist/rsbx ./cmd/rsbx
+          go build -trimpath -ldflags="-s -w -X main.version=${{ github.sha }}" -o dist/rsbxd ./cmd/rsbxd
+          go build -trimpath -ldflags="-s -w" -o dist/rsbx-tramp ./cmd/rsbx-tramp
+          go build -trimpath -ldflags="-s -w" -o dist/rsbx-guard ./cmd/rsbx-guard
+
+      - name: verify the binaries are static
+        run: |
+          for b in dist/*; do
+            if file "$b" | grep -q "dynamically linked"; then
+              echo "$b is dynamically linked; the trampoline must not be"
+              exit 1
+            fi
+          done
+
+      - name: smoke test
+        run: |
+          ./dist/rsbx -version
+          ./dist/rsbxd -version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsbx-linux-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: rsbx:ci
+          build-args: |
+            VERSION=${{ github.sha }}
+
+      - name: the image runs
+        run: |
+          docker run --rm rsbx:ci -version
+
+      # A sandbox needs /dev/fuse plus an unprivileged user namespace, so the
+      # container runs privileged. This exercises the real path: a daemon
+      # serves a remote tree, the client mounts it over FUSE, and a local
+      # shell reads a file that only exists on the daemon side.
+      - name: sandbox end to end
+        run: |
+          mkdir -p e2e/tree e2e/home/localrw e2e/home/sandbox
+          echo REMOTE-MARKER > e2e/tree/remote.txt
+          echo LOCAL-CONTENT > e2e/home/localrw/local.txt
+          chmod -R 777 e2e
+          cat > e2e/config.toml <<'CFG'
+          [daemon]
+          transport = "unix"
+          socket = "/e2e/home/d.sock"
+
+          [local]
+          allow = ["/usr/bin/bash", "/usr/bin/env", "/usr/bin/true"]
+          paths = ["/e2e/home/localrw"]
+          read_only_paths = ["/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
+          entry = "/usr/bin/bash"
+
+          [remote]
+          root = "/e2e/tree"
+
+          [sandbox]
+          mount = "/e2e/home/sandbox"
+          share = "/e2e/home/share"
+          CFG
+          docker run --rm --privileged \
+            -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
+            --entrypoint /bin/bash rsbx:ci -c '
+              mkdir -p /e2e/home/sandbox
+              rsbxd -socket /e2e/home/d.sock -root /e2e/tree >/tmp/daemon.log 2>&1 &
+              sleep 2
+              rsbx -config /e2e/config.toml -- /usr/bin/bash -c "
+                echo \"local shell: \$(readlink /proc/self/exe)\"
+                echo \"local tree:  \$(cat < /e2e/home/localrw/local.txt)\"
+                echo \"remote file: \$(/usr/bin/cat /remote.txt)\"
+                test \"\$(/usr/bin/cat /remote.txt)\" = REMOTE-MARKER
+              "
+            ' | tee out.txt
+          grep -q "remote file: REMOTE-MARKER" out.txt
+
+      - name: log in to ghcr
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: push
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}

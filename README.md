@@ -93,7 +93,47 @@ CGO_ENABLED=0 go build -o rsbx-guard ./cmd/rsbx-guard
 ```
 
 Install all four in one directory; `rsbx` looks for its helpers next to
-itself.
+itself. `-ldflags "-X main.version=..."` stamps the client and the daemon.
+
+## Container image
+
+`Dockerfile` produces one image that carries both ends of the sandbox.
+
+```sh
+docker build -t rsbx .
+docker run --rm -it --privileged -v /dev/fuse rsbx      # client
+docker run --rm --entrypoint rsbxd -v /srv/tree:/tree rsbx \
+  -socket /run/rsbx.sock -root /tree                     # daemon
+```
+
+The client needs `--privileged` (or `--cap-add SYS_ADMIN` plus an
+unprivileged user namespace) and `/dev/fuse`: it mounts the sandbox root and
+runs programs inside it. The daemon needs neither.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+| job | what it proves |
+|---|---|
+| `test` | gofmt, `go vet`, `go test -race ./...` |
+| `binaries` | all four build statically and report a version |
+| `docker` | the image builds, and a sandbox runs inside it end to end |
+
+The last one is the only place the sandbox is actually exercised: it needs
+`/dev/fuse` and a user namespace, which a bare runner does not provide. On
+`main` the image is pushed to `ghcr.io/<owner>/rsbx`.
+
+## Tests
+
+```sh
+go test ./...
+```
+
+The suite pins the decisions that are easy to get silently wrong: which paths
+are local, that a bind never shadows an exec directory, that the dynamic loader
+is never turned into a trampoline, and that the daemon never lets a path escape
+its root.
 
 ## Run
 

@@ -68,3 +68,44 @@ func TestMissingFileYieldsDefaults(t *testing.T) {
 		t.Fatal("defaults not applied")
 	}
 }
+
+// The shipped example uses multi-line arrays, because a long allowlist is
+// unreadable on one line. The parser has to accept that form.
+func TestParseMultiLineArray(t *testing.T) {
+	src := `
+[local]
+allow = [
+  "/usr/bin/bash",   # a comment after an element
+  "/usr/bin/env",
+]
+paths = [
+  "/work",
+]
+`
+	cfg, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/usr/bin/bash", "/usr/bin/env"}
+	if strings.Join(cfg.Local.Allow, ",") != strings.Join(want, ",") {
+		t.Errorf("allow = %v, want %v", cfg.Local.Allow, want)
+	}
+	if len(cfg.Local.Paths) != 1 || cfg.Local.Paths[0] != "/work" {
+		t.Errorf("paths = %v", cfg.Local.Paths)
+	}
+}
+
+func TestParseRejectsUnterminatedArray(t *testing.T) {
+	if _, err := Parse("[local]\nallow = [\n  \"/a\",\n"); err == nil {
+		t.Fatal("unterminated array accepted")
+	}
+}
+
+func TestBalancedIgnoresBracketsInStrings(t *testing.T) {
+	if !balanced(`["[a]"]`) {
+		t.Error("brackets inside a string counted")
+	}
+	if balanced(`["a"`) {
+		t.Error("unclosed array seen as balanced")
+	}
+}
