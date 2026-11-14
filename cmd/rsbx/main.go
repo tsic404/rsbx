@@ -1,0 +1,96 @@
+// Command rsbx gives the caller a shell whose stdout, filesystem and child
+// processes live on the daemon — except the programs listed in local.allow.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"rsbx/internal/config"
+	"rsbx/internal/proto"
+	"rsbx/internal/sandbox"
+)
+
+func main() {
+	var (
+		cfgPath = flag.String("config", "", "configuration file (default ~/.rsbx/config.toml)")
+		noMount = flag.Bool("no-mount", false, "print the computed plan and exit")
+		serve   = flag.Bool("serve", false, "mount the sandbox root and stay running (test aid)")
+	)
+	flag.Parse()
+
+	exe, err := os.Executable()
+	if err != nil {
+		fatal(err)
+	}
+	exeDir, err := filepath.EvalSymlinks(filepath.Dir(exe))
+	if err != nil {
+		exeDir = filepath.Dir(exe)
+	}
+	path := *cfgPath
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fatal(err)
+		}
+		path = filepath.Join(home, ".rsbx", "config.toml")
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		fatal(fmt.Errorf("%s: %w", path, err))
+	}
+	plan, err := sandbox.Prepare(cfg, exeDir)
+	if err != nil {
+		fatal(err)
+	}
+	if *noMount {
+		fmt.Print(plan.Explain())
+		return
+	}
+	// make sure the daemon answers before mounting, so a dead daemon is a
+	// clear error instead of a hanging filesystem
+	if _, err := plan.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: "/"}); err != nil {
+		fatal(fmt.Errorf("daemon unreachable (%s): %w", cfg.Daemon.EffectiveEndpoint(), err))
+	}
+	srv, err := plan.MountRoot()
+	if err != nil {
+		fatal(fmt.Errorf("mount %s: %w", plan.Mount, err))
+	}
+	defer srv.Unmount()
+	if os.Getenv("RSBX_DEBUG_MOUNT") != "" {
+		ents, err := os.ReadDir(plan.Mount)
+		fmt.Fprintf(os.Stderr, "rsbx: mount ready, %d entries, err=%v\n", len(ents), err)
+		if sub, err := os.ReadDir(plan.Mount + "/usr/bin"); err == nil {
+			fmt.Fprintf(os.Stderr, "rsbx: /usr/bin has %d entries\n", len(sub))
+		} else {
+			fmt.Fprintf(os.Stderr, "rsbx: /usr/bin: %v\n", err)
+		}
+		fmt.Fprintf(os.Stderr, "rsbx: bwrap argv = %q\n", plan.BwrapArgs(flag.Args()))
+	}
+
+	if *serve {
+		// Keep the filesystem mounted without starting any program, so the
+		// mount can be inspected on its own.
+		select {}
+	}
+	argv := flag.Args()
+	if len(argv) == 0 {
+		entry := cfg.Local.Entry
+		if entry == "" {
+			entry = "/bin/sh"
+		}
+		argv = []string{entry}
+	}
+	code, err := plan.Run(argv)
+	if err != nil {
+		fatal(err)
+	}
+	os.Exit(code)
+}
+
+func fatal(err error) {
+	fmt.Fprintln(os.Stderr, "rsbx:", err)
+	os.Exit(1)
+}

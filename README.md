@@ -1,0 +1,118 @@
+# rsbx — a shell whose world is the daemon's
+
+`rsbx` gives you an interactive shell that behaves like an ssh session: the
+filesystem you see, the processes you start, and the output you read all live
+on a remote daemon. The exception is the list of programs in the configuration
+file: those run **on your machine**, with the host toolchain and the host
+kernel, but they still read and write the remote tree.
+
+```
+$ rsbx                       # drop into the sandbox shell
+[rsbx] /proj $ git status    # git is local, the repo is remote
+[rsbx] /proj $ make          # make is local, its children run remotely
+```
+
+## Two lists, two questions
+
+**Where does it run?** Decided by `local.allow`, on the absolute path of the
+executable.
+
+**Whose files does it see?** Decided by `local.paths` and `local.read_only_paths`,
+on the absolute path being opened.
+
+The two lists are independent, and that is the point: a local program reads
+both the local trees and (through the sandbox filesystem) the daemon tree,
+while a program running on the daemon only ever sees the remote tree.
+
+| program | runs on | sees |
+|---|---|---|
+| in `local.allow` | your machine | local trees, plus the daemon tree over FUSE |
+| anything else | the daemon | only the daemon tree |
+| path in `local.paths` | — | served from this machine, read/write |
+| path in `local.read_only_paths` | — | served from this machine, read-only |
+| any other path | — | answered by the daemon |
+
+## How it is implemented
+
+```mermaid
+flowchart TB
+  subgraph client["your machine"]
+    shell["shell (local, allowlisted)"]
+    fuse["FUSE root<br/>daemon tree + host toolchain<br/>+ trampolines"]
+    guard["rsbx-guard<br/>Landlock exec allowlist"]
+    tramp["rsbx-tramp<br/>static, served as every<br/>non-allowlisted name"]
+    shell -- "open /proj/x.c" --> fuse
+    shell -- "exec ls" --> tramp
+    fuse -. "mounted as / by bwrap" .- guard
+    guard --> shell
+  end
+  subgraph remote["daemon host"]
+    d["rsbxd<br/>executes argv, owns the tree"]
+    tree[("remote root<br/>mounted as / for children")]
+    d --> tree
+  end
+  fuse == "fs frames" ==> d
+  tramp == "exec session" ==> d
+```
+
+Three mechanisms, each independently sufficient for its own job:
+
+1. **Trampolines.** The sandbox's `/usr/bin/ls` *is* a small static binary, not
+   the host `ls`. Executing it asks the daemon to run `ls`. Because the host
+   file is not reachable under that name at all, this works for statically
+   linked programs and for execs that bypass libc.
+2. **Union filesystem.** The sandbox root is a FUSE mount: paths the daemon
+   owns are answered over the wire, host directories (`/usr/lib`, `/etc`, …)
+   are served read-only, and executable names are resolved through the policy.
+3. **Landlock (backstop).** `rsbx-guard` installs an exec allowlist inside the
+   sandbox, so an exec that somehow skips the trampoline is refused by the
+   kernel rather than silently running a host binary.
+
+The daemon jails its children with bwrap so that `/` means the same thing on
+both sides: a path you see in the sandbox is a path the daemon can open.
+
+## The surprising part: `/` is the same on both sides
+
+The client mounts the sandbox view at `~/.rsbx/sandbox`, then bwrap re-mounts
+*that* as `/`. The daemon does the same with its root. Neither side translates
+paths; a sandbox-absolute path is sent verbatim.
+
+## Requirements
+
+* Linux ≥ 5.13 for Landlock (older kernels degrade to trampoline-only).
+* `bubblewrap`, `fusermount3`, unprivileged user namespaces.
+* Go ≥ 1.24 to build.
+
+## Build
+
+```sh
+go build -o rsbx       ./cmd/rsbx
+go build -o rsbxd      ./cmd/rsbxd
+CGO_ENABLED=0 go build -o rsbx-tramp ./cmd/rsbx-tramp
+CGO_ENABLED=0 go build -o rsbx-guard ./cmd/rsbx-guard
+```
+
+Install all four in one directory; `rsbx` looks for its helpers next to
+itself.
+
+## Run
+
+```sh
+rsbxd -socket ~/.rsbx/daemon.sock -root ~/remote-tree &   # on the daemon host
+rsbx -config ~/.rsbx/config.toml                          # on your machine
+```
+
+Use `rsbx -no-mount` to print the resolved plan (allowlist, mount, bwrap
+arguments) without starting anything.
+
+## Limits worth knowing
+
+* **Writes are whole-file.** Edits land on `close`/`release`; there is no byte
+  range protocol yet, so very large remote files are copied in full.
+* **Metadata is cached.** Lookups are answered from the daemon with a short
+  TTL; a file changed on the daemon may stay stale for that window.
+* **Landlock needs a recent kernel.** On older kernels the trampoline is the
+  only guard, and a program that calls `execve` by raw syscall on a host path
+  outside the FUSE root could still run locally.
+* **The daemon trusts the client.** It executes whatever argv it receives;
+  it is a remote shell, not a multi-tenant service.

@@ -1,0 +1,41 @@
+# rsbx — a shell whose view of the machine is the daemon's, except for the
+# programs and paths listed under [local].
+
+[daemon]
+# "unix"  : rsbxd listens on a socket on this machine
+# "ssh"   : rsbxd is started by ssh and speaks over its stdio
+transport = "unix"
+socket    = "~/.rsbx/daemon.sock"
+# transport = "ssh"
+# command   = "ssh build@company-01 /home/tsic/rsbx-client/dist/rsbxd -stdio -root /home/tsic/remote-tree"
+
+[local]
+# -- which programs run HERE --
+# Anything not listed executes on the daemon, including static binaries.
+allow = [
+  "/usr/bin/bash",
+  "/usr/bin/env",
+  "/usr/bin/git",
+  "/usr/bin/make",
+  "/usr/bin/ssh",
+]
+# The shell started when no command is given.
+entry = "/usr/bin/bash"
+
+# -- which files are LOCAL --
+# These trees are read and written on this machine: no round trip, and a
+# redirected program on the daemon cannot see them at all.
+paths = [
+  "/home/me/work",
+]
+# Toolchain and device trees: served locally but read-only.
+read_only_paths = [
+  "/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc",
+]
+
+[remote]
+root = "/home/tsic/remote-tree"
+
+[sandbox]
+mount = "~/.rsbx/sandbox"
+share = "~/.rsbx/share"

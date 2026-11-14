@@ -1,0 +1,9 @@
+# build output
+/rsbx
+/rsbxd
+/rsbx-tramp
+/rsbx-guard
+/dist/
+
+# runtime state the sandbox creates
+/.rsbx/
