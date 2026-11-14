@@ -71,7 +71,7 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	machine, err := paths.New(cfg.Local.ReadOnlyPaths, true)
+	machine, err := paths.New(append(append([]string(nil), cfg.Local.ReadOnlyPaths...), linkTargets()...), true)
 	if err != nil {
 		return nil, err
 	}
@@ -309,6 +309,8 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 		"--unshare-all",
 	)
 	if p.Cfg.Daemon.Transport == "ssh" {
+		// The trampoline reaches the daemon over ssh, so this sandbox must keep
+		// the host network namespace.
 		args = append(args, "--share-net")
 	}
 	args = append(args,
@@ -418,6 +420,37 @@ func (p *Plan) SandboxExecPaths() []string {
 		add(r)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// linkTargets returns the directories holding the merged-usr link targets and
+// the dynamic loaders. A local program cannot start without the loader, and
+// distributions scatter it across /lib, /lib64 and /usr/lib/<triplet>.
+func linkTargets() []string {
+	var out []string
+	add := func(p string) {
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			out = append(out, filepath.Clean(p))
+		}
+	}
+	for _, link := range []string{"/lib", "/lib64", "/bin", "/sbin"} {
+		target, err := os.Readlink(link)
+		if err != nil {
+			// Not a symlink: the directory itself is the local tree.
+			add(link)
+			continue
+		}
+		abs := target
+		if !strings.HasPrefix(abs, "/") {
+			abs = filepath.Join(filepath.Dir(link), target)
+		}
+		add(abs)
+	}
+	for _, p := range loaderPaths() {
+		if _, err := os.Stat(p); err == nil {
+			add(filepath.Dir(p))
+		}
+	}
 	return out
 }
 

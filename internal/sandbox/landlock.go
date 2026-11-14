@@ -56,7 +56,7 @@ func addPathBeneath(ruleset int, path string) error {
 // dynamically linked ELF is executed through one, so denying it would deny the
 // allowlist too.
 func loaderPaths() []string {
-	return []string{
+	paths := []string{
 		"/lib64/ld-linux-x86-64.so.2",
 		"/lib/ld-linux-x86-64.so.2",
 		"/lib/ld-linux-aarch64.so.1",
@@ -66,6 +66,14 @@ func loaderPaths() []string {
 		"/usr/lib/ld-linux-x86-64.so.2",
 		"/usr/lib64/ld-linux-x86-64.so.2",
 	}
+	// Debian and Ubuntu keep the loader under a multiarch directory, which
+	// cannot be enumerated without knowing the triplet.
+	for _, triplet := range []string{"x86_64-linux-gnu", "aarch64-linux-gnu", "i386-linux-gnu", "riscv64-linux-gnu"} {
+		paths = append(paths,
+			"/usr/lib/"+triplet+"/ld-linux-x86-64.so.2",
+			"/usr/lib/"+triplet+"/ld-linux-aarch64.so.1")
+	}
+	return paths
 }
 
 // ApplyLandlock installs the ruleset on the calling process, so every child
