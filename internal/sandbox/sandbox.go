@@ -306,13 +306,23 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 	args = append(args,
 		"--proc", "/proc",
 		"--dev", "/dev",
-		"--unshare-all",
+		// -try variants degrade instead of refusing to start. Inside a
+		// container the outer runtime already provides these namespaces and
+		// nested creation is often forbidden; the sandbox then keeps what it
+		// was given, which is strictly more isolation than the host.
+		"--unshare-user-try",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
+		"--unshare-cgroup-try",
 	)
 	// A sandbox gets its own network namespace unless the caller needs the
 	// host one: the ssh transport always does, and some containers cannot
 	// create a namespace at all.
 	if p.Cfg.Daemon.Transport == "ssh" || p.Cfg.Sandbox.ShareNetwork {
 		args = append(args, "--share-net")
+	} else {
+		args = append(args, "--unshare-net-try")
 	}
 	args = append(args,
 		"--die-with-parent",
