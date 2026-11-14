@@ -109,3 +109,16 @@ func TestBalancedIgnoresBracketsInStrings(t *testing.T) {
 		t.Error("unclosed array seen as balanced")
 	}
 }
+
+func TestParseShareNetwork(t *testing.T) {
+	cfg, err := Parse("[sandbox]\nshare_network = true\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Sandbox.ShareNetwork {
+		t.Fatal("share_network not applied")
+	}
+	if _, err := Parse("[sandbox]\nshare_network = yes\n"); err == nil {
+		t.Fatal("non-boolean accepted")
+	}
+}

@@ -133,6 +133,11 @@ jobs:
           [sandbox]
           mount = "/e2e/home/sandbox"
           share = "/e2e/home/share"
+          # The runner's privileged container cannot configure loopback in a
+          # fresh network namespace (RTM_NEWADDR is refused), so the sandbox
+          # keeps the host one. Only the network is shared; mounts, pid, ipc
+          # and uts are still unshared.
+          share_network = true
           CFG
           docker run --rm --privileged \
             -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \

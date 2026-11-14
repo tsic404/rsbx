@@ -65,6 +65,11 @@ type Sandbox struct {
 	Mount string `json:"mount"`
 	// Share is the directory that mirrors the remote tree locally (FUSE).
 	Share string `json:"share"`
+	// ShareNetwork keeps the host network namespace inside the sandbox
+	// instead of creating a private one. Set it when the daemon is reached
+	// over the network (the ssh transport does this automatically), or when
+	// the host cannot create a network namespace, as some containers cannot.
+	ShareNetwork bool `json:"share_network"`
 }
 
 // Default returns a working configuration for a first run.
@@ -214,6 +219,13 @@ func assign(cfg *Config, table, key, raw string) error {
 			return str(&cfg.Sandbox.Mount)
 		case "share":
 			return str(&cfg.Sandbox.Share)
+		case "share_network":
+			v, err := parseBool(raw)
+			if err != nil {
+				return err
+			}
+			cfg.Sandbox.ShareNetwork = v
+			return nil
 		}
 	case "":
 		return fmt.Errorf("key %q outside a table", key)
@@ -259,6 +271,16 @@ func stripComment(s string) string {
 		}
 	}
 	return s
+}
+
+func parseBool(raw string) (bool, error) {
+	switch strings.TrimSpace(raw) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("expected true or false")
 }
 
 func parseString(raw string) (string, error) {

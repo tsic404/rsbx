@@ -308,9 +308,10 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 		"--dev", "/dev",
 		"--unshare-all",
 	)
-	if p.Cfg.Daemon.Transport == "ssh" {
-		// The trampoline reaches the daemon over ssh, so this sandbox must keep
-		// the host network namespace.
+	// A sandbox gets its own network namespace unless the caller needs the
+	// host one: the ssh transport always does, and some containers cannot
+	// create a namespace at all.
+	if p.Cfg.Daemon.Transport == "ssh" || p.Cfg.Sandbox.ShareNetwork {
 		args = append(args, "--share-net")
 	}
 	args = append(args,
