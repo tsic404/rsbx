@@ -111,16 +111,22 @@ var _ = strings.HasPrefix
 // is believed.
 func openForRule(path string) (int, error) {
 	var err error
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < 12; attempt++ {
 		var fd int
 		fd, err = unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
 		if err == nil {
 			return fd, nil
 		}
-		if err == unix.ENOENT || err == unix.ENOTDIR {
-			return -1, err
-		}
-		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+		// ENOENT is retried like any other error. The path is read through the
+		// sandbox filesystem, which answers "no such file" for a moment while a
+		// dentry is being resolved; believing it dropped the rule, and the
+		// loader then had no execute grant at all. Every session that lost
+		// /lib/ld-linux-x86-64.so.2 this way failed the entry with
+		// "exec /bin/sh: permission denied", which points at nothing.
+		//
+		// The delay grows, because the window is a directory being built rather
+		// than a lost race: the second attempt is what most sessions need.
+		time.Sleep(time.Duration(attempt+1) * 4 * time.Millisecond)
 	}
 	return -1, err
 }

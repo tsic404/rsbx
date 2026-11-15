@@ -308,14 +308,21 @@ func mountDev(root string) error {
 		return fmt.Errorf("open dev dir: %w", err)
 	}
 	defer unix.Close(devfd)
+	// Every later operation on a target goes through this descriptor, as
+	// /proc/self/fd/N/name. Resolving the target by path again would look up
+	// the dentry the directory had before the tmpfs was mounted, which is the
+	// reason the bind failed with ENOENT for a file created a moment earlier.
+	via := func(name string) string {
+		return fmt.Sprintf("/proc/self/fd/%d/%s", devfd, name)
+	}
 	for _, name := range []string{"null", "zero", "full", "random", "urandom", "tty"} {
 		if err := unix.Mknodat(devfd, name, unix.S_IFREG|0o600, 0); err != nil && err != unix.EEXIST {
 			return fmt.Errorf("create /dev/%s: %w", name, err)
 		}
-		if err := unix.Mount(filepath.Join("/dev", name), filepath.Join(dev, name), "", unix.MS_BIND, ""); err != nil {
+		if err := unix.Mount(filepath.Join("/dev", name), via(name), "", unix.MS_BIND, ""); err != nil {
 			return fmt.Errorf("bind /dev/%s: %w", name, err)
 		}
-		if err := remountReadOnly(filepath.Join(dev, name)); err != nil {
+		if err := remountReadOnly(via(name)); err != nil {
 			return fmt.Errorf("read-only /dev/%s: %w", name, err)
 		}
 	}
