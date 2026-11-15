@@ -147,12 +147,12 @@ jobs:
       # local shell reads a file that only exists on the daemon side.
       - name: sandbox end to end
         run: |
-          docker network create rsbx-e2e
+          docker network create rsbx-e2e 2>/dev/null || true
           docker volume rm "$RUN_VOL" 2>/dev/null || true
           docker volume create "$PROJ_VOL"
           docker volume create "$RUN_VOL"
-          docker run --rm -v "$PROJ_VOL":/seed --entrypoint /bin/sh rsbx:ci \
-            -c 'printf REMOTE-MARKER > /seed/remote.txt'
+          docker run --rm --user 0 -v "$PROJ_VOL":/seed --entrypoint /bin/sh rsbx:ci \
+            -c 'printf REMOTE-MARKER > /seed/remote.txt && chmod 777 /seed/remote.txt'
           docker run -d --rm --name rsbxd --network rsbx-e2e \
             -v "$PROJ_VOL":/proj -v "$RUN_VOL":/run/rsbx \
             --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
@@ -167,7 +167,7 @@ jobs:
           # Scratch state lives in a second named volume: configs, cache and
           # mount points. Nothing on it is a project file.
           docker volume create rsbx-state
-          docker run --rm --privileged --network rsbx-e2e \
+          docker run --rm --privileged --user 0 --network rsbx-e2e \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/sandbox /e2e/state/cache
@@ -218,8 +218,10 @@ jobs:
                    && gcc -static -O1 -o /host/e2e/probes/durable_write testdata/probe/durable_write.c'
           chmod 777 e2e/probes
           # Seed the daemon's project volume. The client side never mounts it.
-          docker run --rm -v "$PROJ_VOL":/seed -v "$PWD/e2e:/e2e" \
-            --entrypoint /bin/bash rsbx:ci -c 'cp /e2e/probes/* /seed/ && chmod 777 /seed/*'
+          # The image runs as the unprivileged rsbx user, so the seed write runs
+          # as root and then hands the disposable volume to the sandbox user.
+          docker run --rm --user 0 -v "$PROJ_VOL":/seed -v "$PWD/e2e:/e2e" \
+            --entrypoint /bin/bash rsbx:ci -c 'cp /e2e/probes/* /seed/ && chmod -R 777 /seed'
           cat > e2e/probe.toml <<'CFG'
           [daemon]
           transport = "unix"
@@ -243,7 +245,7 @@ jobs:
           # agents, process, cache, execloc and runtime, driven by one script.
           # RSBX_PROJ is the daemon's native /proj/probe path — a disposable
           # directory on the throwaway volume the daemon container serves.
-          docker run --rm --privileged --network rsbx-e2e \
+          docker run --rm --privileged --user 0 --network rsbx-e2e \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/sandbox /e2e/state/cache
@@ -278,7 +280,7 @@ jobs:
           docker volume create "$PROJ_VOL"
           docker volume create "$RUN_VOL"
           docker volume create rsbx-state
-          docker network create rsbx-dual
+          docker network create rsbx-dual 2>/dev/null || true
           docker run -d --rm --name rsbxd --network rsbx-dual \
             -v "$PROJ_VOL":/proj -v "$RUN_VOL":/run/rsbx \
             --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
@@ -289,7 +291,7 @@ jobs:
             '
           # Copy the probe in, then run it: one container hosts the two client
           # sessions because they need a shared MNT scratch home.
-          docker run --rm --privileged --network rsbx-dual \
+          docker run --rm --privileged --user 0 --network rsbx-dual \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             -v "$PWD/testdata/probe/dual.sh:/probe/dual.sh:ro" \
             --entrypoint /bin/bash rsbx:ci -c '
