@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stand-in for the multica CLI: an allowlisted host program.
+#
+# Placement is measured, not asserted: /proc/1 is the container init of
+# whichever machine the process really runs on. Here that is the client; a
+# process the daemon started sees rsbxd as its pid 1. Everything it reads from
+# /proj is daemon-only content either way, which is the point of the sandbox.
+echo "MULTICA-PID1=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 40)"
+echo "MULTICA-PWD=$(pwd)"
+case "$1" in
+  sees) echo "MULTICA-SEES=$(cat /proj/marker 2>/dev/null || echo none)" ;;
+  run)  shift; echo "MULTICA-EXEC=$*"; exec /bin/sh -c "$*" ;;
+  *)    echo "MULTICA-EXEC=$*"; /bin/sh -c "$*" ;;
+esac

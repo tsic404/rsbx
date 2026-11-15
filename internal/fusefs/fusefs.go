@@ -1010,7 +1010,16 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if err != nil {
 			return nil, 0, syscall.EIO
 		}
-		return &handle{fd: f, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
+		// The handle carries the attributes of the program the name stands
+		// for, not those of the file it was opened from. Getattr on this
+		// descriptor reports the trampoline's size, and if the mode it copies
+		// lacks the execute bit the kernel refuses the second exec of the same
+		// name while the first one succeeded.
+		base := statOf(f)
+		base.Mode = proto.SIFREG | 0o555
+		return &handle{
+			fd: f, path: n.path, lay: n.lay, base: base,
+		}, fuse.FOPEN_KEEP_CACHE, 0
 	}
 	if host, ok := n.hostRoot(n.path); ok {
 		if writes && !n.writable(n.path) {

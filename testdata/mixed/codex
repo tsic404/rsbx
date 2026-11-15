@@ -1,0 +1,4 @@
+#!/bin/sh
+echo "CODEX-PID1=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 40)"
+[ "$1" = config-read ] && echo "CODEX-CONFIG=[$(cat /work/agent/codex/config.toml 2>/dev/null || echo missing)]"
+exit 0

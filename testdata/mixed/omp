@@ -1,0 +1,11 @@
+#!/bin/sh
+# Stand-in for an agent CLI: a host program whose config is local and whose
+# work product is remote. Placement is measured from /proc/1, as in multica.
+echo "OMP-PID1=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 40)"
+cfg=${OMP_CONFIG:-/work/agent/omp/config.toml}
+case "$1" in
+  config-write) /bin/mkdir -p "${cfg%/*}"; printf 'model=local-config\n' > "$cfg" && echo "OMP-WROTE=$cfg" ;;
+  config-read)  echo "OMP-CONFIG=[$(cat "$cfg" 2>/dev/null || echo missing)]" ;;
+  work)         shift; d=$1; /bin/mkdir -p "$d" 2>/dev/null || mkdir -p "$d"; printf 'artifact from omp\n' > "$d/out.txt"; echo "OMP-WORK=$d/out.txt" ;;
+  *)            /bin/sh -c "$*" ;;
+esac
