@@ -3,10 +3,13 @@ package fsremote
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"rsbx/internal/proto"
 )
@@ -54,6 +57,7 @@ func attrOf(fi os.FileInfo) proto.Attr {
 		a.UID = st.Uid
 		a.GID = st.Gid
 		a.Ino = st.Ino
+		a.Nlink = uint32(st.Nlink)
 	}
 	return a
 }
@@ -139,7 +143,50 @@ func (s *Server) Handle(req *proto.FxReq) *proto.FxResp {
 		return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
 
 	case proto.FxUnlink:
-		if err := os.RemoveAll(full); err != nil {
+		// Remove, not RemoveAll: unlink means "this one name". A recursive
+		// delete here would let a stray unlink wipe a directory tree.
+		if err := os.Remove(full); err != nil {
+			return errResp(req.ID, err)
+		}
+		return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
+
+	case proto.FxRmdir:
+		if fi, err := os.Lstat(full); err == nil && !fi.IsDir() {
+			return &proto.FxResp{ID: req.ID, Kind: proto.KErr, Err: "not a directory"}
+		}
+		if err := os.Remove(full); err != nil {
+			return errResp(req.ID, err)
+		}
+		return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
+
+	case proto.FxSymlink:
+		// The link text is stored verbatim; only the link's own directory is
+		// resolved, so a target outside the root is a legitimate dangling link
+		// rather than an escape.
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			return errResp(req.ID, err)
+		}
+		if err := os.Symlink(req.Arg, full); err != nil {
+			return errResp(req.ID, err)
+		}
+		return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
+
+	case proto.FxLink:
+		src, ok := s.Resolve(req.Arg)
+		if !ok {
+			return &proto.FxResp{ID: req.ID, Kind: proto.KErr, Err: "link source escapes the remote root"}
+		}
+		if err := os.Link(src, full); err != nil {
+			return errResp(req.ID, err)
+		}
+		return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
+
+	case proto.FxUtimes:
+		atime, mtime, err := parseTimes(req.Arg)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		if err := os.Chtimes(full, atime, mtime); err != nil {
 			return errResp(req.ID, err)
 		}
 		return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
@@ -222,6 +269,25 @@ func (s *Server) Handle(req *proto.FxReq) *proto.FxResp {
 		return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
 	}
 	return &proto.FxResp{ID: req.ID, Kind: proto.KErr, Err: "unknown filesystem operation"}
+}
+
+// parseTimes decodes "<atime>,<mtime>" in decimal nanoseconds. A negative or
+// empty value means "leave this one alone", which is how utimensat expresses
+// UTIME_OMIT.
+func parseTimes(arg string) (atime, mtime time.Time, err error) {
+	parts := strings.SplitN(arg, ",", 2)
+	if len(parts) != 2 {
+		return atime, mtime, fmt.Errorf("utimes: want \"atime,mtime\", got %q", arg)
+	}
+	now := time.Now()
+	atime, mtime = now, now
+	if v, e := strconv.ParseInt(parts[0], 10, 64); e == nil && v >= 0 {
+		atime = time.Unix(0, v)
+	}
+	if v, e := strconv.ParseInt(parts[1], 10, 64); e == nil && v >= 0 {
+		mtime = time.Unix(0, v)
+	}
+	return atime, mtime, nil
 }
 
 func errResp(id uint32, err error) *proto.FxResp {

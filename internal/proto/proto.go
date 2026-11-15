@@ -46,6 +46,25 @@ const (
 	FxAppend = 12
 	// FxWriteAt writes at an explicit offset; Arg carries the decimal offset.
 	FxWriteAt = 13
+	// FxSymlink creates a symbolic link named by Path pointing at Arg. It
+	// carries the target as data, not a path, so it is never resolved here.
+	FxSymlink = 14
+	// FxLink creates a hard link: Path is the existing file, Arg the new name.
+	FxLink = 15
+	// FxRmdir removes an empty directory. Unlink must not: a build tool that
+	// deletes a directory and one that deletes a file are asking different
+	// questions, and answering both with RemoveAll silently destroys data.
+	FxRmdir = 16
+	// FxUtimes sets access and modification times. Arg is "<atime>,<mtime>" in
+	// decimal nanoseconds; an empty field means "leave unchanged".
+	FxUtimes = 17
+	// FxGetlk asks whether a lock would conflict; FxSetlk takes or drops one.
+	// Arg is "<owner>,<type>,<start>,<end>", all decimal. Locks have to be
+	// arbitrated where the file actually is: a database opened here and by a
+	// program on the daemon is one file, and two lock tables would each believe
+	// they held it.
+	FxGetlk = 18
+	FxSetlk = 19
 )
 
 const (
@@ -249,6 +268,7 @@ type Attr struct {
 	Ino   uint64
 	UID   uint32
 	GID   uint32
+	Nlink uint32
 }
 
 func (a *Attr) encode(e *Enc) {
@@ -258,6 +278,7 @@ func (a *Attr) encode(e *Enc) {
 	e.U64(a.Ino)
 	e.U32(a.UID)
 	e.U32(a.GID)
+	e.U32(a.Nlink)
 }
 
 func decodeAttr(d *Dec) Attr {
@@ -268,6 +289,7 @@ func decodeAttr(d *Dec) Attr {
 	a.Ino = d.U64()
 	a.UID = d.U32()
 	a.GID = d.U32()
+	a.Nlink = d.U32()
 	return a
 }
 
@@ -315,6 +337,16 @@ type FxResp struct {
 	Data []byte
 	Ents []DirEntry
 	Err  string
+	// Lock reports the conflicting lock for FxGetlk, if any.
+	Lock *LockInfo
+}
+
+// LockInfo describes one byte-range lock in FUSE's terms.
+type LockInfo struct {
+	Typ   uint32 // 0 read, 1 write, 2 unlock
+	Start uint64
+	End   uint64
+	Pid   uint32
 }
 
 func (r *FxResp) Encode() []byte {

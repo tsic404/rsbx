@@ -245,7 +245,13 @@ func (p *Plan) MountRoot() (*fuse.Server, error) {
 			FsName:        "rsbx",
 			DisableSplice: true,
 		},
-		EntryTimeout: durp(1),
+		// No dentry caching. A negative entry that lasts a moment is enough to
+		// hide a file the same process created microseconds earlier: git makes a
+		// directory, writes an object into it and reads it back, and the kernel
+		// answers the lookup from a cached "not found". Correctness here is worth
+		// the extra lookups, and the tree is remote anyway, so the kernel cache
+		// was never going to save the round trip that mattered.
+		EntryTimeout: durp(0),
 		AttrTimeout:  durp(1),
 	}
 	srv, err := fs.Mount(p.Mount, fusefs.NewRoot(p.Layout()), opts)

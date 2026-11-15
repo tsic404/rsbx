@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"rsbx/internal/config"
 	"rsbx/internal/proto"
@@ -67,7 +69,18 @@ func main() {
 	if err != nil {
 		fatal(fmt.Errorf("mount %s: %w", plan.Mount, err))
 	}
-	defer srv.Unmount()
+	// os.Exit skips defers, so the filesystem would stay mounted and the mount
+	// point would answer ENOTCONN on the next run. Unmount before every exit
+	// path instead of relying on the defer.
+	unmounted := false
+	stop := func() {
+		if unmounted {
+			return
+		}
+		unmounted = true
+		srv.Unmount()
+	}
+	defer stop()
 	if os.Getenv("RSBX_DEBUG_MOUNT") != "" {
 		ents, err := os.ReadDir(plan.Mount)
 		fmt.Fprintf(os.Stderr, "rsbx: mount ready, %d entries, err=%v\n", len(ents), err)
@@ -92,13 +105,30 @@ func main() {
 		}
 		argv = []string{entry}
 	}
+	// A signal ends this process without running any defer. Intercept the ones
+	// that stop a build or a CI job, unmount, then die by the same signal so
+	// the exit status still says how it ended.
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		s := <-sigc
+		stop()
+		if sg, ok := s.(syscall.Signal); ok {
+			syscall.Kill(os.Getpid(), sg)
+		}
+	}()
+
 	code, err := plan.Run(argv)
 	if err != nil {
+		stop()
 		fatal(err)
 	}
+	stop()
 	os.Exit(code)
 }
 
+// fatal reports and exits. It is only safe once the mount is gone; callers that
+// hold one unmount first.
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "rsbx:", err)
 	os.Exit(1)

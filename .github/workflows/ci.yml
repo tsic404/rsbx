@@ -122,7 +122,7 @@ jobs:
         run: |
           docker build --target test -t rsbx-test-env .
           docker run --rm --privileged --user 0 -v /dev/fuse:/dev/fuse \
-            rsbx-test-env test -v -run 'ThroughMount|ReachesHost' ./internal/fusefs
+            rsbx-test-env test ./internal/fusefs
 
       # A sandbox needs /dev/fuse plus an unprivileged user namespace, so the
       # container runs privileged. This exercises the real path: a daemon
@@ -215,7 +215,15 @@ jobs:
           /e2e/probes/atomic_write /e2e/state session.jsonl
           echo "=== durable write (fsync, wal) ==="
           /e2e/probes/durable_write /e2e/state
+          echo "=== workload ==="
+          mkdir -p /e2e/tree/proj
+          RSBX_PROJ=/e2e/tree/proj /e2e/probes/workload.sh
           INNER
+          # The same probes a developer runs by hand, plus one round of an
+          # agent's real project work: 23 checks covering atomic write, append,
+          # truncate, links, chmod, utimes, rm -rf, sqlite, tar and git.
+          cp testdata/probe/workload.sh e2e/probes/workload.sh
+          chmod 777 e2e/probes/workload.sh
           docker run --rm --privileged --user 0 \
             -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
             --entrypoint /bin/bash rsbx:ci -c '
@@ -226,6 +234,11 @@ jobs:
             ' | tee probe-out.txt
           grep -q "reopen ok: payload" probe-out.txt
           grep -q "sqlite-like ok" probe-out.txt
+          # Every workload check must pass; a single FAIL line fails the step.
+          if grep -q "^FAIL" probe-out.txt; then
+            echo "workload checks failed:"; grep "^FAIL" probe-out.txt; exit 1
+          fi
+          test "$(grep -c '^OK' probe-out.txt)" -eq 23
 
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
