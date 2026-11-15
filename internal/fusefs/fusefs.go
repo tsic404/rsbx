@@ -660,19 +660,37 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	}
 	// A member of an exec-policy directory is served from the host, and the
 	// policy decides which file that is: the local binary, or the trampoline.
+	//
+	// Only a redirected name is read-only. Data files in the same directory
+	// keep working normally: an agent's state directory often holds one .node
+	// or .so, and making the whole tree unwritable because of it broke session
+	// persistence with EROFS.
 	if n.isExecDir(n.path) {
-		if writes {
-			return nil, 0, syscall.EROFS
+		_, trapped := n.trapFor(n.path)
+		if trapped {
+			// The trampoline is immutable: writing to it would replace the
+			// program, not the data.
+			if writes {
+				return nil, 0, syscall.EROFS
+			}
+			f, err := os.Open(n.lay.Trampoline)
+			if err != nil {
+				return nil, 0, errnoOf(err.Error())
+			}
+			return &handle{f: f, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
 		}
-		target, _, err := n.execTarget(n.path)
+		// Any other name is ordinary host data, writable like any local file.
+		// An exec directory is defined by holding programs, not by being
+		// read-only: an agent's state tree commonly carries one .node or .so.
+		openFlags := flags
+		if !writes {
+			openFlags = uint32(os.O_RDONLY)
+		}
+		f, err := os.OpenFile(n.path, int(openFlags), 0)
 		if err != nil {
 			return nil, 0, errnoOf(err.Error())
 		}
-		f, err := os.Open(target)
-		if err != nil {
-			return nil, 0, errnoOf(err.Error())
-		}
-		return &handle{f: f, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
+		return &handle{f: f, path: n.path, lay: n.lay}, 0, 0
 	}
 	// Every O_APPEND open, create or not, streams appends to the daemon: the
 	// kernel may reuse an inode and skip CREATE entirely for the second
@@ -923,7 +941,9 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 
 func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	from := path.Join(n.path, name)
-	to := path.Join(newParent.EmbeddedInode().Path(nil), newName)
+	// Inode.Path returns a path relative to the root, so it has to be anchored
+	// before it can be compared against the policy or the host filesystem.
+	to := path.Join("/", newParent.EmbeddedInode().Path(nil), newName)
 	if _, ok := n.hostRoot(from); ok {
 		// a local file may only move within its own writable tree
 		if !n.writable(from) || !n.writable(to) {

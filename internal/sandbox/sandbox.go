@@ -354,7 +354,13 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 		// the bare ENOENT does not say so.
 		"--setenv", "RSBX_LOCAL_TREES", strings.Join(p.Local.Roots(), ":"),
 	)
-
+	// The resolver belongs to the network namespace actually in use. Bind the
+	// directory rather than individual files: a per-file bind makes bwrap
+	// create a placeholder for each name through the filesystem, which lands in
+	// the root of the sandbox view and confuses everything under /etc.
+	if p.usesHostNetwork() {
+		args = append(args, "--ro-bind-try", "/etc", "/etc")
+	}
 	// Landlock runs inside the sandbox, in front of the entry program: bwrap
 	// needs mount and mkdir rights to build the view, so the restriction is
 	// installed after the view exists.
@@ -429,6 +435,11 @@ func (p *Plan) SandboxExecPaths() []string {
 	return out
 }
 
+// usesHostNetwork reports whether the sandbox keeps the host network namespace.
+func (p *Plan) usesHostNetwork() bool {
+	return p.Cfg.Daemon.Transport == "ssh" || p.Cfg.Sandbox.ShareNetwork
+}
+
 // hasPath reports whether a path will exist inside the sandbox view: it must
 // not be hidden by the /tmp tmpfs, and it must be either local content or part
 // of the daemon tree.
@@ -469,6 +480,11 @@ func dedupePaths(in []string) []string {
 	return out
 }
 
+// networkConfig lists the host files that describe how this machine resolves
+// names. The sandbox keeps the host network namespace when the caller needs it
+// (ssh transport, or share_network), so it must also keep the resolver that
+// namespace uses; the daemon's resolver would name servers this machine cannot
+// reach, which shows up as getaddrinfo EAI_AGAIN.
 // linkTargets returns the directories holding the merged-usr link targets and
 // the dynamic loaders. A local program cannot start without the loader, and
 // distributions scatter it across /lib, /lib64 and /usr/lib/<triplet>.

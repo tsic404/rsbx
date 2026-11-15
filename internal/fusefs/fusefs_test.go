@@ -2,7 +2,9 @@ package fusefs
 
 import (
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -60,3 +62,14 @@ type stubLocalForTrap struct{}
 func (stubLocalForTrap) IsLocal(string) bool  { return true }
 func (stubLocalForTrap) Writable(string) bool { return true }
 func (stubLocalForTrap) Roots() []string      { return nil }
+
+// Inode.Path returns a path relative to the root. Using it directly as a
+// rename destination produced "home/…" instead of "/home/…", which failed the
+// local-tree test and answered EROFS to an agent writing its session file.
+func TestRenameDestinationIsAnchored(t *testing.T) {
+	rel := "home/me/.omp/sessions"
+	got := path.Join("/", rel, "x.jsonl")
+	if !strings.HasPrefix(got, "/home/me/") {
+		t.Fatalf("destination not anchored: %q", got)
+	}
+}
