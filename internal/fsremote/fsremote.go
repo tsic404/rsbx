@@ -671,6 +671,18 @@ func (s *Server) registerWaiter(h uint64) chan struct{} {
 	return ch
 }
 
+// waiterCount reports how many lock requests are currently parked. Tests use
+// it to synchronise with a blocked FxSetlkw instead of sleeping.
+func (s *Server) waiterCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, set := range s.waiters {
+		n += len(set)
+	}
+	return n
+}
+
 func (s *Server) unregisterWaiter(h uint64, ch chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -32,7 +32,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          # The module cache is a speed optimisation. A restored toolchain tar
+          # that fails half-way used to break the run before any test ran.
+          cache: false
 
       - name: gofmt
         run: |

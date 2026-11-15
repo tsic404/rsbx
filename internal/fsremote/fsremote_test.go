@@ -619,7 +619,16 @@ func TestSetlkwCancellableByClose(t *testing.T) {
 	}
 	done := make(chan *proto.FxResp, 1)
 	go func() { done <- setlk(s, h2, 2, 1, 0, 0, true) }()
-	time.Sleep(20 * time.Millisecond)
+	// The waiter must exist before Close: poll the server's own registration
+	// instead of sleeping, or a slow machine closes before the request starts
+	// and the test proves nothing.
+	deadline := time.Now().Add(5 * time.Second)
+	for s.waiterCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Setlkw never registered a waiter")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	s.Close()
 	select {
 	case resp := <-done:
