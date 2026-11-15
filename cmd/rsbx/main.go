@@ -13,12 +13,38 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"rsbx/internal/config"
 	"rsbx/internal/proto"
 	"rsbx/internal/sandbox"
 )
+
+// installGoroutineDump writes every goroutine's stack to the file named by
+// RSBX_STACK_FILE when SIGUSR2 arrives. It has to be a file: the stalled
+// session holds the mount, so its own stderr may be unreadable by the time the
+// dump is wanted, and the caller that needs it is outside the sandbox.
+func installGoroutineDump() {
+	path := os.Getenv("RSBX_STACK_FILE")
+	if path == "" {
+		return
+	}
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGUSR2)
+	go func() {
+		for range sigc {
+			buf := make([]byte, 4<<20)
+			n := runtime.Stack(buf, true)
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				continue
+			}
+			f.Write(buf[:n])
+			f.Close()
+		}
+	}()
+}
 
 // version is injected at build time with -ldflags "-X main.version=...".
 var version = "dev"
@@ -27,6 +53,11 @@ func main() {
 	if sandbox.MaybeRunLauncher() {
 		return
 	}
+	// A session that stalls shows up from outside only as a process in D
+	// state: the kernel parks it in lookup_slow, and no signal reaches a
+	// caller waiting there. SIGUSR2 therefore dumps every goroutine to a
+	// file instead of asking the stalled caller to do anything.
+	installGoroutineDump()
 
 	var (
 		cfgPath = flag.String("config", "", "configuration file (default ~/.rsbx/config.toml)")
