@@ -331,10 +331,10 @@ jobs:
               printf '%s\n' \
                 '[daemon]' \
                 'transport = "unix"' \
-                'socket = "/run/rsbx/daemon.sock"' \
+                'socket = "#SOCK#"' \
                 '' \
                 '[local]' \
-                'allow = []' \
+                'allow = ["/usr/bin/bash", "/bin"]' \
                 'entry = "/bin/sh"' \
                 '' \
                 '[sandbox]' \
@@ -344,7 +344,7 @@ jobs:
                 'unshare_user = false' \
                 > /e2e/state/cfg/base.toml
               chmod 777 /e2e/state
-              D=/e2e/state MNT=/e2e/state TREE=/proj \
+              D=/e2e/state MNT=/e2e/state TREE=/proj/dual \
                 F=$(command -v rsbx) CFG_BASE=/e2e/state/cfg/base.toml \
                 bash /probe/dual.sh
             ' | tee dual-out.txt
