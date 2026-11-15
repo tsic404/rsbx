@@ -305,6 +305,8 @@ jobs:
       - name: concurrent sessions on one daemon
         run: |
           docker volume rm "$RUN_VOL" rsbx-state 2>/dev/null || true
+          # The previous step left its daemon running under this name.
+          docker rm -f rsbxd 2>/dev/null || true
           docker volume create "$PROJ_VOL"
           docker volume create "$RUN_VOL"
           docker volume create rsbx-state
