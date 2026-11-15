@@ -82,6 +82,12 @@ func TestListReportsType(t *testing.T) {
 
 func TestWriteAtPlacesBytes(t *testing.T) {
 	s, root := newServer(t)
+	// Create first: a positioned write writes to a file, it does not bring one
+	// into existence. Reaching for O_CREATE here made every write a create,
+	// which put back a file whose name its owner had already removed.
+	if resp := s.Handle(&proto.FxReq{Op: proto.FxWrite, Path: "/at.txt", Data: nil}); resp.Kind == proto.KErr {
+		t.Fatalf("create failed: %s", resp.Err)
+	}
 	if resp := s.Handle(&proto.FxReq{Op: proto.FxWriteAt, Path: "/at.txt", Arg: "0", Data: []byte("hello")}); resp.Kind == proto.KErr {
 		t.Fatalf("write failed: %s", resp.Err)
 	}
@@ -94,5 +100,19 @@ func TestWriteAtPlacesBytes(t *testing.T) {
 	}
 	if string(got) != "hello-world" {
 		t.Fatalf("positioned write misplaced bytes: %q", got)
+	}
+}
+
+// A positioned write to a name that does not exist is an error, not an implicit
+// create. Otherwise a program that removes its scratch file and keeps writing
+// leaves the file behind with a tail of its writes in it.
+func TestWriteAtDoesNotCreate(t *testing.T) {
+	s, root := newServer(t)
+	resp := s.Handle(&proto.FxReq{Op: proto.FxWriteAt, Path: "/gone.txt", Arg: "0", Data: []byte("x")})
+	if resp.Kind != proto.KErr {
+		t.Fatalf("write to a missing file returned kind %d, want an error", resp.Kind)
+	}
+	if _, err := os.Stat(filepath.Join(root, "gone.txt")); !os.IsNotExist(err) {
+		t.Fatalf("the write created the file: %v", err)
 	}
 }

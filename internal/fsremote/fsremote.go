@@ -251,6 +251,12 @@ func (s *Server) Handle(req *proto.FxReq) *proto.FxResp {
 		// creates; write only writes to what is already there.
 		f, err := os.OpenFile(full, os.O_WRONLY, 0o644)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// KNone means "there is no such file", which a stat answers
+				// calmly. A write cannot: the caller is holding a descriptor it
+				// believes is valid, so the removal has to surface as an error.
+				return &proto.FxResp{ID: req.ID, Kind: proto.KErr, Err: "no such file"}
+			}
 			return errResp(req.ID, err)
 		}
 		_, werr := f.WriteAt(req.Data, off)

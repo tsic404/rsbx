@@ -482,3 +482,66 @@ func TestStatIsStableAcrossRead(t *testing.T) {
 		t.Fatalf("handle stat disagrees: %v vs %v", during.ModTime(), before.ModTime())
 	}
 }
+
+// An open descriptor keeps reading the bytes it was opened on. A later write to
+// the same name replaces the file, and the holder must not start seeing the new
+// content, still less nothing at all. Log rotation, `git`'s object check and
+// every editor's "save" rely on this.
+func TestOpenHandleKeepsItsContent(t *testing.T) {
+	mnt, tree := mounted(t)
+	p := inView(mnt, filepath.Join(tree, "held.txt"))
+	if err := os.WriteFile(p, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	// Replace the name while the descriptor is open, by writing a new file and
+	// renaming it into place — the way editors and state files save. In-place
+	// truncation is expected to be visible to a holder; a rename is not.
+	tmp := inView(mnt, filepath.Join(tree, ".held.tmp"))
+	if err := os.WriteFile(tmp, []byte("replacement"), 0o644); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		t.Fatalf("rename replacement: %v", err)
+	}
+	buf := make([]byte, 64)
+	n, _ := f.ReadAt(buf, 0)
+	if string(buf[:n]) != "original" {
+		t.Fatalf("open handle read %q, want the content it was opened on", buf[:n])
+	}
+	// and the new content is what the path serves
+	got, err := os.ReadFile(filepath.Join(tree, "held.txt"))
+	if err != nil {
+		t.Fatalf("host read: %v", err)
+	}
+	if string(got) != "replacement" {
+		t.Fatalf("path serves %q", got)
+	}
+}
+
+// A descriptor whose name is removed keeps working, and the name stays gone.
+// Scratch files are made this way: create, unlink, keep writing.
+func TestWriteThroughRemovedNameDoesNotResurrectIt(t *testing.T) {
+	mnt, tree := mounted(t)
+	p := inView(mnt, filepath.Join(tree, "scratch"))
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.Write([]byte("first")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	// writing is allowed to fail or to be discarded, but must not recreate
+	f.Write([]byte("second"))
+	f.Close()
+	if _, err := os.Stat(filepath.Join(tree, "scratch")); !os.IsNotExist(err) {
+		t.Fatalf("the name came back: %v", err)
+	}
+}

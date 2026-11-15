@@ -653,6 +653,9 @@ type handle struct {
 	// base is the state the file had when it was opened. A remote write that
 	// changed it since then is a real conflict: two writers, one file.
 	base proto.Attr
+	// private marks a temp file that belongs to this handle alone, so it is
+	// removed on release. A write buffer uses the shared cache key instead.
+	private bool
 	// appendOnly marks handles opened for append, where the bytes are appended
 	// on the daemon instead of being replayed from a local copy.
 	appendOnly bool
@@ -718,6 +721,11 @@ func (h *handle) Release(ctx context.Context) syscall.Errno {
 	}
 	if h.remote != "" {
 		return 0
+	}
+	// A read handle owns a private copy of the bytes it was opened on, and
+	// nothing else refers to it once the descriptor is gone.
+	if h.temp != "" && !h.dirty && h.private {
+		os.Remove(h.temp)
 	}
 	if !h.dirty || h.temp == "" {
 		return 0
@@ -840,17 +848,36 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if err := os.WriteFile(temp+".meta", []byte(stampOf(attr)), 0o600); err != nil {
 		return nil, 0, syscall.EIO
 	}
-	// A read-only open of a remote file has nothing to flush, so the handle
-	// must not look dirty: that is what previously left copies behind.
-	f, err := os.Open(temp)
+	// This handle gets its own copy, not the shared cache entry.
+	//
+	// An open descriptor must keep reading the bytes it was opened on, even if
+	// the name is later rewritten or removed. Sharing the cache file breaks
+	// that: the next write rewrites the same path, and the holder starts reading
+	// somebody else's content — or, once the entry is dropped, nothing at all.
+	// The cache entry stays as the fast path for the next open; this private
+	// copy is what the descriptor reads.
+	priv, err := os.CreateTemp(filepath.Dir(temp), "open-*")
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
+	if _, err := priv.Write(data); err != nil {
+		priv.Close()
+		os.Remove(priv.Name())
+		return nil, 0, syscall.EIO
+	}
+	f, err := os.Open(priv.Name())
+	priv.Close()
+	if err != nil {
+		os.Remove(priv.Name())
+		return nil, 0, syscall.EIO
+	}
+	temp = priv.Name()
+	privateCopy := true
 	// Keep the metadata the copy was fetched at. A handle-scoped getattr has to
 	// answer with the file's own times, not the local copy's: tar stats a file,
 	// reads it, then stats again, and reports "file changed as we read it" when
 	// the second answer differs.
-	return &handle{f: f, temp: temp, path: n.path, lay: n.lay, base: attr}, fuse.FOPEN_KEEP_CACHE, 0
+	return &handle{f: f, temp: temp, private: privateCopy, path: n.path, lay: n.lay, base: attr}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // writeTemp is the scratch file that buffers a remote write before it is
