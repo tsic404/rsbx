@@ -170,7 +170,9 @@ jobs:
           done
           if [ "$ok" = 0 ]; then
             echo "daemon socket never appeared"
-            docker logs rsbxd 2>&1 | tail -20 || true
+            docker ps -a --filter name=rsbxd --format '{{.Status}} {{.Image}}' || true
+            docker inspect rsbxd --format '{{.State.Status}} exit={{.State.ExitCode}} err={{.State.Error}}' || true
+            docker logs rsbxd 2>&1 | tail -30 || true
             exit 1
           fi
           # Scratch state lives in a second named volume: configs, cache and
