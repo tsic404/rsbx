@@ -85,7 +85,11 @@ holder(){
   mkdir -p "$d" || return 1
   printf 'original' > "$d/data.txt" || return 1
   exec 5<"$d/data.txt" || return 1
-  ( printf 'replacement' > "$d/data.txt" ) || return 1
+  # Replace the name with a new file, the way editors and state writers save.
+  # A descriptor keeps the inode it opened, so it still reads the old bytes;
+  # only an in-place rewrite is visible to a holder, and that is not this.
+  printf 'replacement' > "$d/.data.tmp" || return 1
+  mv "$d/.data.tmp" "$d/data.txt" || return 1
   local fromfd; fromfd=$(dd bs=64 count=1 <&5 2>/dev/null)
   exec 5<&-
   [ "$fromfd" = original ] || { echo "fd saw=${fromfd:0:30}"; return 1; }
