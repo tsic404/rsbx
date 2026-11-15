@@ -257,6 +257,25 @@ func (n *Node) isExecDir(p string) bool {
 	return false
 }
 
+// isExecDirSelf reports whether p is one of the directories where the policy
+// arbitrates names, rather than a name inside one.
+func (n *Node) isExecDirSelf(p string) bool {
+	for _, d := range n.lay.ExecDirs {
+		if p == d {
+			return true
+		}
+	}
+	return false
+}
+
+// hostRealDir reports whether this machine has p as a real directory. A
+// symlink is not one: /bin -> usr/bin has to keep resolving as a link, or the
+// merged-usr layout stops finding the shell.
+func hostRealDir(p string) bool {
+	fi, err := os.Lstat(p)
+	return err == nil && fi.IsDir()
+}
+
 // trapFor returns the trampoline when p is an executable the policy reroutes.
 func (n *Node) trapFor(p string) (string, bool) {
 	if n.lay.Trampoline == "" || n.lay.LocalExec == nil {
@@ -481,6 +500,15 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (in 
 	//    own bytes are host content; every other name is an ordinary session
 	//    file and is served remote, even when the same name exists here. A
 	//    directory that holds programs does not expose a host listing.
+	// A policy directory is a directory in the view, so the kernel can walk
+	// into it and resolve the names the policy arbitrates. Without this the
+	// name fell through to the daemon's listing, which has nothing of this
+	// machine, and a PATH lookup then never found an allowlisted program in it.
+	if n.isExecDirSelf(p) && hostRealDir(p) {
+		out.Attr = attrOf(proto.SIFDIR|0o555, 0, ino(p))
+		child := &Node{lay: n.lay, path: p}
+		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: ino(p)}), 0
+	}
 	if n.isExecDir(p) {
 		if fi, ok := n.allowedExec(p); ok {
 			out.Attr = attrOfFI(proto.SIFREG|uint32(fi.Mode().Perm()), fi, ino(p))

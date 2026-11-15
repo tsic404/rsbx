@@ -214,3 +214,38 @@ func (failingRemote) ReadFile(string) ([]byte, proto.Attr, error) {
 }
 
 func (failingRemote) WriteFile(string, []byte) error { return os.ErrClosed }
+
+// A policy directory has to be recognised as a directory by the view, because
+// the kernel has to walk into it before the policy can answer about any name
+// inside. When it fell through to the daemon's listing instead, the directory
+// held none of this machine's programs and a PATH lookup never found an
+// allowlisted one: the session ran /usr/bin/dash against the name "multica" and
+// reported "multica: not found" with the program present the whole time.
+func TestPolicyDirectoryIsADirectory(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	lay := &Layout{
+		Remote:    &stubRemote{},
+		Local:     stubLocal{},
+		ExecDirs:  []string{real, link},
+		LocalExec: func(string) bool { return false },
+	}
+	n := &Node{lay: lay, path: "/"}
+
+	// A real directory is a directory.
+	if !n.isExecDirSelf(real) || !hostRealDir(real) {
+		t.Fatalf("%s is not recognised as a policy directory that is a directory", real)
+	}
+	// A symlink at a policy path keeps its link: /bin -> usr/bin is how a
+	// merged-usr layout finds the shell, and answering it with a directory
+	// would cut that route.
+	if !n.isExecDirSelf(link) {
+		t.Fatalf("%s is not a policy directory", link)
+	}
+	if hostRealDir(link) {
+		t.Fatalf("%s is a symlink, yet it was treated as a real directory", link)
+	}
+}
