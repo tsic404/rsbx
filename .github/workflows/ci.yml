@@ -234,11 +234,12 @@ jobs:
           # The image runs as the unprivileged rsbx user, so the seed write runs
           # as root and then hands the disposable volume to the sandbox user.
           # RSBX_PROJ points at /proj/probe/<name>, so the scripts belong in
-          # /proj/probe, next to the probe binaries.
+          # /proj/probe, next to the probe binaries. The C probes also write
+          # there, so the directory has to exist before the run.
           docker run --rm --user 0 -v "$PROJ_VOL":/seed -v "$PWD/e2e:/e2e" \
             -v "$PWD/testdata/probe:/probes:ro" \
             --entrypoint /bin/bash rsbx:ci \
-            -c 'mkdir -p /seed/probe && cp /e2e/probes/* /seed/probe/ &&
+            -c 'mkdir -p /seed/probe/write && cp /e2e/probes/* /seed/probe/ &&
                 cp /probes/*.sh /probes/*.c /seed/probe/ &&
                 chmod -R 777 /seed &&
                 chmod 755 /seed/probe/*.sh'
@@ -266,12 +267,12 @@ jobs:
             -v "$PWD/e2e/probe.toml:/e2e/probe.toml:ro" \
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/sandbox /e2e/state/cache
-              mkdir -p /e2e/state/probe && chmod 777 /e2e/state/probe
+
               rsbx -config /e2e/probe.toml -- /bin/sh -c "
                 echo \"=== atomic write (create, rename, reopen) ===\"
-                /proj/probe/atomic_write /e2e/state/probe session.jsonl
+                /proj/probe/atomic_write /proj/probe/write session.jsonl
                 echo \"=== durable write (fsync, wal) ===\"
-                /proj/probe/durable_write /e2e/state/probe
+                /proj/probe/durable_write /proj/probe/write
                 RSBX_PROJ=/proj/probe/run /proj/probe/workload.sh
                 RSBX_PROJ=/proj/probe/deep /proj/probe/semantics.sh
                 RSBX_PROJ=/proj/probe/fleet /proj/probe/agents.sh
