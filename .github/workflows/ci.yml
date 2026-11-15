@@ -241,7 +241,7 @@ jobs:
             'socket = "/run/rsbx/daemon.sock"' \
             '' \
             '[local]' \
-            'allow = []' \
+            'allow = ["/usr/bin", "/bin"]' \
             'entry = "/bin/sh"' \
             '' \
             '[sandbox]' \
