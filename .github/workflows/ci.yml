@@ -166,6 +166,50 @@ jobs:
             ' | tee out.txt
           grep -q "remote file: REMOTE-MARKER" out.txt
 
+      # The unit tests cannot reach these: they need a live mount. The probes
+      # are what a real program does to its own state files, and both patterns
+      # were broken at some point.
+      - name: persistence probes
+        if: always()
+        run: |
+          mkdir -p e2e/probes e2e/state
+          chmod -R 777 e2e
+          gcc -static -O1 -o e2e/probes/atomic_write testdata/probe/atomic_write.c
+          gcc -static -O1 -o e2e/probes/durable_write testdata/probe/durable_write.c
+          cat > e2e/probe.toml <<'CFG'
+          [daemon]
+          transport = "unix"
+          socket = "/e2e/state/d.sock"
+
+          [local]
+          allow = ["/usr/bin/bash", "/e2e/probes"]
+          paths = ["/e2e/state"]
+          read_only_paths = ["/usr/bin", "/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
+          entry = "/usr/bin/bash"
+
+          [sandbox]
+          mount = "/e2e/state/sandbox"
+          cache = "/e2e/state/cache"
+          share_network = true
+          unshare_user = false
+          CFG
+          cat > e2e/probe.sh <<'INNER'
+          echo "=== atomic write (create, rename, reopen) ==="
+          /e2e/probes/atomic_write /e2e/state session.jsonl
+          echo "=== durable write (fsync, wal) ==="
+          /e2e/probes/durable_write /e2e/state
+          INNER
+          docker run --rm --privileged --user 0 \
+            -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
+            --entrypoint /bin/bash rsbx:ci -c '
+              mkdir -p /e2e/state/sandbox
+              rsbxd -socket /e2e/state/d.sock -root /e2e/tree >/tmp/d.log 2>&1 &
+              sleep 2
+              rsbx -config /e2e/probe.toml -- /usr/bin/bash /e2e/probe.sh
+            ' | tee probe-out.txt
+          grep -q "reopen ok: payload" probe-out.txt
+          grep -q "sqlite-like ok" probe-out.txt
+
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
