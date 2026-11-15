@@ -126,7 +126,7 @@ check_agent_config_local(){
 # 8. the agent's work product is remote.
 check_agent_io_remote(){
   local out
-  out=$(run 'omp work /proj/agentwork')
+  out=$(run 'mkdir -p /proj/agentwork && omp work /proj/agentwork')
   printf '%s\n' "$out" | grep -q "OMP-WORK=/proj/agentwork/out.txt" || { echo "got [$out]"; return 1; }
   out=$(run 'cat /proj/agentwork/out.txt')
   printf '%s\n' "$out" | grep -q "artifact from omp" || { echo "read back [$out]"; return 1; }

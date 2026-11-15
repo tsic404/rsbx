@@ -1,11 +1,27 @@
 #!/bin/sh
 # Stand-in for an agent CLI: a host program whose config is local and whose
 # work product is remote. Placement is measured from /proc/1, as in multica.
-echo "OMP-PID1=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 40)"
+# /proc/1 is the init of the machine this process really runs on, read with
+# the shell's own builtin: tr is a program, and an unlisted program runs on the
+# daemon, where /proc/1 would answer for the wrong machine.
+IFS= read -r p1 < /proc/1/cmdline 2>/dev/null || p1=""
+echo "OMP-PID1=${p1%%,*}"
 cfg=${OMP_CONFIG:-/work/agent/omp/config.toml}
 case "$1" in
-  config-write) /bin/mkdir -p "${cfg%/*}"; printf 'model=local-config\n' > "$cfg" && echo "OMP-WROTE=$cfg" ;;
-  config-read)  echo "OMP-CONFIG=[$(cat "$cfg" 2>/dev/null || echo missing)]" ;;
-  work)         shift; d=$1; /bin/mkdir -p "$d" 2>/dev/null || mkdir -p "$d"; printf 'artifact from omp\n' > "$d/out.txt"; echo "OMP-WORK=$d/out.txt" ;;
+  # The config tree is prepared by the caller: creating a directory needs a
+  # program, and a program that is not allowlisted runs on the daemon, so the
+  # runner makes /work/agent before the probe starts.
+  config-write)
+    [ -d "${cfg%/*}" ] || { printf 'no config dir: %s\n' "${cfg%/*}" >&2; exit 1; }
+    printf 'model=local-config\n' > "$cfg" && echo "OMP-WROTE=$cfg" ;;
+  # The read is done by this shell's own builtin, not by cat: cat is a program
+  # and an unlisted program runs on the daemon, where this local tree does not
+  # exist.
+  config-read)
+    if [ -r "$cfg" ]; then IFS= read -r line < "$cfg"; echo "OMP-CONFIG=[$line]";
+    else echo "OMP-CONFIG=[missing]"; fi ;;
+  # The work product is a remote path. mkdir is a program, so it runs on the
+  # daemon and creates the directory there; this shell only writes into it.
+  work)         shift; d=$1; printf 'artifact from omp\n' > "$d/out.txt" && echo "OMP-WORK=$d/out.txt" ;;
   *)            /bin/sh -c "$*" ;;
 esac

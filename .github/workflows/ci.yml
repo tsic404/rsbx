@@ -395,7 +395,8 @@ jobs:
           docker run --rm --privileged --user 0 --network mix-net \
             -v "$PWD/testdata/mixed:/probe:ro" -v mix-run:/run/rsbx \
             --entrypoint /bin/bash rsbx-mixed-client -c '
-              mkdir -p /state/cfg /state/sb /state/cache /work/agent
+              mkdir -p /state/cfg /state/sb /state/cache /work/agent/omp \
+                       /work/agent/codex /work/agent/claude
               chmod -R 777 /state /work
               export PATH=/usr/local/bin:$PATH
               MNT=/state F=/usr/local/bin/rsbx SOCK=/run/rsbx/daemon.sock \

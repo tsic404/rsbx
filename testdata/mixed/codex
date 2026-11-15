@@ -1,4 +1,12 @@
 #!/bin/sh
-echo "CODEX-PID1=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 40)"
-[ "$1" = config-read ] && echo "CODEX-CONFIG=[$(cat /work/agent/codex/config.toml 2>/dev/null || echo missing)]"
+# /proc/1 is the init of the machine this process really runs on, read with
+# the shell's own builtin: tr is a program, and an unlisted program runs on the
+# daemon, where /proc/1 would answer for the wrong machine.
+IFS= read -r p1 < /proc/1/cmdline 2>/dev/null || p1=""
+echo "CODEX-PID1=${p1%%,*}"
+[ "$1" = config-read ] && {
+  f=/work/agent/codex/config.toml
+  if [ -r "$f" ]; then IFS= read -r line < "$f"; echo "CODEX-CONFIG=[$line]";
+  else echo "CODEX-CONFIG=[missing]"; fi
+}
 exit 0
