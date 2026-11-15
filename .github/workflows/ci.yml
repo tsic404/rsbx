@@ -222,12 +222,15 @@ jobs:
           # /e2e/tree, so a project path there is remote content, which is the
           # point of the exercise.
           RSBX_PROJ=/proj /e2e/probes/workload.sh
+          echo "=== semantics ==="
+          RSBX_PROJ=/proj/deep /e2e/probes/semantics.sh
           INNER
           # The same probes a developer runs by hand, plus one round of an
           # agent's real project work: 23 checks covering atomic write, append,
           # truncate, links, chmod, utimes, rm -rf, sqlite, tar and git.
           cp testdata/probe/workload.sh e2e/probes/workload.sh
-          chmod 777 e2e/probes/workload.sh
+          cp testdata/probe/semantics.sh e2e/probes/semantics.sh
+          chmod 777 e2e/probes/workload.sh e2e/probes/semantics.sh
           docker run --rm --privileged --user 0 \
             -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
             --entrypoint /bin/bash rsbx:ci -c '
@@ -245,7 +248,7 @@ jobs:
             echo "workload checks failed:"; grep "^FAIL" probe-out.txt; exit 1
           fi
           total=$(grep -cE '^(OK|SKIP)' probe-out.txt)
-          test "$total" -eq 23
+          test "$total" -eq 45
 
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'

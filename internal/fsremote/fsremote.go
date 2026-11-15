@@ -244,7 +244,12 @@ func (s *Server) Handle(req *proto.FxReq) *proto.FxResp {
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			return errResp(req.ID, err)
 		}
-		f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE, 0o644)
+		// No O_CREATE. A write through a descriptor whose name has since been
+		// removed must not bring the name back: the holder deleted it, and
+		// recreating it turns "remove my scratch file" into "leave a file
+		// behind with the tail of my writes". Create is the operation that
+		// creates; write only writes to what is already there.
+		f, err := os.OpenFile(full, os.O_WRONLY, 0o644)
 		if err != nil {
 			return errResp(req.ID, err)
 		}
