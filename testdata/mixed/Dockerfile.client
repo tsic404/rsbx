@@ -1,0 +1,10 @@
+# The client side of the mixed-model probe. multica and the agent CLIs exist
+# here and nowhere else; git is deliberately absent, so every git call has to
+# cross to the daemon.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fuse3 ca-certificates coreutils findutils grep sed gawk tar diffutils && \
+    rm -rf /var/lib/apt/lists/*
+COPY multica omp codex claude /usr/local/bin/
+RUN chmod 755 /usr/local/bin/multica /usr/local/bin/omp \
+              /usr/local/bin/codex /usr/local/bin/claude

@@ -1,0 +1,5 @@
+# The daemon side of the mixed-model probe: git, and none of the stand-ins.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fuse3 ca-certificates coreutils findutils grep sed gawk tar diffutils git && \
+    rm -rf /var/lib/apt/lists/*

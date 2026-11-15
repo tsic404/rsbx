@@ -358,6 +358,53 @@ jobs:
           fi
           test "$(grep -c '^OK' dual-out.txt)" -eq 8
 
+      # The mixed-execution model: multica and the agent CLIs run on the client
+      # and see the daemon's tree, while a program that is not allowlisted (git)
+      # runs on the daemon. Two purpose-built images make placement observable:
+      # the client carries the stand-ins and no git, the daemon the reverse.
+      - name: mixed local and remote execution
+        run: |
+          docker build -q -t rsbx-mixed-daemon -f testdata/mixed/Dockerfile.daemon testdata/mixed
+          docker build -q -t rsbx-mixed-client -f testdata/mixed/Dockerfile.client testdata/mixed
+          # If git were on the client, or missing on the daemon, the placement
+          # checks below would pass without proving anything.
+          if docker run --rm --entrypoint /bin/sh rsbx-mixed-client -c 'command -v git'; then
+            echo "git is on the client image"; exit 1
+          fi
+          docker run --rm --entrypoint /bin/sh rsbx-mixed-daemon -c 'command -v git >/dev/null'
+          docker rm -f rsbx-mixed >/dev/null 2>&1 || true
+          docker volume rm mix-proj mix-run >/dev/null 2>&1 || true
+          docker network rm mix-net >/dev/null 2>&1 || true
+          docker network create mix-net >/dev/null
+          docker volume create mix-proj >/dev/null
+          docker volume create mix-run >/dev/null
+          docker run --rm --user 0 -v mix-run:/run/rsbx --entrypoint /bin/sh rsbx-mixed-daemon \
+            -c 'mkdir -p /run/rsbx && chown 1000:1000 /run/rsbx'
+          # A marker that exists only on the daemon: a session that reads it is
+          # reading remote content, whatever the path is called.
+          docker run --rm --user 0 -v mix-proj:/seed --entrypoint /bin/sh rsbx-mixed-daemon \
+            -c 'printf "daemon-marker\n" > /seed/marker && chmod -R 777 /seed'
+          docker run -d --rm --name rsbx-mixed --network mix-net \
+            -v mix-proj:/proj -v mix-run:/run/rsbx \
+            --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
+          docker run --rm --network mix-net -v mix-run:/run/rsbx \
+            --entrypoint /bin/bash rsbx:ci -c '
+              for i in $(seq 1 50); do [ -S /run/rsbx/daemon.sock ] && exit 0; sleep 0.2; done
+              echo "daemon socket never appeared"; exit 1
+            '
+          docker run --rm --privileged --user 0 --network mix-net \
+            -v "$PWD/testdata/mixed:/probe:ro" -v mix-run:/run/rsbx \
+            --entrypoint /bin/bash rsbx-mixed-client -c '
+              mkdir -p /state/cfg /state/sb /state/cache /work/agent
+              chmod -R 777 /state /work
+              MNT=/state F=$(command -v rsbx) SOCK=/run/rsbx/daemon.sock \
+                AGENT_HOME=/work/agent DAEMON_TREE=/proj timeout 300 bash /probe/lab.sh
+            ' 2>&1 | tee mixed-out.txt
+          if grep -q "^FAIL" mixed-out.txt; then
+            echo "mixed-model checks failed:"; grep "^FAIL" mixed-out.txt; exit 1
+          fi
+          test "$(grep -c '^OK' mixed-out.txt)" -eq 10
+
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
