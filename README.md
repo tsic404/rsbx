@@ -50,13 +50,13 @@ flowchart TB
   subgraph client["your machine"]
     shell["shell (local entry)"]
     fuse["FUSE root<br/>daemon tree + explicit local trees<br/>+ trampolines"]
-    guard["rsbx-guard<br/>Landlock exec allowlist"]
+    launch["self-reexec launcher<br/>namespaces, root switch,<br/>capabilities, Landlock"]
     tramp["rsbx-tramp<br/>static, served as every<br/>non-allowlisted name"]
     broker["transport broker<br/>relay socket, outside the root"]
     shell -- "open /proj/x.c" --> fuse
     shell -- "exec ls" --> tramp
-    fuse -. "re-exec of rsbx:<br/>new namespaces, root switch" .- guard
-    guard --> shell
+    fuse -. "pivot into the view" .- launch
+    launch --> shell
     broker --- fuse
   end
   subgraph remote["daemon host"]
@@ -81,15 +81,17 @@ Four mechanisms, each independently sufficient for its own job:
 3. **Union filesystem.** The sandbox root is a FUSE mount: paths not claimed by
    an explicit local tree are answered over the wire by the daemon, and
    executable names are resolved through the policy.
-4. **Landlock (backstop).** `rsbx-guard` installs an exec allowlist inside the
+4. **Landlock (backstop).** The launcher installs an exec allowlist inside the
    sandbox, so an exec that somehow skips the trampoline is refused by the
    kernel rather than silently running a host binary.
 
 The client enters its own fixed layout without an external helper: it
-re-executes itself before ordinary CLI parsing, asks the kernel for new user,
-mount and pid namespaces, mounts the FUSE root, switches root and detaches the
-old one, then drops inherited descriptors. Mount isolation is mandatory and
-fails closed.
+re-executes itself before ordinary CLI parsing, asks the kernel for new IPC,
+UTS and (when configured) network and user namespaces, takes a private mount
+namespace, mounts the FUSE root, provides its own `/proc` and a minimal
+`/dev`, pivots, detaches the old root, clears capabilities, sets
+`no_new_privs`, installs Landlock and runs the entry as a reaped child. Setup
+fails closed: a kernel that refuses a step is an error, never a weaker sandbox.
 
 ### The local runtime, and what is *not* local
 
@@ -132,30 +134,18 @@ itself. `-ldflags "-X main.version=..."` stamps the client and the daemon.
 
 ## Container image
 
-`Dockerfile` produces one slim image that carries both ends of the sandbox.
-There is no bubblewrap, no compiler and no bundled libc or model runtime.
+`Dockerfile` produces one image that carries both ends of the sandbox.
 
 ```sh
 docker build -t rsbx .
-
-# daemon: its own disposable container; /proj is mounted from a throwaway
-# volume and served exactly as it is, native paths, no root argument
-docker run --rm --name rsbxd -v proj-vol:/proj -v rsbx-run:/run/rsbx \
-  --entrypoint rsbxd rsbx -socket /run/rsbx/daemon.sock
-
-# client: privileged only for /dev/fuse and the user namespace; it mounts no
-# project and no /usr tree, just the socket volume and its own scratch state
-docker run --rm -it --privileged -v /dev/fuse -v rsbx-run:/run/rsbx \
-  -v rsbx-home:/home/rsbx rsbx
+docker run --rm -it --privileged -v /dev/fuse rsbx             # client
+docker run --rm --entrypoint rsbxd -v /srv/tree:/proj rsbx \
+  -socket /run/rsbx/daemon.sock                                # daemon
 ```
 
-The client needs `--privileged` (or `--cap-add SYS_ADMIN` plus an
-unprivileged user namespace) and `/dev/fuse`: it mounts the sandbox root and
-runs programs inside it. It never binds the project directory: `/proj` exists
-only in the daemon container, and the client sees it through rsbx, the way it
-would over ssh. The daemon needs neither privilege nor `/dev/fuse`, and it
-takes no root argument: whatever is mounted at `/proj` in its container *is*
-`/proj` for the programs it runs.
+The client needs `--privileged` (or `--cap-add SYS_ADMIN` plus an unprivileged
+user namespace) and `/dev/fuse`: it mounts the sandbox root and runs programs
+inside it. The daemon needs neither.
 
 The two ends are separate disposable containers sharing a socket volume; see
 CI below.
@@ -203,8 +193,9 @@ go test ./...
 
 The suite pins the decisions that are easy to get silently wrong: which paths
 are local, that the default allowlist is only the entry shell, that a script in
-a project tree is never turned into a trampoline, and that daemon paths are
-native absolute paths.
+a project tree is never turned into a trampoline, that a descriptor keeps its
+inode across rename and unlink, and that daemon paths are native absolute
+paths.
 
 ## Run
 
@@ -221,9 +212,19 @@ namespace plan) without starting anything.
 * **Metadata is cached briefly.** Lookups are answered by the daemon with a
   short TTL; a file changed on the daemon may stay stale for that window. Data
   is never cached: opens get real daemon descriptors.
+* **Execution redirection covers policy directories.** A name inside an
+  allowlisted directory that the policy keeps remote resolves to the
+  trampoline, so the daemon runs it. A program in a *plain* path with no allow
+  entry at all is refused by Landlock rather than redirected, because Landlock
+  grants paths and not a syscall hook. Listing the directory in `local.allow`
+  is what makes such a name executable.
 * **Landlock needs a recent kernel.** On older kernels the trampoline is the
   only guard, and a program that calls `execve` by raw syscall on a host path
-  outside the FUSE root could still run locally.
+  could still run locally.
+* **Capability dropping depends on the outer runtime.** Inside a privileged
+  rootless container the runtime refuses to narrow the bounding set; the
+  launcher reports the capabilities it could not drop instead of claiming a
+  state the kernel does not have.
 * **The daemon trusts the client.** It executes whatever argv it receives;
   it is a remote shell, not a multi-tenant service.
 

@@ -158,12 +158,19 @@ jobs:
             --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
           # the client waits for the socket instead of a fixed sleep: as soon
           # as it answers, the daemon is up
-          docker run --rm --network rsbx-e2e -v "$RUN_VOL":/run/rsbx \
-            --entrypoint /bin/bash rsbx:ci -c '
-              for i in $(seq 1 100); do [ -S /run/rsbx/daemon.sock ] && exit 0; sleep 0.2; done
-              echo "daemon socket never appeared"
-              exit 1
-            '
+          ok=0
+          for i in $(seq 1 100); do
+            if docker run --rm --network rsbx-e2e -v "$RUN_VOL":/run/rsbx \
+                 --entrypoint /bin/sh rsbx:ci -c 'test -S /run/rsbx/daemon.sock'; then
+              ok=1; break
+            fi
+            sleep 0.2
+          done
+          if [ "$ok" = 0 ]; then
+            echo "daemon socket never appeared"
+            docker logs rsbxd 2>&1 | tail -20 || true
+            exit 1
+          fi
           # Scratch state lives in a second named volume: configs, cache and
           # mount points. Nothing on it is a project file.
           docker volume create rsbx-state
