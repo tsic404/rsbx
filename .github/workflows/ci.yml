@@ -172,10 +172,12 @@ jobs:
       - name: persistence probes
         if: always()
         run: |
-          mkdir -p e2e/probes e2e/state
-          chmod -R 777 e2e
+          mkdir -p e2e/probes e2e/state e2e/tree
+          # Built on the runner: the image carries no compiler, and the probes
+          # are static so they can run inside it either way.
           gcc -static -O1 -o e2e/probes/atomic_write testdata/probe/atomic_write.c
           gcc -static -O1 -o e2e/probes/durable_write testdata/probe/durable_write.c
+          chmod -R 777 e2e
           cat > e2e/probe.toml <<'CFG'
           [daemon]
           transport = "unix"
@@ -193,7 +195,7 @@ jobs:
           share_network = true
           unshare_user = false
           CFG
-          cat > e2e/probe.sh <<'INNER'
+          cat > e2e/probes/probe.sh <<'INNER'
           echo "=== atomic write (create, rename, reopen) ==="
           /e2e/probes/atomic_write /e2e/state session.jsonl
           echo "=== durable write (fsync, wal) ==="
@@ -205,7 +207,7 @@ jobs:
               mkdir -p /e2e/state/sandbox
               rsbxd -socket /e2e/state/d.sock -root /e2e/tree >/tmp/d.log 2>&1 &
               sleep 2
-              rsbx -config /e2e/probe.toml -- /usr/bin/bash /e2e/probe.sh
+              rsbx -config /e2e/probe.toml -- /usr/bin/bash /e2e/probes/probe.sh
             ' | tee probe-out.txt
           grep -q "reopen ok: payload" probe-out.txt
           grep -q "sqlite-like ok" probe-out.txt
