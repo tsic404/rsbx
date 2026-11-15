@@ -132,12 +132,9 @@ jobs:
           read_only_paths = ["/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
           entry = "/usr/bin/bash"
 
-          [remote]
-          root = "/e2e/tree"
-
           [sandbox]
           mount = "/e2e/home/sandbox"
-          share = "/e2e/home/share"
+          cache = "/e2e/home/cache"
           # The runner's privileged container cannot configure loopback in a
           # fresh network namespace (RTM_NEWADDR is refused), so the sandbox
           # keeps the host one. Only the network is shared; mounts, pid, ipc
