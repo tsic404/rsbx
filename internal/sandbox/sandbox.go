@@ -340,6 +340,10 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 	args = append(args,
 		"--die-with-parent",
 		"--setenv", "RSBX_SANDBOX_MOUNT", p.Mount,
+		// The trampoline quotes this when a redirected command fails while
+		// naming a local tree: that failure is caused by the split view, and
+		// the bare ENOENT does not say so.
+		"--setenv", "RSBX_LOCAL_TREES", strings.Join(p.Local.Roots(), ":"),
 	)
 
 	// Landlock runs inside the sandbox, in front of the entry program: bwrap

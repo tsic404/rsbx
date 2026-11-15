@@ -178,11 +178,19 @@ two consequences worth knowing before configuring one.
 **The agent must be on `local.allow`.** It keeps its own state, so it belongs on
 this machine. Anything else runs on the daemon, where `/work` does not exist.
 
-**The tools a redirected command needs must be local too.** This is the part
-that surprises people: `ls`, `stat` and `cat` are not special. If they are not
-allowed locally they run on the daemon, and a daemon-side `stat` of a local
-tree reports `No such file or directory`. Listing the coreutils you use is what
-makes an agent's own file inspection work:
+**A tool belongs on the list only if it must read local content.** `ls`, `stat`
+and `cat` are not special and work fine on the daemon; running there is the
+cheaper path. What they cannot do remotely is see a `[local.paths]` tree, since
+the two sides have different filesystem views. When such a command fails, the
+sandbox names the cause rather than leaving a bare `ENOENT`:
+
+```
+rsbx: stat ran on the daemon and cannot see the local tree /work/a.txt;
+      add /usr/bin/stat to local.allow to run it here instead
+```
+
+Listing the coreutils an agent uses for its own file inspection is what keeps
+that inspection local:
 
 ```toml
 [local]

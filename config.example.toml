@@ -10,10 +10,16 @@ socket    = "~/.rsbx/daemon.sock"
 [local]
 # -- which programs run HERE --
 #
-# Anything not listed executes on the daemon. That includes ordinary tools, so
-# an agent that must inspect a local tree needs them listed: `ls`, `stat` and
-# `cat` run on the daemon by default, where a [local.paths] tree does not
-# exist, and the agent would see "no such file".
+# Anything not listed executes on the daemon. That is the intended default, and
+# it is not a privilege question: `ls` and `stat` work perfectly well remotely.
+#
+# The one thing a daemon-side program cannot do is see a [local.paths] tree,
+# because the two sides have different filesystem views. So a tool belongs here
+# only when it must read local content: an agent inspecting its own state, or a
+# build reading a local checkout. When such a tool fails, the sandbox says so:
+#
+#   rsbx: stat ran on the daemon and cannot see the local tree /work/a.txt;
+#         add /usr/bin/stat to local.allow to run it here instead
 allow = [
   # shells and coreutils
   "/usr/bin/bash", "/usr/bin/env", "/usr/bin/true",

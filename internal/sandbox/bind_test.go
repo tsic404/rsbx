@@ -57,9 +57,13 @@ func TestLocalTreesAreNeverBound(t *testing.T) {
 	pol, _ := policy.New([]string{"/usr/bin/true"})
 	local, _ := paths.New([]string{dir}, false)
 	plan := &Plan{Exec: pol, Local: local, Cfg: testCfg(), Mount: "/mnt/x"}
-	for _, a := range plan.BwrapArgs([]string{"/bin/true"}) {
-		if a == dir {
-			t.Fatalf("local tree bound from the host: %s", a)
+	args := plan.BwrapArgs([]string{"/bin/true"})
+	for i := 0; i+2 < len(args); i++ {
+		if args[i] != "--bind" && args[i] != "--ro-bind" && args[i] != "--bind-try" && args[i] != "--ro-bind-try" {
+			continue
+		}
+		if args[i+1] == dir || args[i+2] == dir {
+			t.Fatalf("local tree bound from the host: %v", args[i:i+3])
 		}
 	}
 }
@@ -105,5 +109,24 @@ func TestDeepLocalTreeIsReachable(t *testing.T) {
 	}
 	if !plan.hasPath(filepath.Dir(deep)) {
 		t.Errorf("ancestor %s reported unreachable", filepath.Dir(deep))
+	}
+}
+
+// The trampoline needs the local tree list to explain a failure. Without it the
+// user only sees a bare ENOENT and has to infer the cause.
+func TestLocalTreesReachTheSandbox(t *testing.T) {
+	dir := tempDirOutsideTmp(t)
+	pol, _ := policy.New([]string{"/usr/bin/true"})
+	local, _ := paths.New([]string{dir}, false)
+	plan := &Plan{Exec: pol, Local: local, Cfg: testCfg(), Mount: "/mnt/x"}
+	args := plan.BwrapArgs([]string{"/bin/true"})
+	found := false
+	for i := 0; i+2 < len(args); i++ {
+		if args[i] == "--setenv" && args[i+1] == "RSBX_LOCAL_TREES" && args[i+2] == dir {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("RSBX_LOCAL_TREES not passed to the sandbox: %v", args)
 	}
 }
