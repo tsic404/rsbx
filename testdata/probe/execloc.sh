@@ -5,8 +5,10 @@
 set -u
 D=${RSBX_EXEC_DIR:-/opt/tools}
 R=${RSBX_PROJ:-/proj/execloc}
-mkdir -p "$R" 2>/dev/null
-if [ -d "$R" ]; then find "$R" -mindepth 1 -delete 2>/dev/null; fi
+# The working directory doubles as the exec directory under test, so it is never
+# cleaned wholesale: the probes themselves may live there, and deleting the
+# directory's contents deletes the script that is running. Each check removes
+# only the names it created instead.
 mkdir -p "$R" || { echo "FAIL setup: cannot create $R"; exit 1; }
 cd "$R" || exit 1
 
