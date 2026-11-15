@@ -268,6 +268,21 @@ func (n *Node) isExecDirSelf(p string) bool {
 	return false
 }
 
+// hostSymlink returns the target when this machine has p as a symlink. A link
+// is never a program to redirect: the kernel follows it, and the target is the
+// name the policy has to decide about.
+func hostSymlink(p string) (string, bool) {
+	fi, err := os.Lstat(p)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return "", false
+	}
+	target, err := os.Readlink(p)
+	if err != nil || target == "" {
+		return "", false
+	}
+	return target, true
+}
+
 // hostRealDir reports whether this machine has p as a real directory. A
 // symlink is not one: /bin -> usr/bin has to keep resolving as a link, or the
 // merged-usr layout stops finding the shell.
@@ -293,6 +308,16 @@ func (n *Node) trapFor(p string) (string, bool) {
 	// agent reading a +x file from its own tree would silently receive the
 	// trampoline binary.
 	if !n.isExecDir(p) {
+		return "", false
+	}
+	// A name the policy runs here is not redirected at all. This has to be
+	// decided before asking the daemon, because the daemon usually has the
+	// same program: /usr/bin/dash, /bin/sh and every tool in a PATH directory
+	// exist on both sides, and answering those with the trampoline sent the
+	// entry shell to the daemon, so a session started with none of this
+	// machine's files and every allowlisted program looked missing.
+	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() &&
+		fi.Mode()&0o111 != 0 && n.lay.LocalExec(p) {
 		return "", false
 	}
 	if trap, ok := n.trapForExact(p); ok {
@@ -510,6 +535,17 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (in 
 		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: ino(p)}), 0
 	}
 	if n.isExecDir(p) {
+		// A symlink inside a policy directory has to be served as a symlink.
+		// allowedExec only accepts a regular file, and the name is not a
+		// program the daemon should run either, so without this branch the
+		// link fell through to the trampoline and the kernel executed the
+		// target on the daemon: /bin/sh -> dash became a remote dash, and the
+		// session started with none of this machine's files.
+		if target, ok := hostSymlink(p); ok {
+			out.Attr = attrOf(proto.SIFLNK|0o777, uint64(len(target)), ino(p))
+			child := &Node{lay: n.lay, path: p, phantom: true}
+			return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFLNK, Ino: ino(p)}), 0
+		}
 		if fi, ok := n.allowedExec(p); ok {
 			out.Attr = attrOfFI(proto.SIFREG|uint32(fi.Mode().Perm()), fi, ino(p))
 			child := &Node{lay: n.lay, path: p}
@@ -681,6 +717,18 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 	// Getattr, Lookup and Open must all agree on which, or the kernel caches
 	// one size and reads another.
 	if n.isExecDir(n.path) {
+		// The policy directory itself lives only on this machine. Asking the
+		// daemon returned ENOENT and the kernel then never descended into it.
+		if n.isExecDirSelf(n.path) {
+			out.Attr = attrOf(proto.SIFDIR|0o555, 0, ino(n.path))
+			return 0
+		}
+		// Agree with Lookup: a link served as a link there needs a link's
+		// attributes here, or the kernel caches two kinds for one inode.
+		if target, ok := hostSymlink(n.path); ok {
+			out.Attr = attrOf(proto.SIFLNK|0o777, uint64(len(target)), ino(n.path))
+			return 0
+		}
 		if fi, ok := n.allowedExec(n.path); ok {
 			out.Attr = attrOfFI(proto.SIFREG|uint32(fi.Mode().Perm()), fi, ino(n.path))
 			return 0
@@ -805,6 +853,11 @@ func (n *Node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 		if target, err := os.Readlink(host); err == nil {
 			return []byte(target), 0
 		}
+	}
+	// A link in a policy directory is this machine's link; the daemon's target
+	// would point at a name this machine may not have.
+	if target, ok := hostSymlink(n.path); ok {
+		return []byte(target), 0
 	}
 	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxReadlink, Path: n.path})
 	if err != nil || resp.Kind != proto.KLink {

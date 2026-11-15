@@ -57,3 +57,49 @@ func TestTrampolineHandleReportsExecutableAttrs(t *testing.T) {
 		t.Errorf("descriptor size %d, want the trampoline's 4", out.Attr.Size)
 	}
 }
+
+// An allowlisted program must never be redirected, even when the daemon holds
+// a program of the same name. Every tool in a PATH directory exists on both
+// sides, so redirecting them sent the entry shell to the daemon: the session
+// started with none of this machine's files, and every allowlisted program was
+// reported missing because the name it was started by had become a trampoline.
+func TestAllowlistedProgramIsNotRedirected(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tramp := filepath.Join(dir, "tramp")
+	if err := os.WriteFile(tramp, []byte("\x7fELF"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(bin, "tool")
+	if err := os.WriteFile(local, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The daemon has the same name, which is the case that broke: a PATH
+	// directory is occupied on both machines.
+	lay := &Layout{
+		Remote:     &stubRemote{found: true, attr: proto.Attr{Mode: proto.SIFREG | 0o755, Size: 999}},
+		Local:      stubLocal{},
+		ExecDirs:   []string{bin},
+		Trampoline: tramp,
+		LocalExec:  func(p string) bool { return p == local },
+	}
+	n := &Node{lay: lay, path: bin}
+
+	if trap, ok := n.trapFor(local); ok {
+		t.Errorf("allowlisted %s was redirected to %s: the daemon having the name "+
+			"must not win over the policy running it here", local, trap)
+	}
+	// And the attributes still describe this machine's file, not the
+	// trampoline.
+	fi, ok := n.allowedExec(local)
+	if !ok {
+		t.Fatalf("allowedExec refused an allowlisted regular executable")
+	}
+	if fi.Size() != 10 {
+		t.Errorf("size %d, want this machine's 10", fi.Size())
+	}
+}
