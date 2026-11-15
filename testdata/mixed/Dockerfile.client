@@ -1,10 +1,9 @@
-# The client side of the mixed-model probe. multica and the agent CLIs exist
-# here and nowhere else; git is deliberately absent, so every git call has to
-# cross to the daemon.
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      fuse3 ca-certificates coreutils findutils grep sed gawk tar diffutils && \
-    rm -rf /var/lib/apt/lists/*
+# The client side of the mixed model: the release image plus the host CLIs that
+# are supposed to run here. The release image carries the rsbx client and its
+# helpers, and no git, which is exactly the client half this probe needs.
+FROM rsbx:ci
 COPY multica omp codex claude /usr/local/bin/
+USER 0
 RUN chmod 755 /usr/local/bin/multica /usr/local/bin/omp \
-              /usr/local/bin/codex /usr/local/bin/claude
+              /usr/local/bin/codex /usr/local/bin/claude && \
+    test ! -e /usr/bin/git && test ! -e /bin/git

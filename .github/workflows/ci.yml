@@ -386,7 +386,7 @@ jobs:
             -c 'printf "daemon-marker\n" > /seed/marker && chmod -R 777 /seed'
           docker run -d --rm --name rsbx-mixed --network mix-net \
             -v mix-proj:/proj -v mix-run:/run/rsbx \
-            --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
+            --entrypoint rsbxd rsbx-mixed-daemon -socket /run/rsbx/daemon.sock
           docker run --rm --network mix-net -v mix-run:/run/rsbx \
             --entrypoint /bin/bash rsbx:ci -c '
               for i in $(seq 1 50); do [ -S /run/rsbx/daemon.sock ] && exit 0; sleep 0.2; done
@@ -397,7 +397,8 @@ jobs:
             --entrypoint /bin/bash rsbx-mixed-client -c '
               mkdir -p /state/cfg /state/sb /state/cache /work/agent
               chmod -R 777 /state /work
-              MNT=/state F=$(command -v rsbx) SOCK=/run/rsbx/daemon.sock \
+              export PATH=/usr/local/bin:$PATH
+              MNT=/state F=/usr/local/bin/rsbx SOCK=/run/rsbx/daemon.sock \
                 AGENT_HOME=/work/agent DAEMON_TREE=/proj timeout 300 bash /probe/lab.sh
             ' 2>&1 | tee mixed-out.txt
           if grep -q "^FAIL" mixed-out.txt; then
