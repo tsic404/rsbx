@@ -190,7 +190,7 @@ jobs:
             'socket = "/run/rsbx/daemon.sock"' \
             '' \
             '[local]' \
-            'allow = []' \
+            'allow = ["/usr/bin/cat"]' \
             'entry = "/bin/sh"' \
             '' \
             '[sandbox]' \
@@ -235,25 +235,21 @@ jobs:
           # as root and then hands the disposable volume to the sandbox user.
           docker run --rm --user 0 -v "$PROJ_VOL":/seed -v "$PWD/e2e:/e2e" \
             --entrypoint /bin/bash rsbx:ci -c 'cp /e2e/probes/* /seed/ && chmod -R 777 /seed'
-          cat > e2e/probe.toml <<'CFG'
-          [daemon]
-          transport = "unix"
-          socket = "/run/rsbx/daemon.sock"
-
-          [local]
-          # The workload drives ordinary shell utilities; each has to run where
-          # the filesystem is. Inside the sandbox that is the daemon: /proj and
-          # its tools are one tree, so nothing is allowlisted locally. Only the
-          # probe binaries live on the client's scratch volume.
-          allow = []
-          entry = "/bin/sh"
-
-          [sandbox]
-          mount = "/e2e/state/sandbox"
-          cache = "/e2e/state/cache"
-          share_network = true
-          unshare_user = false
-          CFG
+          printf '%s\n' \
+            '[daemon]' \
+            'transport = "unix"' \
+            'socket = "/run/rsbx/daemon.sock"' \
+            '' \
+            '[local]' \
+            'allow = []' \
+            'entry = "/bin/sh"' \
+            '' \
+            '[sandbox]' \
+            'mount = "/e2e/state/sandbox"' \
+            'cache = "/e2e/state/cache"' \
+            'share_network = true' \
+            'unshare_user = false' \
+            > e2e/probe.toml
           # The same probes a developer runs by hand: workload, semantics,
           # agents, process, cache, execloc and runtime, driven by one script.
           # RSBX_PROJ is the daemon's native /proj/probe path — a disposable
