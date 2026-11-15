@@ -26,7 +26,7 @@ mkcfg(){
 transport = "unix"
 socket = "$SOCK"
 [local]
-allow = ["/usr/local/bin/multica", "/usr/local/bin/omp", "/usr/local/bin/codex", "/usr/local/bin/claude", "/bin/sh", "/usr/bin"]
+allow = ["/usr/local/bin/multica", "/usr/local/bin/omp", "/usr/local/bin/codex", "/usr/local/bin/claude", "/bin/sh"]
 entry = "/bin/sh"
 paths = ["$AGENT_HOME"]
 read_only_paths = []

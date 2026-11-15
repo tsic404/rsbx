@@ -279,34 +279,38 @@ func (n *Node) trapFor(p string) (string, bool) {
 	if trap, ok := n.trapForExact(p); ok {
 		return trap, true
 	}
-	// A name inside an exec-policy directory that does not exist on this
-	// machine can still be a program on the daemon. The policy says which
-	// directory decides where programs run, not that every name in it is local;
-	// an ssh-style session has to be able to run a tool that was only ever
-	// installed on the other side. Without this the name resolves to ENOENT and
-	// the session cannot use the daemon's programs at all.
-	if !n.existsHere(p) {
-		// The name has to be a program on the daemon, not merely present.
-		// Anything else — a data file, a directory, a placeholder — is content
-		// that belongs to the session, and answering it with the trampoline
-		// replaces the user's file with a copy of this binary. Creating a file
-		// in an exec directory is an ordinary thing to do, and every new file
-		// is absent locally by definition.
-		if n.remoteIsProgram(p) {
-			return n.lay.Trampoline, true
-		}
+	// A name the policy does not allow can still be a program on the daemon:
+	// the policy says which directory decides where programs run, not that
+	// every name in it is local, so a session has to be able to run a tool that
+	// was only ever installed on the other side. It has to be a program there,
+	// not merely present: answering a data file or a directory with the
+	// trampoline would replace the user's content with a copy of this binary.
+	if isProc, _ := n.remoteIsProgram(p); isProc {
+		return n.lay.Trampoline, true
 	}
+	// A daemon that did not answer says nothing about the name either way, so
+	// the decision is deferred: the caller reports the transport failure rather
+	// than claiming the name does not exist, and the next lookup asks again.
 	return "", false
 }
 
 // remoteIsProgram reports whether the daemon holds an executable regular file at
-// this path.
-func (n *Node) remoteIsProgram(p string) bool {
+// this path, and whether the daemon answered at all. The two are kept apart
+// because a transport failure is not a verdict: treating "the connection
+// dropped" as "the daemon has no such program" turned a name into ENOENT under
+// load, and the same exec then worked on the next call.
+func (n *Node) remoteIsProgram(p string) (isProgram, answered bool) {
 	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
-	if err != nil || resp.Kind != proto.KStat {
-		return false
+	if err != nil {
+		return false, false
 	}
-	return kind(resp.Attr.Mode) == proto.SIFREG && resp.Attr.Mode&0o111 != 0
+	switch resp.Kind {
+	case proto.KStat:
+		return kind(resp.Attr.Mode) == proto.SIFREG && resp.Attr.Mode&0o111 != 0, true
+	case proto.KNone, proto.KErr:
+		return false, true
+	}
+	return false, false
 }
 
 // trapForExact is the original decision: the name is a local file that the

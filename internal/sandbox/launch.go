@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -619,14 +620,36 @@ func touchFile(p string) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", p, err)
 	}
-	return f.Close()
+	// The file exists at this point, which is the whole purpose of the call.
+	// A close that fails reports a descriptor problem, not a missing mount
+	// target, and failing the session over it strands the sandbox on an error
+	// that has nothing to do with what it was building.
+	_ = f.Close()
+	return nil
 }
 
 // remountReadOnly turns an existing bind mount into a read-only one.
 func remountReadOnly(target string) error {
 	// Change only the read-only attribute. A bind remount with a new flags
 	// set would clear inherited locked nosuid/nodev/noexec attributes.
-	return unix.MountSetattr(unix.AT_FDCWD, target, 0, &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY})
+	//
+	// The attribute change races with the bind it follows: under concurrent
+	// starts the kernel occasionally answers EINVAL for a mount that is still
+	// being attached, so a failure is retried on a settle delay rather than
+	// failing the session. A target that is genuinely unmountable keeps
+	// failing and the caller still reports it.
+	attr := &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = unix.MountSetattr(unix.AT_FDCWD, target, 0, attr); err == nil {
+			return nil
+		}
+		if err != unix.EINVAL && err != unix.EBUSY {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+	return err
 }
 
 // launchSpec builds the payload for this run.

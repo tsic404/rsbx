@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -33,11 +34,18 @@ func LandlockRuleset(paths []string) (int, error) {
 }
 
 func addPathBeneath(ruleset int, path string) error {
-	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
+	fd, err := openForRule(path)
 	if err != nil {
-		// A path that cannot be opened cannot be executed either. Skipping it
-		// keeps one missing entry from disabling the whole sandbox.
-		return nil
+		// A path that is genuinely absent cannot be executed either, so
+		// skipping it keeps one missing entry from disabling the whole sandbox.
+		// Anything else is a real failure and must be reported: dropping a rule
+		// because the filesystem was momentarily busy silently narrowed the
+		// allowlist, and the entry program was then refused by the kernel with
+		// EACCES that pointed at nothing.
+		if err == unix.ENOENT || err == unix.ENOTDIR {
+			return nil
+		}
+		return fmt.Errorf("landlock grant %s: %w", path, err)
 	}
 	defer unix.Close(fd)
 	attr := unix.LandlockPathBeneathAttr{
@@ -96,3 +104,23 @@ func ApplyLandlock(paths []string) error {
 
 var _ = filepath.Join
 var _ = strings.HasPrefix
+
+// openForRule resolves a path for a Landlock rule. The path is read through the
+// sandbox's own filesystem, which under load can answer a transient error for a
+// file that is plainly there, so a failure is retried on a short delay before it
+// is believed.
+func openForRule(path string) (int, error) {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		var fd int
+		fd, err = unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
+		if err == nil {
+			return fd, nil
+		}
+		if err == unix.ENOENT || err == unix.ENOTDIR {
+			return -1, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+	return -1, err
+}

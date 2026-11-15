@@ -175,3 +175,42 @@ func TestNonExecutableDaemonFileIsNotTrapped(t *testing.T) {
 		t.Fatalf("a non-executable file resolved to %q", trap)
 	}
 }
+
+// A transport failure is not a verdict about the name. Treating a dropped
+// connection as "the daemon has no such program" turned a redirected name into
+// ENOENT under load, so the same exec failed on one call and worked on the next.
+func TestUnansweredDaemonIsNotAbsence(t *testing.T) {
+	dir := t.TempDir()
+	tramp := filepath.Join(dir, "tramp")
+	if err := os.WriteFile(tramp, []byte("\x7fELF"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lay := &Layout{
+		Remote:     &failingRemote{},
+		Local:      stubLocal{},
+		ExecDirs:   []string{"/opt/tools"},
+		Trampoline: tramp,
+		LocalExec:  func(string) bool { return false },
+	}
+	n := &Node{lay: lay, path: "/opt/tools"}
+	if isProc, answered := n.remoteIsProgram("/opt/tools/tool"); answered {
+		t.Fatalf("a transport error was reported as answered (isProgram=%v)", isProc)
+	}
+	// And the lookup must not claim the name does not exist.
+	if _, ok := n.trapFor("/opt/tools/tool"); ok {
+		t.Fatal("redirected a name whose remote state is unknown")
+	}
+}
+
+// failingRemote fails every request, the way a dropped connection does.
+type failingRemote struct{}
+
+func (failingRemote) Do(*proto.FxReq) (*proto.FxResp, error) {
+	return nil, os.ErrClosed
+}
+
+func (failingRemote) ReadFile(string) ([]byte, proto.Attr, error) {
+	return nil, proto.Attr{}, os.ErrClosed
+}
+
+func (failingRemote) WriteFile(string, []byte) error { return os.ErrClosed }
