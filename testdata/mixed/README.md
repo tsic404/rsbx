@@ -15,7 +15,7 @@ Two facts have to hold at once, and each is measured rather than asserted:
 
 | probe | what it does | what it catches |
 |---|---|---|
-| `lab.sh` | 10 checks: multica runs here, sees the daemon tree, git is absent here yet runs, git runs on the daemon, git's work lands on the daemon tree and survives, the agent's config tree is local, the agent's work product is remote, every agent CLI runs here, multica and git see one tree | a policy that runs the wrong program on the wrong side, or leaves a local tree on the daemon |
+| `lab.sh` | 11 checks: multica runs here, sees the daemon tree, git is absent here yet runs, git runs on the daemon, git's work lands on the daemon tree and survives, the agent's config tree is local, the agent's work product is remote, every agent CLI runs here, multica and git see one tree | a policy that runs the wrong program on the wrong side, or leaves a local tree on the daemon |
 | `stress.sh` | 4 concurrent checks at N sessions: parallel commits, host and daemon programs interleaved 20 times in one session, agent config local while its product is remote, one shared remote file rewritten and re-read 10 times | contention that only appears when several sessions share one daemon |
 
 `multica`, `omp`, `codex` and `claude` are stand-ins, not the real programs.
@@ -56,3 +56,22 @@ Redirection is limited to the directories the allowlist names. A program in a
 directory that was never listed — `/usr/local/bin` when only single files in
 it are allowlisted — is ordinary host content and runs here. That is why
 `/usr/bin` is listed as a directory above: it is what makes `git` remote.
+
+## Running the stress probe back to back
+
+A started session leaves an uninterruptible process behind while its mount
+tears down, for a few seconds after the session exits. Starting the next run
+before they drain makes every session in it fail, and the failure looks like a
+sandbox defect: mount, bind and exec errors for paths that are plainly there.
+The run is measuring the previous run's teardown.
+
+Wait for the host to settle between runs, and treat anything measured while it
+had not as void:
+
+```sh
+while ps -eo stat | awk '$1 ~ /D/' | grep -q .; do sleep 1; done
+```
+
+The same applies to `/sys/fs/fuse/connections`: aborting a connection whose
+session is still live turns every later syscall in it into `ENOTCONN`, which
+also reads as a defect.

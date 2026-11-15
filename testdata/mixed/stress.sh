@@ -48,13 +48,23 @@ concurrent_commits(){
         git init -q . && printf 'work-$i\n' > f.txt
         git add f.txt
         git -c user.email=a@b -c user.name=n commit -qm c$i 2>/dev/null
-        git rev-list --count HEAD" >/dev/null 2>&1 ) &
+        git rev-list --count HEAD" > "$MNT/commit.$i" 2>&1 ) &
     pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
   [ $rc -eq 0 ] || {
-    local who; who=$(grep -l . "$MNT"/split.* 2>/dev/null | head -1)
-    echo "a session failed: $(tail -2 "$who" 2>/dev/null | tr '\n' ' ')"
+    # Keep each session's own output. Reading it from split.* reported an
+    # empty message, because those files belong to a different check: a
+    # failure with no reason is worse than no failure reported at all.
+    local i
+    for i in $(seq 1 $N); do
+      local got; got=$(cat "$MNT/commit.$i" 2>/dev/null)
+      case "$got" in
+        1) ;;
+        *) echo "c$i: [${got:0:160}]"; return 1 ;;
+      esac
+    done
+    echo "a session failed with no output"
     return 1
   }
   for i in $(seq 1 $N); do
@@ -85,7 +95,18 @@ agent_split(){
     pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
-  [ $rc -eq 0 ] || { echo "a session failed"; return 1; }
+  [ $rc -eq 0 ] || {
+    local i
+    for i in $(seq 1 $N); do
+      local got; got=$(cat "$MNT/split.$i" 2>/dev/null)
+      case "$got" in
+        *OMP-WROTE*OMP-WORK*) ;;
+        *) echo "w$i: [${got:0:160}]"; return 1 ;;
+      esac
+    done
+    echo "a session failed with no output"
+    return 1
+  }
   local i
   for i in $(seq 1 $N); do
     [ -f "$AGENT_HOME/omp/cfg$i.toml" ] || { echo "cfg$i not local"; return 1; }
