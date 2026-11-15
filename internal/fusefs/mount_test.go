@@ -545,3 +545,45 @@ func TestWriteThroughRemovedNameDoesNotResurrectIt(t *testing.T) {
 		t.Fatalf("the name came back: %v", err)
 	}
 }
+
+// A read handle serves a snapshot of the file it was opened on. Statting that
+// handle and reading it have to agree on the size: a writer may change the file
+// since the open, and reporting the new size while Read serves the old bytes is
+// a lie — impossible on a local filesystem, and it corrupts any program that
+// sizes its buffer from a stat.
+func TestHandleStatMatchesItsContent(t *testing.T) {
+	mnt, tree := mounted(t)
+	p := inView(mnt, filepath.Join(tree, "snap.txt"))
+	if err := os.WriteFile(p, []byte("gen1-abcdefgh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// open the file, which materialises the read snapshot
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Replace the name with a smaller file. An editor or a state writer saves
+	// this way, and the open descriptor keeps the bytes it opened on.
+	tmp := inView(mnt, filepath.Join(tree, ".snap.tmp"))
+	if err := os.WriteFile(tmp, []byte("gen2"), 0o644); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		t.Fatalf("rename replacement: %v", err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatalf("handle stat: %v", err)
+	}
+	buf := make([]byte, 64)
+	n, _ := f.ReadAt(buf, 0)
+	// the handle still holds gen1's bytes, and its stat agrees
+	if string(buf[:n]) != "gen1-abcdefgh" {
+		t.Fatalf("handle read %q, want the snapshot", buf[:n])
+	}
+	if fi.Size() != int64(len("gen1-abcdefgh")) {
+		t.Fatalf("handle size %d, want %d (the bytes it serves)",
+			fi.Size(), len("gen1-abcdefgh"))
+	}
+	f.Close()
+}

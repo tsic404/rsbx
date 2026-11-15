@@ -267,6 +267,47 @@ jobs:
           total=$(grep -cE '^(OK|SKIP)' probe-out.txt)
           test "$total" -eq 84
 
+      # Two rsbx clients sharing one daemon tree, which is what an agent team
+      # in a repo is. The single-session probes cannot exercise this; it needs
+      # several mount points and concurrent clients.
+      - name: concurrent sessions on one daemon
+        run: |
+          cp testdata/probe/dual.sh e2e/probes/dual.sh
+          chmod 777 e2e/probes/dual.sh
+          mkdir -p e2e/probes/cfg
+          # The probe writes one config per session; only the mount and cache
+          # differ, so it starts from this template.
+          cat > e2e/probes/cfg/base.toml <<'CFG'
+          [daemon]
+          transport = "unix"
+          socket = "/e2e/home/d.sock"
+
+          [local]
+          allow = ["/usr/bin", "/bin"]
+          paths = []
+          entry = "/usr/bin/bash"
+
+          [sandbox]
+          mount = "#MOUNT#"
+          cache = "#CACHE#"
+          share_network = true
+          unshare_user = false
+          CFG
+          docker run --rm --privileged --user 0 \
+            -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
+            --entrypoint /bin/bash rsbx:ci -c '
+              mkdir -p /e2e/home /e2e/tree /e2e/probes/cfg
+              rsbxd -socket /e2e/home/d.sock -root /e2e/tree >/tmp/d.log 2>&1 &
+              sleep 2
+              D=/e2e/home MNT=/e2e/home TREE=/e2e/tree \
+                F=$(command -v rsbx) CFG_BASE=/e2e/probes/cfg/base.toml \
+                bash /e2e/probes/dual.sh
+            ' | tee dual-out.txt
+          if grep -q "^FAIL" dual-out.txt; then
+            echo "dual-session checks failed:"; grep "^FAIL" dual-out.txt; exit 1
+          fi
+          test "$(grep -c '^OK' dual-out.txt)" -eq 8
+
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3

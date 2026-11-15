@@ -607,6 +607,31 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 }
 
 func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	if h, ok := f.(*handle); ok && h.f != nil && h.base.Mode != 0 {
+		// A read handle holds a fixed snapshot. Its stat must report exactly
+		// what this descriptor serves — same file, so size, time and inode all
+		// come from h.f, not from h.base or from a live path stat. Serving the
+		// live size while Read returns the snapshot bytes is a lie, and mixing
+		// two sources for the same descriptor makes tar decide the file changed
+		// while it was reading it.
+		if fi, err := h.f.Stat(); err == nil {
+			// A handle stat and a path stat of the same unchanged file have to
+			// agree to the last digit, or tar decides the file changed while it
+			// was reading it. So the times come from the same side as the path:
+			// a local tree's own inode (nanoseconds), the daemon's seconds for a
+			// remote one. Only the size is taken from the handle, because that
+			// is the snapshot Read actually serves.
+			if n.lay.Local != nil && n.lay.Local.IsLocal(n.path) {
+				out.Attr = attrOfFI(h.base.Mode, fi, h.base.Ino)
+			} else {
+				out.Attr = attrOfRemote(h.base, remoteIno(h.base, n.path))
+				out.Attr.Size = uint64(fi.Size())
+			}
+			return 0
+		}
+		out.Attr = attrOfRemote(h.base, remoteIno(h.base, n.path))
+		return 0
+	}
 	if h, ok := f.(*handle); ok && h.temp != "" {
 		fi, err := os.Stat(h.temp)
 		if err != nil {
@@ -738,6 +763,25 @@ type handle struct {
 	remote string
 }
 
+// statOf records a handle's underlying file as a proto.Attr, for Getattr to
+// report the bytes the descriptor actually serves.
+func statOf(f *os.File) proto.Attr {
+	fi, err := f.Stat()
+	if err != nil {
+		return proto.Attr{Mode: proto.SIFREG}
+	}
+	a := proto.Attr{
+		Mode:  proto.SIFREG | uint32(fi.Mode().Perm()),
+		Size:  uint64(fi.Size()),
+		Mtime: fi.ModTime().Unix(),
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		a.Ino = st.Ino
+		a.Nlink = uint32(st.Nlink)
+	}
+	return a
+}
+
 // Flush is what a closed fd actually waits for. Programs that append with >> in
 // a loop rely on it: they write, flush, write, flush. Without it the bytes sit
 // in the handle until the file is finally released, and an append that reopens
@@ -842,6 +886,11 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		return &handle{
 			f: f, path: n.path, lay: n.lay,
 			appendOnly: flags&uint32(os.O_APPEND) != 0,
+			// A local file is the host's own: an open descriptor keeps the
+			// inode it opened, even if the name is later replaced. Getattr on
+			// that descriptor has to report the same size Read serves, so base
+			// is the inode's own metadata.
+			base: statOf(f),
 		}, 0, 0
 	}
 	// A member of an exec-policy directory is served from the host, and the
@@ -884,6 +933,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 			return &handle{
 				f: f, path: n.path, lay: n.lay,
 				appendOnly: flags&uint32(os.O_APPEND) != 0,
+				base:       statOf(f),
 			}, 0, 0
 		}
 	}
@@ -902,10 +952,17 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	// The materialised copy is reused, which keeps repeated execs of the
 	// same remote binary to one round trip.
 	if !writes {
-		if cached, _, err := n.lay.cached(n.path); err == nil {
+		if cached, attr, err := n.lay.cached(n.path); err == nil {
 			f, err := os.Open(cached)
 			if err == nil {
-				return &handle{f: f, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
+				// A cached hit is a snapshot of the file at fetch time, and this
+				// handle will serve that snapshot. Its attributes have to match
+				// what the handle actually returns, or a reader that stats then
+				// reads sees two different files: stat reports the daemon's
+				// live size while read serves the cached bytes. That is
+				// impossible on a local filesystem and corrupts any program
+				// that sizes its buffer from a stat.
+				return &handle{f: f, path: n.path, lay: n.lay, base: attr}, fuse.FOPEN_KEEP_CACHE, 0
 			}
 		}
 	}
