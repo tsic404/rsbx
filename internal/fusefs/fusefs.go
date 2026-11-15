@@ -14,6 +14,7 @@ package fusefs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path"
@@ -58,8 +59,9 @@ type Layout struct {
 	Trampoline string
 	// LocalExec reports whether an executable may run on this machine.
 	LocalExec func(hostPath string) bool
-	// Scratch is where remote files are materialised for writing.
-	Scratch string
+	// Cache holds copies of remote files that were read, so repeated opens
+	// are served locally. It is disposable.
+	Cache string
 	// TTL caches negative and positive lookups for this long.
 	TTL time.Duration
 	// Synthetic lists paths that exist only as mount points (bwrap needs to
@@ -665,25 +667,48 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 			}
 		}
 	}
-	data, _, err := n.lay.Remote.ReadFile(n.path)
+	data, attr, err := n.lay.Remote.ReadFile(n.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, 0, syscall.ENOENT
 		}
 		return nil, 0, errnoOf(err.Error())
 	}
-	temp := filepath.Join(n.lay.Scratch, hash(n.path))
-	if err := os.MkdirAll(n.lay.Scratch, 0o700); err != nil {
+	temp := filepath.Join(n.lay.Cache, hash(n.path))
+	if err := os.MkdirAll(n.lay.Cache, 0o700); err != nil {
 		return nil, 0, syscall.EIO
 	}
 	if err := os.WriteFile(temp, data, 0o600); err != nil {
 		return nil, 0, syscall.EIO
 	}
-	f, err := os.OpenFile(temp, os.O_RDWR, 0o600)
+	// The stamp is what makes the copy usable later: it records the daemon's
+	// metadata at fetch time, so a later open can tell whether it is stale.
+	if err := os.WriteFile(temp+".meta", []byte(stampOf(attr)), 0o600); err != nil {
+		return nil, 0, syscall.EIO
+	}
+	// A read-only open of a remote file has nothing to flush, so the handle
+	// must not look dirty: that is what previously left copies behind.
+	f, err := os.Open(temp)
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
-	return &handle{f: f, temp: temp, path: n.path, lay: n.lay}, 0, 0
+	return &handle{f: f, temp: temp, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
+}
+
+// writeTemp is the scratch file that buffers a remote write before it is
+// flushed back, created through Create().
+func (n *Node) writeTemp(p string) (*handle, syscall.Errno) {
+	// Write buffers get their own key: reusing the read-cache key would let a
+	// small write truncate a large cached body that nothing asked to discard.
+	temp := filepath.Join(n.lay.Cache, hash(p)+".w")
+	if err := os.MkdirAll(n.lay.Cache, 0o700); err != nil {
+		return nil, syscall.EIO
+	}
+	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+	return &handle{f: f, temp: temp, path: p, lay: n.lay, dirty: true}, 0
 }
 
 func (n *Node) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -781,14 +806,10 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 		inode := n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)})
 		return inode, &handle{remote: p, path: p, lay: n.lay, appendOnly: true}, 0, 0
 	}
-	h := &handle{path: p, lay: n.lay, dirty: true}
-	temp := filepath.Join(n.lay.Scratch, hash(p))
-	os.MkdirAll(n.lay.Scratch, 0o700)
-	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.FileMode(mode))
-	if err != nil {
-		return nil, nil, 0, syscall.EIO
+	h, errno := n.writeTemp(p)
+	if errno != 0 {
+		return nil, nil, 0, errno
 	}
-	h.f, h.temp = f, temp
 	n.lay.Remote.WriteFile(p, nil)
 	out.Attr = attrOf(proto.SIFREG|mode, 0, ino(p))
 	child := &Node{lay: n.lay, path: p}
@@ -926,17 +947,37 @@ func itoa(v uint64) string {
 
 var _ = sync.Mutex{}
 
-// cached returns the materialised copy of a remote path when it is still fresh.
+// cached returns the copy of a remote path that is still current.
+//
+// Current means the daemon's metadata for that path still matches the metadata
+// recorded when the copy was made. Comparing the copy's own age would only tell
+// us how long ago we fetched it, which says nothing about whether the daemon
+// changed the file since.
 func (l *Layout) cached(p string) (string, proto.Attr, error) {
-	full := filepath.Join(l.Scratch, hash(p))
+	full := filepath.Join(l.Cache, hash(p))
 	fi, err := os.Stat(full)
 	if err != nil {
 		return "", proto.Attr{}, err
 	}
-	if l.TTL > 0 && time.Since(fi.ModTime()) > l.TTL {
+	stamp, err := os.ReadFile(full + ".meta")
+	if err != nil {
 		return "", proto.Attr{}, os.ErrNotExist
 	}
-	return full, proto.Attr{Size: uint64(fi.Size())}, nil
+	remote, err := l.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
+	if err != nil {
+		return "", proto.Attr{}, err
+	}
+	if remote.Kind != proto.KStat || string(stamp) != stampOf(remote.Attr) {
+		return "", proto.Attr{}, os.ErrNotExist
+	}
+	attr := remote.Attr
+	attr.Size = uint64(fi.Size())
+	return full, attr, nil
+}
+
+// stampOf renders the metadata that decides whether a cached copy is current.
+func stampOf(a proto.Attr) string {
+	return fmt.Sprintf("%d:%d:%d", a.Size, a.Mtime, a.Ino)
 }
 
 // ino is a synthetic inode number; the kernel only needs uniqueness within a

@@ -45,7 +45,7 @@ type Plan struct {
 	Cfg        *config.Config
 	Policy     *policy.Policy
 	Mount      string
-	Scratch    string
+	Cache      string
 	Trampoline string
 	Remote     *rpc.FS
 	// Local is the path policy: trees served from this machine.
@@ -81,11 +81,11 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 		Exec:       pol,
 		Local:      merged,
 		Mount:      cfg.Sandbox.Mount,
-		Scratch:    filepath.Join(cfg.Sandbox.Share, "scratch"),
+		Cache:      cfg.Sandbox.Cache,
 		Trampoline: tramp,
 		Remote:     rpc.NewFS(targetOf(cfg)),
 	}
-	for _, d := range []string{p.Mount, p.Scratch} {
+	for _, d := range []string{p.Mount, p.Cache} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, err
 		}
@@ -188,7 +188,7 @@ func (p *Plan) Layout() *fusefs.Layout {
 		ExecDirs:    execDirs,
 		Trampoline:  p.Trampoline,
 		LocalExec:   p.Exec.IsLocal,
-		Scratch:     p.Scratch,
+		Cache:       p.Cache,
 		TTL:         2 * time.Second,
 		Synthetic:   synthetic,
 		HostDirs:    hostDirs,
@@ -323,7 +323,10 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 	if p.Cfg.Daemon.Transport == "ssh" || p.Cfg.Sandbox.ShareNetwork {
 		args = append(args, "--share-net")
 	} else {
-		args = append(args, "--unshare-net-try")
+		// There is no --unshare-net-try: bwrap only offers the -try form for
+		// user and cgroup namespaces. An unprivileged process can always
+		// create a network namespace, so the plain flag is safe here.
+		args = append(args, "--unshare-net")
 	}
 	args = append(args,
 		"--die-with-parent",
@@ -343,6 +346,13 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 			)
 			argv = append([]string{"/.rsbx-guard"}, argv...)
 		}
+	}
+	// The caller's working directory only survives if the sandbox actually has
+	// it: a path under /tmp is hidden by the tmpfs, and a directory outside the
+	// sandbox tree does not exist at all. Falling back to / is what keeps the
+	// session startable in both cases.
+	if cwd, err := os.Getwd(); err == nil && cwd != "/" && p.hasPath(cwd) {
+		args = append(args, "--chdir", cwd)
 	}
 	return append(args, argv...)
 }
@@ -433,6 +443,26 @@ func (p *Plan) SandboxExecPaths() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// hasPath reports whether a path will exist inside the sandbox view: it must
+// not be hidden by the /tmp tmpfs, and it must be either local content or part
+// of the daemon tree.
+func (p *Plan) hasPath(path string) bool {
+	if path == "/tmp" || strings.HasPrefix(path, "/tmp/") {
+		return false
+	}
+	if p.Local.IsLocal(path) {
+		return true
+	}
+	for _, s := range synthetic {
+		if path == s || strings.HasPrefix(path, s+"/") {
+			return true
+		}
+	}
+	// Anything else is a daemon path; asking the daemon would need a round
+	// trip before the mount exists, so assume it may not be there.
+	return false
 }
 
 // linkTargets returns the directories holding the merged-usr link targets and

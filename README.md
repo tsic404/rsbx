@@ -124,6 +124,19 @@ The last one is the only place the sandbox is actually exercised: it needs
 `/dev/fuse` and a user namespace, which a bare runner does not provide. On
 `main` the image is pushed to `ghcr.io/<owner>/rsbx`.
 
+## Configuration notes
+
+Two things that used to be configuration and no longer are:
+
+* **The remote root is not a client setting.** It belongs to the daemon:
+  `rsbxd -root /srv/tree`. A `[remote] table` is rejected with an error that
+  says so, because accepting it silently did nothing.
+* **`sandbox.cache` is a cache, not a shared tree.** It holds copies of remote
+  files this machine has read, keyed by the daemon's metadata; an entry is used
+  only while that metadata still matches, so a file changed on the daemon is
+  refetched instead of served stale. Deleting the directory costs bandwidth and
+  nothing else.
+
 ## Tests
 
 ```sh

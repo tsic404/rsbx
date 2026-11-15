@@ -33,9 +33,19 @@ read_only_paths = [
   "/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc",
 ]
 
-[remote]
-root = "/home/tsic/remote-tree"
+# There is no [remote] table: the daemon-side root is a property of the
+# daemon, not of the client. Pass it to rsbxd:
+#
+#   rsbxd -socket ~/.rsbx/daemon.sock -root /home/tsic/remote-tree
 
 [sandbox]
 mount = "~/.rsbx/sandbox"
-share = "~/.rsbx/share"
+# Disposable copies of remote files this machine has read. Deleting it only
+# costs bandwidth; it never holds anything that is not on the daemon.
+cache = "~/.rsbx/cache"
+# Keep the host network namespace. Needed for the ssh transport (automatic),
+# and for containers that cannot create a network namespace.
+# share_network = false
+# Create a user namespace. Leave it on outside containers; some container
+# runtimes refuse a nested one.
+# unshare_user = true

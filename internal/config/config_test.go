@@ -17,9 +17,6 @@ paths = ["/work", "/home/u/repos"]
 read_only_paths = ["/usr"]
 entry = "/usr/bin/bash"
 
-[remote]
-root = "/srv/work"
-
 [sandbox]
 mount = "/home/u/.rsbx/sandbox"
 `
@@ -38,9 +35,6 @@ func TestParse(t *testing.T) {
 	wantAllow := []string{"/usr/bin", "/bin", "/opt/my tools/bin"}
 	if strings.Join(cfg.Local.Allow, "|") != strings.Join(wantAllow, "|") {
 		t.Errorf("allow = %v, want %v", cfg.Local.Allow, wantAllow)
-	}
-	if cfg.Remote.Root != "/srv/work" {
-		t.Errorf("root = %q", cfg.Remote.Root)
 	}
 	if len(cfg.Local.Paths) != 2 || len(cfg.Local.ReadOnlyPaths) != 1 {
 		t.Errorf("paths = %v read-only = %v", cfg.Local.Paths, cfg.Local.ReadOnlyPaths)
@@ -134,5 +128,39 @@ func TestParseUnshareUser(t *testing.T) {
 	d := Default()
 	if !d.Sandbox.UnshareUser {
 		t.Fatal("unshare_user must default to true")
+	}
+}
+
+// The [remote] table used to be accepted and never read, so a user who set it
+// saw no effect. It must now be a loud error rather than a silent no-op.
+func TestRemoteTableIsRejected(t *testing.T) {
+	_, err := Parse("[remote]\nroot = \"/srv/work\"\n")
+	if err == nil {
+		t.Fatal("[remote] accepted")
+	}
+	if !strings.Contains(err.Error(), "-root") {
+		t.Errorf("error does not say where the root belongs: %v", err)
+	}
+}
+
+// sandbox.share was renamed to sandbox.cache; the old name must not silently
+// configure something else.
+func TestOldShareKeyIsRejected(t *testing.T) {
+	_, err := Parse("[sandbox]\nshare = \"/tmp/x\"\n")
+	if err == nil {
+		t.Fatal("sandbox.share accepted")
+	}
+	if !strings.Contains(err.Error(), "cache") {
+		t.Errorf("error does not mention the new name: %v", err)
+	}
+}
+
+func TestTheRemoteKeysAreGone(t *testing.T) {
+	_, err := Parse("[sandbox]\nremote = \"/srv/work\"\n")
+	if err == nil {
+		t.Fatal("sandbox.remote accepted")
+	}
+	if !strings.Contains(err.Error(), "-root") {
+		t.Errorf("error does not point at -root: %v", err)
 	}
 }
