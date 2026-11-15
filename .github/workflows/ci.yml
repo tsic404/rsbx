@@ -228,6 +228,8 @@ jobs:
           RSBX_PROJ=/proj/fleet /e2e/probes/agents.sh
           echo "=== process ==="
           RSBX_PROJ=/proj/proc /e2e/probes/process.sh
+          echo "=== cache ==="
+          RSBX_PROJ=/proj/cache /e2e/probes/cache.sh
           INNER
           # The same probes a developer runs by hand, plus one round of an
           # agent's real project work: 23 checks covering atomic write, append,
@@ -236,8 +238,9 @@ jobs:
           cp testdata/probe/semantics.sh e2e/probes/semantics.sh
           cp testdata/probe/agents.sh e2e/probes/agents.sh
           cp testdata/probe/process.sh e2e/probes/process.sh
+          cp testdata/probe/cache.sh e2e/probes/cache.sh
           chmod 777 e2e/probes/workload.sh e2e/probes/semantics.sh \
-            e2e/probes/agents.sh e2e/probes/process.sh
+            e2e/probes/agents.sh e2e/probes/process.sh e2e/probes/cache.sh
           docker run --rm --privileged --user 0 \
             -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
             --entrypoint /bin/bash rsbx:ci -c '
@@ -255,7 +258,7 @@ jobs:
             echo "workload checks failed:"; grep "^FAIL" probe-out.txt; exit 1
           fi
           total=$(grep -cE '^(OK|SKIP)' probe-out.txt)
-          test "$total" -eq 63
+          test "$total" -eq 69
 
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
