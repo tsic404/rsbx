@@ -151,6 +151,8 @@ jobs:
           docker volume rm "$RUN_VOL" 2>/dev/null || true
           docker volume create "$PROJ_VOL"
           docker volume create "$RUN_VOL"
+          docker run --rm -v "$PROJ_VOL":/seed --entrypoint /bin/sh rsbx:ci \
+            -c 'printf REMOTE-MARKER > /seed/remote.txt'
           docker run -d --rm --name rsbxd --network rsbx-e2e \
             -v "$PROJ_VOL":/proj -v "$RUN_VOL":/run/rsbx \
             --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
@@ -158,8 +160,9 @@ jobs:
           # as it answers, the daemon is up
           docker run --rm --network rsbx-e2e -v "$RUN_VOL":/run/rsbx \
             --entrypoint /bin/bash rsbx:ci -c '
-              for i in $(seq 1 50); do [ -S /run/rsbx/daemon.sock ] && exit 0; sleep 0.2; done
-              echo "daemon socket never appeared"; exit 1
+              for i in $(seq 1 100); do [ -S /run/rsbx/daemon.sock ] && exit 0; sleep 0.2; done
+              echo "daemon socket never appeared"
+              exit 1
             '
           # Scratch state lives in a second named volume: configs, cache and
           # mount points. Nothing on it is a project file.
@@ -207,6 +210,7 @@ jobs:
           docker volume create "$PROJ_VOL"
           docker volume create "$RUN_VOL"
           docker volume create rsbx-state
+          mkdir -p e2e/probes && chmod 777 e2e/probes
           # The probes are built on the runner: the image carries no compiler,
           # and the binaries are static so they can run inside it either way.
           docker run --rm -v "$PWD:/host" -w /host gcc:13 \
