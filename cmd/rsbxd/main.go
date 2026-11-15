@@ -1,4 +1,5 @@
-// Command rsbxd is the daemon: it runs commands and owns the remote tree.
+// Command rsbxd is the daemon: it runs commands and owns the remote tree. Its
+// own root is the remote filesystem; there is no -root override and no jail.
 package main
 
 import (
@@ -19,7 +20,6 @@ var version = "dev"
 func main() {
 	showVer := flag.Bool("version", false, "print the version and exit")
 	sock := flag.String("socket", "", "unix socket to listen on (empty = stdio)")
-	root := flag.String("root", "", "remote root directory")
 	stdio := flag.Bool("stdio", false, "serve a single session over stdin/stdout")
 	flag.Parse()
 
@@ -27,17 +27,7 @@ func main() {
 		fmt.Println("rsbxd", version)
 		return
 	}
-	if *root == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			log.Fatal(err)
-		}
-		*root = home
-	}
-	if err := os.MkdirAll(*root, 0o755); err != nil {
-		log.Fatal(err)
-	}
-	srv := &daemon.Server{Root: *root}
+	srv := &daemon.Server{}
 
 	if *stdio || *sock == "" {
 		srv.ServeConn(stdioConn{})
@@ -65,7 +55,7 @@ func main() {
 		log.Fatal(err)
 	}
 	os.Chmod(*sock, 0o600)
-	log.Printf("rsbxd: socket=%s root=%s", *sock, *root)
+	log.Printf("rsbxd: socket=%s", *sock)
 	for {
 		c, err := ln.Accept()
 		if err != nil {

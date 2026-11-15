@@ -2,9 +2,13 @@
 # One round of realistic agent work, run inside the sandbox.
 #
 # Prints "OK <name>" or "FAIL <name>: <why>" for each check and nothing else, so
-# a caller can count passes and diff failures. RSBX_PROJ names the directory to
-# work in; it must be on the remote tree, since everything here stands in for
-# what an agent does to its project.
+# a caller can count passes and diff failures.
+#
+# This is a DESTRUCTIVE probe: it wipes its working directory clean on every
+# run. It therefore refuses to run against a default host path. RSBX_PROJ must
+# name a disposable scratch directory — a fresh subdirectory of the remote
+# tree, or a throwaway container volume — that the probe is allowed to delete.
+# It is never safe to let this fall back to a host /proj.
 #
 # Every check exists because it once failed:
 #
@@ -21,7 +25,8 @@
 #   git_commit       link(2) produced an invisible entry; dentry caching then
 #                    hid a directory created microseconds earlier
 set -u
-R=${RSBX_PROJ:-/proj/run}
+: "${RSBX_PROJ:?set RSBX_PROJ to a disposable scratch directory for this destructive probe}"
+R=$RSBX_PROJ
 # Start from a clean directory. Every check asserts on an exact result, so state
 # left by an earlier run turns into a false failure — a leftover file makes
 # "ln" fail with EEXIST and a leftover directory makes "mkdir" fail the same way.
@@ -114,5 +119,15 @@ N1=$(ls -la "$R" 2>/dev/null | wc -l); N2=$(find "$R" -maxdepth 1 2>/dev/null | 
 [ "$N2" -ge 5 ] && ok readdir || bad readdir "entries=$N2"
 
 # concurrent writers, separate files
-for i in 1 2 3 4; do ( for j in $(seq 1 40); do printf 'w%d-%d\n' $i $j >> "$R/conc.$i"; done ) & done; wait
-[ "$(cat "$R"/conc.* 2>/dev/null | wc -l)" = 160 ] && ok concurrent || bad concurrent "lines=$(cat "$R"/conc.* 2>/dev/null|wc -l)"
+writer_pids=()
+for i in 1 2 3 4; do
+  ( for j in $(seq 1 40); do printf 'w%d-%d\n' "$i" "$j" >> "$R/conc.$i" || exit 1; done ) &
+  writer_pids+=($!)
+done
+writer_rc=0
+for writer_pid in "${writer_pids[@]}"; do wait "$writer_pid" || writer_rc=1; done
+if [ $writer_rc -eq 0 ] && [ "$(cat "$R"/conc.* 2>/dev/null | wc -l)" = 160 ]; then
+  ok concurrent
+else
+  bad concurrent "lines=$(cat "$R"/conc.* 2>/dev/null|wc -l)"
+fi

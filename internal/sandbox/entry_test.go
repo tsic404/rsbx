@@ -15,9 +15,10 @@ func TestEntryProgramIsAllowedImplicitly(t *testing.T) {
 	if err := os.WriteFile(entry, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	tramp := filepath.Join(dir, "rsbx-tramp")
-	if err := os.WriteFile(tramp, []byte("x"), 0o755); err != nil {
-		t.Fatal(err)
+	for _, helper := range []string{"rsbx-tramp", "rsbx-guard"} {
+		if err := os.WriteFile(filepath.Join(dir, helper), []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	cfg := testCfg()
@@ -50,9 +51,10 @@ func TestEntryProgramIsAllowedImplicitly(t *testing.T) {
 // rather than silently failing at exec time.
 func TestRelativeEntryRejected(t *testing.T) {
 	dir := tempDirOutsideTmp(t)
-	tramp := filepath.Join(dir, "rsbx-tramp")
-	if err := os.WriteFile(tramp, []byte("x"), 0o755); err != nil {
-		t.Fatal(err)
+	for _, helper := range []string{"rsbx-tramp", "rsbx-guard"} {
+		if err := os.WriteFile(filepath.Join(dir, helper), []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg := testCfg()
 	cfg.Local.Allow = []string{"/usr/bin/true"}

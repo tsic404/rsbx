@@ -3,8 +3,11 @@
 #
 # Each check names the behaviour it asserts, so a failure identifies the
 # operation rather than just "something broke".
+# Destructive probe: RSBX_PROJ must be a disposable scratch directory; it is
+# never safe to fall back to a host /proj, which this probe wipes clean.
 set -u
-R=${RSBX_PROJ:-/proj/deep}
+: "${RSBX_PROJ:?set RSBX_PROJ to a disposable scratch directory for this destructive probe}"
+R=$RSBX_PROJ
 mkdir -p "$R" 2>/dev/null
 if [ -d "$R" ]; then
   find "$R" -mindepth 1 -delete 2>/dev/null || rm -rf "${R:?}"/* 2>/dev/null
@@ -139,11 +142,13 @@ t_sparse(){ local e; e=$(sparse 2>&1); [ $? -eq 0 ] && ok sparse_extend || bad s
 concappend(){
   local f=$R/shared.log
   : > "$f" || return 1
-  local i
+  local i pids=() pid rc=0
   for i in 1 2 3 4 5 6 7 8; do
-    ( local j; for j in $(seq 1 50); do printf 'p%d-%03d\n' "$i" "$j" >> "$f"; done ) &
+    ( local j; for j in $(seq 1 50); do printf 'p%d-%03d\n' "$i" "$j" >> "$f" || exit 1; done ) &
+    pids+=($!)
   done
-  wait
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  [ $rc -eq 0 ] || { echo "an appender failed"; return 1; }
   local n; n=$(wc -l < "$f") || return 1
   [ "$n" = 400 ] || { echo "lines=$n want 400"; return 1; }
   # every line must be intact: a torn write shows up as a line of the wrong shape
@@ -167,9 +172,10 @@ readdir_mut(){
   mkdir -p "$R/busy" || return 1
   local i
   for i in $(seq 1 50); do : > "$R/busy/f$i"; done
-  ( local j; for j in $(seq 51 100); do : > "$R/busy/f$j"; done ) &
+  ( local j; for j in $(seq 51 100); do : > "$R/busy/f$j" || exit 1; done ) &
+  local mutator=$!
   local out; out=$(ls "$R/busy" 2>&1) || { echo "ls failed: ${out:0:60}"; return 1; }
-  wait
+  wait "$mutator" || { echo "mutator failed"; return 1; }
   local n; n=$(ls "$R/busy" | wc -l)
   [ "$n" = 100 ] || { echo "count=$n"; return 1; }
 }
@@ -268,14 +274,16 @@ t_dirlink(){ local e; e=$(dirlink 2>&1); [ $? -eq 0 ] && ok symlink_to_dir || ba
 # Many processes creating and removing the same names. A racing directory
 # operation must report ENOENT/EEXIST, never anything else.
 conc_mkdir(){
-  local i
+  local i pids=() pid rc=0
   for i in 1 2 3 4; do
     ( local j; for j in $(seq 1 30); do
         mkdir "$R/race-$i" 2>/dev/null || true
         rmdir "$R/race-$i" 2>/dev/null || true
       done ) &
+    pids+=($!)
   done
-  wait
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  [ $rc -eq 0 ] || { echo "a racer failed"; return 1; }
   # nothing may be left behind
   local left; left=$(ls -d "$R"/race-* 2>/dev/null | wc -l)
   [ "$left" = 0 ] || { echo "leftover=$left"; return 1; }

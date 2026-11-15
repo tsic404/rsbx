@@ -2,8 +2,8 @@ package sandbox
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -12,9 +12,9 @@ import (
 // LandlockRuleset builds a ruleset that permits execve only for the listed
 // paths plus the dynamic loaders.
 //
-// The paths are interpreted inside the sandbox, after bwrap has built the view,
-// which is why they are sandbox-absolute ("/usr/bin/bash") rather than host
-// paths: the guard runs where the kernel resolves them that way.
+// The paths are interpreted inside the sandbox, after the launcher has built
+// the view, which is why they are sandbox-absolute ("/usr/bin/bash") rather
+// than host paths: the guard runs where the kernel resolves them that way.
 func LandlockRuleset(paths []string) (int, error) {
 	attr := unix.LandlockRulesetAttr{Access_fs: unix.LANDLOCK_ACCESS_FS_EXECUTE}
 	fd, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
@@ -52,9 +52,10 @@ func addPathBeneath(ruleset int, path string) error {
 	return nil
 }
 
-// loaderPaths lists the dynamic loaders relative to a sandbox root. Every
+// loaderPaths lists the dynamic loaders relative to the sandbox root. Every
 // dynamically linked ELF is executed through one, so denying it would deny the
-// allowlist too.
+// allowlist too. The list is the set of interpreters, not a grant for the
+// library trees around them.
 func loaderPaths() []string {
 	paths := []string{
 		"/lib64/ld-linux-x86-64.so.2",
@@ -94,4 +95,4 @@ func ApplyLandlock(paths []string) error {
 }
 
 var _ = filepath.Join
-var _ = os.Getenv
+var _ = strings.HasPrefix

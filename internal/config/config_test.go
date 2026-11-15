@@ -61,6 +61,12 @@ func TestMissingFileYieldsDefaults(t *testing.T) {
 	if cfg.Daemon.Transport == "" {
 		t.Fatal("defaults not applied")
 	}
+	if len(cfg.Local.Allow) != 0 || cfg.Local.Entry != "/bin/sh" {
+		t.Errorf("default local: allow=%v entry=%q", cfg.Local.Allow, cfg.Local.Entry)
+	}
+	if len(cfg.Local.ReadOnlyPaths) != 0 {
+		t.Errorf("default read_only_paths = %v, want empty", cfg.Local.ReadOnlyPaths)
+	}
 }
 
 // The shipped example uses multi-line arrays, because a long allowlist is
@@ -132,14 +138,15 @@ func TestParseUnshareUser(t *testing.T) {
 }
 
 // The [remote] table used to be accepted and never read, so a user who set it
-// saw no effect. It must now be a loud error rather than a silent no-op.
+// saw no effect. It must now be a loud error rather than a silent no-op:
+// rsbxd serves its own native filesystem, so there is nothing to configure.
 func TestRemoteTableIsRejected(t *testing.T) {
 	_, err := Parse("[remote]\nroot = \"/srv/work\"\n")
 	if err == nil {
 		t.Fatal("[remote] accepted")
 	}
-	if !strings.Contains(err.Error(), "-root") {
-		t.Errorf("error does not say where the root belongs: %v", err)
+	if !strings.Contains(err.Error(), "rsbxd serves its own filesystem") {
+		t.Errorf("error does not say the daemon serves its own filesystem: %v", err)
 	}
 }
 
@@ -160,7 +167,7 @@ func TestTheRemoteKeysAreGone(t *testing.T) {
 	if err == nil {
 		t.Fatal("sandbox.remote accepted")
 	}
-	if !strings.Contains(err.Error(), "-root") {
-		t.Errorf("error does not point at -root: %v", err)
+	if !strings.Contains(err.Error(), "rsbxd serves its own filesystem") {
+		t.Errorf("error does not say the daemon serves its own filesystem: %v", err)
 	}
 }

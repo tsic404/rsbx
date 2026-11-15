@@ -14,6 +14,14 @@ permissions:
   # this block.
   packages: write
 
+env:
+  # The daemon container serves its project tree from this named volume; the
+  # client container never mounts it.
+  PROJ_VOL: rsbx-proj
+  # Both ends reach each other through this shared socket volume. It is wiped
+  # at the start of the docker job, so every run gets a clean daemon.
+  RUN_VOL: rsbx-run
+
 jobs:
   test:
     name: build and test
@@ -45,8 +53,6 @@ jobs:
       # which a normal runner does not provide. The unit tests cover the
       # policies and the protocol, so they run here; the sandbox test runs in
       # the docker job below, where the container can be given the devices.
-      # The mount-backed tests in internal/fusefs need /dev/fuse, which this
-      # runner does not have; they skip here and run for real in the docker job.
       # The mount-backed tests in internal/fusefs need /dev/fuse, which this
       # runner does not have; they skip here and run for real in the docker job.
       - name: go test
@@ -117,64 +123,75 @@ jobs:
 
       # /dev/fuse exists here, so the mount-backed filesystem tests run for real
       # instead of skipping. This is the only place CI exercises the FUSE write
-      # paths.
+      # paths. The test container is disposable; the image is the same slim one
+      # the daemon and client run from, plus the Go toolchain of the build stage.
       - name: filesystem tests with a real mount
         run: |
           docker build --target test -t rsbx-test-env .
           docker run --rm --privileged --user 0 -v /dev/fuse:/dev/fuse \
             rsbx-test-env test ./internal/fusefs
 
+      # Every end-to-end job below has the same shape: the daemon runs in its
+      # own disposable container with a throwaway project volume mounted at
+      # /proj — that mount IS the remote tree, native paths, no root argument —
+      # and the client runs in a second container that shares only the socket
+      # volume and its own scratch state. The client never binds the project:
+      # its only view of /proj is the one the daemon serves.
+      #
+      # The containers talk to each other on a shared docker network, so the
+      # client reaches the daemon's socket through the run volume.
+
       # A sandbox needs /dev/fuse plus an unprivileged user namespace, so the
-      # container runs privileged. This exercises the real path: a daemon
-      # serves a remote tree, the client mounts it over FUSE, and a local
-      # shell reads a file that only exists on the daemon side.
+      # client container runs privileged. This exercises the real path: a
+      # daemon serves its own /proj, the client mounts it over FUSE, and a
+      # local shell reads a file that only exists on the daemon side.
       - name: sandbox end to end
         run: |
-          mkdir -p e2e/tree e2e/localrw e2e/state/sandbox
-          echo REMOTE-MARKER > e2e/tree/remote.txt
-          echo LOCAL-CONTENT > e2e/localrw/local.txt
-          chmod -R 777 e2e
-          cat > e2e/config.toml <<'CFG'
-          [daemon]
-          transport = "unix"
-          socket = "/e2e/state/d.sock"
-
-          [local]
-          allow = ["/usr/bin/bash", "/usr/bin/env", "/usr/bin/true",
-                   "/usr/bin/ls", "/usr/bin/stat", "/usr/bin/cat"]
-          paths = ["/e2e/localrw"]
-          # /usr/bin holds the allowlisted commands, so it has to be local too.
-          read_only_paths = ["/usr/bin", "/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
-          entry = "/usr/bin/bash"
-
-          [sandbox]
-          mount = "/e2e/state/sandbox"
-          cache = "/e2e/state/cache"
-          # The runner's privileged container cannot configure loopback in a
-          # fresh network namespace (RTM_NEWADDR is refused), so the sandbox
-          # keeps the host one. Only the network is shared; mounts, pid, ipc
-          # and uts are still unshared.
-          share_network = true
-          # Likewise for the user namespace: the outer runtime already
-          # created one, and GitHub refuses a nested uid map.
-          unshare_user = false
-          CFG
-          # --user 0 matters: bwrap creates a pid namespace, which for a
-          # non-root caller implies a user namespace, and the runner refuses
-          # the uid map. As the container's root it does not need one.
-          docker run --rm --privileged --user 0 \
-            -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
+          docker network create rsbx-e2e
+          docker volume rm "$RUN_VOL" 2>/dev/null || true
+          docker volume create "$PROJ_VOL"
+          docker volume create "$RUN_VOL"
+          docker run -d --rm --name rsbxd --network rsbx-e2e \
+            -v "$PROJ_VOL":/proj -v "$RUN_VOL":/run/rsbx \
+            --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
+          # the client waits for the socket instead of a fixed sleep: as soon
+          # as it answers, the daemon is up
+          docker run --rm --network rsbx-e2e -v "$RUN_VOL":/run/rsbx \
             --entrypoint /bin/bash rsbx:ci -c '
-              mkdir -p /e2e/state/sandbox
-              rsbxd -socket /e2e/state/d.sock -root /e2e/tree >/tmp/daemon.log 2>&1 &
-              sleep 2
-              rsbx -config /e2e/config.toml -- /usr/bin/bash -c "
-                echo \"local shell: \$(readlink /proc/self/exe)\"
-                echo \"local tree:  \$(cat < /e2e/localrw/local.txt)\"
-                echo \"remote file: \$(/usr/bin/cat /remote.txt)\"
-                # a local stat of a local tree is what makes an agent work
-                echo \"local stat:  \$(/usr/bin/stat -c %s /e2e/localrw/local.txt)\"
-                test \"\$(/usr/bin/cat /remote.txt)\" = REMOTE-MARKER
+              for i in $(seq 1 50); do [ -S /run/rsbx/daemon.sock ] && exit 0; sleep 0.2; done
+              echo "daemon socket never appeared"; exit 1
+            '
+          # Scratch state lives in a second named volume: configs, cache and
+          # mount points. Nothing on it is a project file.
+          docker volume create rsbx-state
+          docker run --rm --privileged --network rsbx-e2e \
+            -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
+            --entrypoint /bin/bash rsbx:ci -c '
+              mkdir -p /e2e/state/sandbox /e2e/state/cache
+              cat > /e2e/state/config.toml <<CFG
+              [daemon]
+              transport = "unix"
+              socket = "/.rsbx-rpc/daemon.sock"
+
+              [local]
+              allow = []
+              entry = "/bin/sh"
+
+              [sandbox]
+              mount = "/e2e/state/sandbox"
+              cache = "/e2e/state/cache"
+              # The privileged client container cannot configure loopback in a
+              # fresh network namespace (RTM_NEWADDR is refused), so the
+              # sandbox keeps the host one. Only the network is shared; mounts,
+              # pid, ipc and uts are still unshared.
+              share_network = true
+              # The outer runtime already created the user namespace, and
+              # GitHub refuses a nested uid map.
+              unshare_user = false
+              CFG
+              rsbx -config /e2e/state/config.toml -- /bin/sh -c "
+                echo \"remote file: \$(cat /proj/remote.txt)\"
+                test \"\$(cat /proj/remote.txt)\" = REMOTE-MARKER
               "
             ' | tee out.txt
           grep -q "remote file: REMOTE-MARKER" out.txt
@@ -185,26 +202,32 @@ jobs:
       - name: persistence probes
         if: always()
         run: |
-          # A previous run may have left root-owned files from the container.
-          sudo rm -rf e2e || true
-          mkdir -p e2e/probes e2e/state e2e/tree
-          # Built on the runner: the image carries no compiler, and the probes
-          # are static so they can run inside it either way.
-          gcc -static -O1 -o e2e/probes/atomic_write testdata/probe/atomic_write.c
-          gcc -static -O1 -o e2e/probes/durable_write testdata/probe/durable_write.c
-          chmod 777 e2e e2e/probes e2e/state e2e/tree
+          # A previous run may have left root-owned files in the volumes.
+          docker volume rm "$RUN_VOL" rsbx-state 2>/dev/null || true
+          docker volume create "$PROJ_VOL"
+          docker volume create "$RUN_VOL"
+          docker volume create rsbx-state
+          # The probes are built on the runner: the image carries no compiler,
+          # and the binaries are static so they can run inside it either way.
+          docker run --rm -v "$PWD:/host" -w /host gcc:13 \
+            sh -c 'gcc -static -O1 -o /host/e2e/probes/atomic_write testdata/probe/atomic_write.c \
+                   && gcc -static -O1 -o /host/e2e/probes/durable_write testdata/probe/durable_write.c'
+          chmod 777 e2e/probes
+          # Seed the daemon's project volume. The client side never mounts it.
+          docker run --rm -v "$PROJ_VOL":/seed -v "$PWD/e2e:/e2e" \
+            --entrypoint /bin/bash rsbx:ci -c 'cp /e2e/probes/* /seed/ && chmod 777 /seed/*'
           cat > e2e/probe.toml <<'CFG'
           [daemon]
           transport = "unix"
-          socket = "/e2e/state/d.sock"
+          socket = "/.rsbx-rpc/daemon.sock"
 
           [local]
           # The workload drives ordinary shell utilities; each has to run where
-          # the filesystem is, which is here. Only the data they touch is remote.
-          allow = ["/usr/bin", "/bin", "/e2e/probes"]
-          paths = ["/e2e/state", "/e2e/probes"]
-          read_only_paths = ["/usr/bin", "/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
-          entry = "/usr/bin/bash"
+          # the filesystem is. Inside the sandbox that is the daemon: /proj and
+          # its tools are one tree, so nothing is allowlisted locally. Only the
+          # probe binaries live on the client's scratch volume.
+          allow = []
+          entry = "/bin/sh"
 
           [sandbox]
           mount = "/e2e/state/sandbox"
@@ -212,49 +235,23 @@ jobs:
           share_network = true
           unshare_user = false
           CFG
-          cat > e2e/probes/probe.sh <<'INNER'
-          echo "=== atomic write (create, rename, reopen) ==="
-          /e2e/probes/atomic_write /e2e/state session.jsonl
-          echo "=== durable write (fsync, wal) ==="
-          /e2e/probes/durable_write /e2e/state
-          echo "=== workload ==="
-          # /proj is the daemon's root as the sandbox sees it: rsbxd serves
-          # /e2e/tree, so a project path there is remote content, which is the
-          # point of the exercise.
-          RSBX_PROJ=/proj /e2e/probes/workload.sh
-          echo "=== semantics ==="
-          RSBX_PROJ=/proj/deep /e2e/probes/semantics.sh
-          echo "=== agents ==="
-          RSBX_PROJ=/proj/fleet /e2e/probes/agents.sh
-          echo "=== process ==="
-          RSBX_PROJ=/proj/proc /e2e/probes/process.sh
-          echo "=== cache ==="
-          RSBX_PROJ=/proj/cache /e2e/probes/cache.sh
-          echo "=== execloc ==="
-          RSBX_PROJ=/e2e/probes RSBX_EXEC_DIR=/e2e/probes /e2e/probes/execloc.sh
-          echo "=== runtime ==="
-          RSBX_PROJ=/proj/rt /e2e/probes/runtime.sh
-          INNER
-          # The same probes a developer runs by hand, plus one round of an
-          # agent's real project work: 23 checks covering atomic write, append,
-          # truncate, links, chmod, utimes, rm -rf, sqlite, tar and git.
-          cp testdata/probe/workload.sh e2e/probes/workload.sh
-          cp testdata/probe/semantics.sh e2e/probes/semantics.sh
-          cp testdata/probe/agents.sh e2e/probes/agents.sh
-          cp testdata/probe/process.sh e2e/probes/process.sh
-          cp testdata/probe/cache.sh e2e/probes/cache.sh
-          cp testdata/probe/execloc.sh e2e/probes/execloc.sh
-          cp testdata/probe/runtime.sh e2e/probes/runtime.sh
-          chmod 777 e2e/probes/workload.sh e2e/probes/semantics.sh \
-            e2e/probes/agents.sh e2e/probes/process.sh e2e/probes/cache.sh \
-            e2e/probes/execloc.sh e2e/probes/runtime.sh
-          docker run --rm --privileged --user 0 \
-            -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
+          # The same probes a developer runs by hand: workload, semantics,
+          # agents, process, cache, execloc and runtime, driven by one script.
+          # RSBX_PROJ is the daemon's native /proj/probe path — a disposable
+          # directory on the throwaway volume the daemon container serves.
+          docker run --rm --privileged --network rsbx-e2e \
+            -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             --entrypoint /bin/bash rsbx:ci -c '
-              mkdir -p /e2e/state/sandbox
-              rsbxd -socket /e2e/state/d.sock -root /e2e/tree >/tmp/d.log 2>&1 &
-              sleep 2
-              rsbx -config /e2e/probe.toml -- /usr/bin/bash /e2e/probes/probe.sh
+              mkdir -p /e2e/state/sandbox /e2e/state/cache
+              rsbx -config /e2e/probe.toml -- /bin/sh -c "
+                RSBX_PROJ=/proj/probe/run /proj/probe/workload.sh
+                RSBX_PROJ=/proj/probe/deep /proj/probe/semantics.sh
+                RSBX_PROJ=/proj/probe/fleet /proj/probe/agents.sh
+                RSBX_PROJ=/proj/probe/proc /proj/probe/process.sh
+                RSBX_PROJ=/proj/probe/cache /proj/probe/cache.sh
+                RSBX_PROJ=/proj/probe/exec RSBX_EXEC_DIR=/e2e/probes /proj/probe/execloc.sh
+                RSBX_PROJ=/proj/probe/rt /proj/probe/runtime.sh
+              "
             ' | tee probe-out.txt
           grep -q "reopen ok: payload" probe-out.txt
           grep -q "sqlite-like ok" probe-out.txt
@@ -269,39 +266,49 @@ jobs:
 
       # Two rsbx clients sharing one daemon tree, which is what an agent team
       # in a repo is. The single-session probes cannot exercise this; it needs
-      # several mount points and concurrent clients.
+      # several mount points and concurrent clients. Both clients run in their
+      # own container against the same daemon socket; neither mounts /proj.
       - name: concurrent sessions on one daemon
         run: |
-          cp testdata/probe/dual.sh e2e/probes/dual.sh
-          chmod 777 e2e/probes/dual.sh
-          mkdir -p e2e/probes/cfg
-          # The probe writes one config per session; only the mount and cache
-          # differ, so it starts from this template.
-          cat > e2e/probes/cfg/base.toml <<'CFG'
-          [daemon]
-          transport = "unix"
-          socket = "/e2e/home/d.sock"
-
-          [local]
-          allow = ["/usr/bin", "/bin"]
-          paths = []
-          entry = "/usr/bin/bash"
-
-          [sandbox]
-          mount = "#MOUNT#"
-          cache = "#CACHE#"
-          share_network = true
-          unshare_user = false
-          CFG
-          docker run --rm --privileged --user 0 \
-            -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
+          docker volume rm "$RUN_VOL" rsbx-state 2>/dev/null || true
+          docker volume create "$PROJ_VOL"
+          docker volume create "$RUN_VOL"
+          docker volume create rsbx-state
+          docker network create rsbx-dual
+          docker run -d --rm --name rsbxd --network rsbx-dual \
+            -v "$PROJ_VOL":/proj -v "$RUN_VOL":/run/rsbx \
+            --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
+          docker run --rm --network rsbx-dual -v "$RUN_VOL":/run/rsbx \
             --entrypoint /bin/bash rsbx:ci -c '
-              mkdir -p /e2e/home /e2e/tree /e2e/probes/cfg
-              rsbxd -socket /e2e/home/d.sock -root /e2e/tree >/tmp/d.log 2>&1 &
-              sleep 2
-              D=/e2e/home MNT=/e2e/home TREE=/e2e/tree \
-                F=$(command -v rsbx) CFG_BASE=/e2e/probes/cfg/base.toml \
-                bash /e2e/probes/dual.sh
+              for i in $(seq 1 50); do [ -S /run/rsbx/daemon.sock ] && exit 0; sleep 0.2; done
+              echo "daemon socket never appeared"; exit 1
+            '
+          # Copy the probe in, then run it: one container hosts the two client
+          # sessions because they need a shared MNT scratch home.
+          docker run --rm --privileged --network rsbx-dual \
+            -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
+            -v "$PWD/testdata/probe/dual.sh:/probe/dual.sh:ro" \
+            --entrypoint /bin/bash rsbx:ci -c '
+              mkdir -p /e2e/state/cfg
+              cat > /e2e/state/cfg/base.toml <<CFG
+              [daemon]
+              transport = "unix"
+              socket = "/.rsbx-rpc/daemon.sock"
+
+              [local]
+              allow = []
+              entry = "/bin/sh"
+
+              [sandbox]
+              mount = "#MOUNT#"
+              cache = "#CACHE#"
+              share_network = true
+              unshare_user = false
+              CFG
+              chmod 777 /e2e/state
+              D=/e2e/state MNT=/e2e/state TREE=/proj \
+                F=$(command -v rsbx) CFG_BASE=/e2e/state/cfg/base.toml \
+                bash /probe/dual.sh
             ' | tee dual-out.txt
           if grep -q "^FAIL" dual-out.txt; then
             echo "dual-session checks failed:"; grep "^FAIL" dual-out.txt; exit 1

@@ -2,8 +2,11 @@
 # The runtime facts an agent depends on before any model is involved: a large
 # program starts, finds its libraries, reads and writes its own state, and the
 # tree it sees is the sandbox's rather than this machine's.
+# Destructive probe: RSBX_PROJ must be a disposable scratch directory; it is
+# never safe to fall back to a host /proj, which this probe wipes clean.
 set -u
-R=${RSBX_PROJ:-/proj/rt}
+: "${RSBX_PROJ:?set RSBX_PROJ to a disposable scratch directory for this destructive probe}"
+R=$RSBX_PROJ
 mkdir -p "$R" 2>/dev/null
 if [ -d "$R" ]; then find "$R" -mindepth 1 -delete 2>/dev/null; fi
 mkdir -p "$R" || { echo "FAIL setup: cannot create $R"; exit 1; }

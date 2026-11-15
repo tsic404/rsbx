@@ -2,27 +2,28 @@
 //
 // The tree is a union of two layers:
 //
-//	remote  — answered by the daemon; reads and writes go over the wire
-//	host    — host directories kept read-only so whitelisted binaries work
+//	remote  — answered by the daemon; every open file is a real daemon
+//	          descriptor, so reads, writes, stat, fsync and locks all act on
+//	          the same object the daemon's programs see
+//	host    — host directories kept read-only so allowlisted binaries work
 //
-// Executable directories are special: a name whose host path is *not* on the
-// local allowlist is replaced by the trampoline binary. The host executable is
-// then not reachable under that name at all, which is what makes redirection
-// hold for statically linked programs too.
+// Executable directories are special. A name that is a program on the daemon
+// and is not allowed to run here is replaced by the trampoline binary. A path
+// inside an explicitly local tree is always that tree's own content: local
+// content takes precedence over execution policy, so a script in a local tree
+// is never replaced by trampoline bytes.
 package fusefs
 
 import (
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"log"
 	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -40,7 +41,9 @@ type LocalPaths interface {
 	Roots() []string
 }
 
-// Remote answers filesystem requests against the daemon tree.
+// Remote answers filesystem requests against the daemon tree. Handle-based
+// production opens always carry a real daemon descriptor; ReadFile and
+// WriteFile are whole-file conveniences built on those handles.
 type Remote interface {
 	Do(req *proto.FxReq) (*proto.FxResp, error)
 	ReadFile(p string) ([]byte, proto.Attr, error)
@@ -51,22 +54,26 @@ type Remote interface {
 type Layout struct {
 	Remote Remote
 	// Local is the set of trees served from this machine. A path that matches
-	// is opened, read and written directly: the daemon is never consulted.
+	// is that tree's own content first: it is opened, read and written
+	// directly, whatever the execution policy says. Content priority wins
+	// over exec redirection.
 	Local LocalPaths
 	// ExecDirs lists sandbox directories whose names resolve through the
-	// allowlist; a non-local name yields the trampoline.
+	// allowlist; a remote program that may not run here yields the
+	// trampoline. Names inside explicit local trees are never redirected.
 	ExecDirs []string
 	// Trampoline is the local ELF served for trapped names.
 	Trampoline string
 	// LocalExec reports whether an executable may run on this machine.
 	LocalExec func(hostPath string) bool
-	// Cache holds copies of remote files that were read, so repeated opens
-	// are served locally. It is disposable.
+	// Cache is disposable scratch space owned by the sandbox. The filesystem
+	// no longer keeps copies of remote content here: every remote open is a
+	// real daemon handle, so there is no snapshot to be stale.
 	Cache string
 	// TTL caches negative and positive lookups for this long.
 	TTL time.Duration
-	// Synthetic lists paths that exist only as mount points (bwrap needs to
-	// create them), e.g. "/proc", "/dev", "/tmp".
+	// Synthetic lists paths that exist only as mount points (the launcher
+	// creates them), e.g. "/proc", "/dev", "/tmp".
 	Synthetic []string
 	// SyntheticFiles are mount points that are files, e.g. the guard binary.
 	SyntheticFiles []string
@@ -179,21 +186,24 @@ func isLoader(p string) bool {
 	return strings.HasSuffix(base, ".so") || strings.Contains(base, ".so.")
 }
 
-// execTarget returns the single file that backs an exec-policy member: either
-// the local binary or the trampoline. Every filesystem operation goes through
-// this decision so sizes and contents cannot disagree.
-// execTarget resolves an allowlisted name to the file that backs it here.
-//
-// A name with no local file is served by the trampoline, so the file to stat is
-// the trampoline itself. Only when the policy declines both — the name is local
-// and allowed — does this stat the real path.
-func (n *Node) execTarget(p string) (string, os.FileInfo, error) {
-	if trap, ok := n.trapFor(p); ok {
-		fi, err := os.Stat(trap)
-		return trap, fi, err
+// allowedExec returns the file info for an allowlisted program: the one path
+// outside an explicit local tree that may expose its own host bytes. Every
+// other name in an exec-policy directory is ordinary session content and is
+// served remote, even when the same name happens to exist on this host. Only
+// the allowed executable's own bytes (and the ancestors that hold it) are host
+// content; membership in a program directory never exposes a host listing.
+func (n *Node) allowedExec(p string) (os.FileInfo, bool) {
+	if n.lay.LocalExec == nil || isLoader(p) {
+		return nil, false
 	}
-	fi, err := os.Stat(p)
-	return p, fi, err
+	fi, err := os.Lstat(p)
+	if err != nil || !fi.Mode().IsRegular() || fi.Mode()&0o111 == 0 {
+		return nil, false
+	}
+	if !n.lay.LocalExec(p) {
+		return nil, false
+	}
+	return fi, true
 }
 
 // writable reports whether modifications under p are permitted.
@@ -365,10 +375,21 @@ func attrOfFI(mode uint32, fi os.FileInfo, ino uint64) fuse.Attr {
 // sends whole seconds, so the sub-second field stays empty rather than invented.
 func attrOfRemote(a proto.Attr, ino uint64) fuse.Attr {
 	out := attrOf(a.Mode, a.Size, ino)
+	// All three timestamps come from the daemon's stat, at nanosecond
+	// precision. Substituting mtime for atime reports a timestamp the file
+	// does not have, which breaks futimens/UTIME_OMIT and any tool that
+	// compares them.
 	if a.Mtime > 0 {
 		out.Mtime = uint64(a.Mtime)
-		out.Ctime = out.Mtime
-		out.Atime = out.Mtime
+		out.Mtimensec = a.MtimeNsec
+	}
+	if a.Ctime > 0 {
+		out.Ctime = uint64(a.Ctime)
+		out.Ctimensec = a.CtimeNsec
+	}
+	if a.Atime > 0 {
+		out.Atime = uint64(a.Atime)
+		out.Atimensec = a.AtimeNsec
 	}
 	if a.UID != 0 || a.GID != 0 {
 		out.Uid, out.Gid = a.UID, a.GID
@@ -452,40 +473,29 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (in 
 		child := &Node{lay: n.lay, path: p}
 		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: ino(p)}), 0
 	}
-	// 4. inside an exec-policy directory: every name resolves to either a
-	//    local binary or a trampoline, both served from the host filesystem.
-	//    This is the branch that makes an allowlisted program reachable at all.
+	// 4. inside an exec-policy directory. Only the allowlisted executable's
+	//    own bytes are host content; every other name is an ordinary session
+	//    file and is served remote, even when the same name exists here. A
+	//    directory that holds programs does not expose a host listing.
 	if n.isExecDir(p) {
-		_, fi, err := n.execTarget(p)
-		if err != nil {
-			// No local file of that name. The daemon may still have it: a
-			// directory of programs that exists only on the other side is an
-			// ordinary thing for an ssh-style session to reach for.
-			if mode, ok := n.remoteKind(p); ok {
-				out.Attr = attrOf(mode, 0, ino(p))
-				if resp, rerr := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p}); rerr == nil && resp.Kind == proto.KStat {
-					out.Attr = attrOfRemote(resp.Attr, remoteIno(resp.Attr, p))
-				}
-				child := &Node{lay: n.lay, path: p}
-				fm := uint32(syscall.S_IFREG)
-				if mode == proto.SIFDIR {
-					fm = syscall.S_IFDIR
-				}
-				return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: fm, Ino: out.Attr.Ino}), 0
+		if fi, ok := n.allowedExec(p); ok {
+			out.Attr = attrOfFI(proto.SIFREG|uint32(fi.Mode().Perm()), fi, ino(p))
+			child := &Node{lay: n.lay, path: p}
+			return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)}), 0
+		}
+		if _, ok := n.trapFor(p); ok {
+			fi, err := os.Stat(n.lay.Trampoline)
+			if err != nil {
+				return nil, syscall.EIO
 			}
-			return nil, syscall.ENOENT
+			out.Attr = attrOf(proto.SIFREG|0o555, uint64(fi.Size()), ino(p))
+			child := &Node{lay: n.lay, path: p}
+			return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)}), 0
 		}
-		mode := uint32(proto.SIFREG) | uint32(fi.Mode().Perm())
-		fmode := uint32(syscall.S_IFREG)
-		switch {
-		case fi.IsDir():
-			mode, fmode = proto.SIFDIR|uint32(fi.Mode().Perm()), syscall.S_IFDIR
-		case fi.Mode()&os.ModeSymlink != 0:
-			mode, fmode = proto.SIFLNK|0o777, syscall.S_IFLNK
-		}
-		out.Attr = attrOf(mode, uint64(fi.Size()), ino(p))
-		child := &Node{lay: n.lay, path: p}
-		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: fmode, Ino: ino(p)}), 0
+		// Any other name is ordinary session content; resolve it exactly as
+		// any remote path would be, so an exec directory never leaks a host
+		// listing.
+		return n.remoteLookup(ctx, p, out)
 	}
 	// 5. ancestor of a local tree: a directory that exists only to hold it.
 	//    It must be listed as such, not as an entry with no children.
@@ -494,14 +504,14 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (in 
 		child := &Node{lay: n.lay, path: p}
 		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: ino(p)}), 0
 	}
-	// 5. nothing else lives inside a synthetic tree until bwrap mounts it
+	// 5. nothing else lives inside a synthetic tree; the launcher owns it
 	if n.inSynthetic(p) {
 		return nil, syscall.ENOENT
 	}
 	// 6. remote
 	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, errnoFromErr(err)
 	}
 	switch resp.Kind {
 	case proto.KNone:
@@ -549,27 +559,21 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		}
 		ents = append(ents, fuse.DirEntry{Name: name, Mode: fm, Ino: ino(path.Join(n.path, name))})
 	}
-	// A local tree is read from its host directory. An exec-policy directory
-	// is also read from the host, but each entry is then resolved through the
-	// policy, so the same listing yields local binaries and trampolines.
+	// An explicit local tree is read from its host directory: local content
+	// has priority over everything else. An exec-policy directory is NOT read
+	// from the host at all: the daemon's listing is authoritative, and only
+	// allowlisted executables (served from host bytes) and trampolined remote
+	// programs are reconciled against it. Membership in a program directory
+	// never exposes a host listing of ordinary files.
 	host, fromHost := n.hostRoot(n.path)
-	if !fromHost && n.isExecDir(n.path) {
-		host, fromHost = n.path, true
-	}
+	execDir := n.isExecDir(n.path) && !fromHost
 	if fromHost {
 		des, err := os.ReadDir(host)
 		if err != nil {
 			return nil, syscall.ENOENT
 		}
-		execDir := n.isExecDir(n.path)
 		for _, de := range des {
 			name := de.Name()
-			if execDir {
-				if _, ok := n.trapFor(path.Join(n.path, name)); ok {
-					push(name, proto.SIFREG|0o555)
-					continue
-				}
-			}
 			info, err := de.Info()
 			if err != nil {
 				continue
@@ -582,6 +586,26 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 				mode = proto.SIFLNK | 0o777
 			}
 			push(name, mode)
+		}
+	}
+	if resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxList, Path: n.path}); err == nil && resp.Kind == proto.KDir {
+		for _, e := range resp.Ents {
+			push(e.Name, e.Mode)
+		}
+	}
+	// Names of an exec-policy directory that only exist here are injected:
+	// the allowlisted executable itself, and local names the daemon declined
+	// (each of those is the trampoline).
+	if execDir {
+		if des, err := os.ReadDir(n.path); err == nil {
+			for _, de := range des {
+				child := path.Join(n.path, de.Name())
+				if _, ok := n.allowedExec(child); ok {
+					push(de.Name(), proto.SIFREG|0o555)
+				} else if _, ok := n.trapFor(child); ok {
+					push(de.Name(), proto.SIFREG|0o555)
+				}
+			}
 		}
 	}
 	if resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxList, Path: n.path}); err == nil && resp.Kind == proto.KDir {
@@ -605,68 +629,29 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
 	return fs.NewListDirStream(ents), 0
 }
-
 func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	if h, ok := f.(*handle); ok && h.f != nil && h.base.Mode != 0 {
-		// A read handle holds a fixed snapshot. Its stat must report exactly
-		// what this descriptor serves — same file, so size, time and inode all
-		// come from h.f, not from h.base or from a live path stat. Serving the
-		// live size while Read returns the snapshot bytes is a lie, and mixing
-		// two sources for the same descriptor makes tar decide the file changed
-		// while it was reading it.
-		if fi, err := h.f.Stat(); err == nil {
-			// A handle stat and a path stat of the same unchanged file have to
-			// agree to the last digit, or tar decides the file changed while it
-			// was reading it. So the times come from the same side as the path:
-			// a local tree's own inode (nanoseconds), the daemon's seconds for a
-			// remote one. Only the size is taken from the handle, because that
-			// is the snapshot Read actually serves.
-			if n.lay.Local != nil && n.lay.Local.IsLocal(n.path) {
-				out.Attr = attrOfFI(h.base.Mode, fi, h.base.Ino)
-			} else {
-				out.Attr = attrOfRemote(h.base, remoteIno(h.base, n.path))
-				out.Attr.Size = uint64(fi.Size())
-			}
-			return 0
+	if h, ok := f.(*handle); ok {
+		if h.fd != nil || h.rhandle != 0 {
+			return n.handleGetattr(h, out)
 		}
-		out.Attr = attrOfRemote(h.base, remoteIno(h.base, n.path))
-		return 0
 	}
-	if h, ok := f.(*handle); ok && h.temp != "" {
-		fi, err := os.Stat(h.temp)
-		if err != nil {
-			return syscall.EIO
-		}
-		// The local copy has its own mtime, which says when it was fetched, not
-		// when the file changed. Report the daemon's metadata: tar compares the
-		// stat it took before reading with the one after, and a zero timestamp
-		// on either side reads as "the file changed while I was reading it".
-		if h.base.Mode != 0 || h.base.Mtime != 0 {
-			out.Attr = attrOfRemote(h.base, remoteIno(h.base, n.path))
-			out.Attr.Size = uint64(fi.Size())
-			return 0
-		}
-		out.Attr = attrOfFI(proto.SIFREG|0o644, fi, ino(n.path))
-		return 0
-	}
-	// An exec-policy member is served from one file, chosen once by trapFor.
+	// An exec-policy member is served from one file, chosen once by the policy.
 	// Getattr, Lookup and Open must all agree on which, or the kernel caches
 	// one size and reads another.
 	if n.isExecDir(n.path) {
-		target, fi, err := n.execTarget(n.path)
-		if err != nil {
-			return syscall.ENOENT
+		if fi, ok := n.allowedExec(n.path); ok {
+			out.Attr = attrOfFI(proto.SIFREG|uint32(fi.Mode().Perm()), fi, ino(n.path))
+			return 0
 		}
-		mode := uint32(proto.SIFREG) | uint32(fi.Mode().Perm())
-		switch {
-		case fi.IsDir():
-			mode = proto.SIFDIR | uint32(fi.Mode().Perm())
-		case fi.Mode()&os.ModeSymlink != 0:
-			mode = proto.SIFLNK | 0o777
+		if trap, ok := n.trapFor(n.path); ok {
+			fi, err := os.Stat(trap)
+			if err != nil {
+				return syscall.EIO
+			}
+			out.Attr = attrOf(proto.SIFREG|0o555, uint64(fi.Size()), ino(n.path))
+			return 0
 		}
-		_ = target
-		out.Attr = attrOfFI(mode, fi, ino(n.path))
-		return 0
+		return n.remoteGetattr(n.path, out)
 	}
 	if trap, ok := n.trapFor(n.path); ok {
 		fi, err := os.Stat(trap)
@@ -674,6 +659,16 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 			return syscall.EIO
 		}
 		out.Attr = attrOf(proto.SIFREG|0o555, uint64(fi.Size()), ino(n.path))
+		return 0
+	}
+	// A reserved bind target is the sandbox's own file. The launcher replaces
+	// it with a real mount, so the daemon must never be asked about it.
+	if n.isSyntheticFile(n.path) {
+		out.Attr = attrOf(proto.SIFREG|0o600, 0, ino(n.path))
+		return 0
+	}
+	if n.isSyntheticDir(n.path) {
+		out.Attr = attrOf(proto.SIFDIR|0o755, 0, ino(n.path))
 		return 0
 	}
 	if host, ok := n.hostRoot(n.path); ok {
@@ -711,18 +706,53 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 		out.Attr = attrOf(proto.SIFDIR|0o755, 0, ino(n.path))
 		return 0
 	}
-	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: n.path})
+	return n.remoteGetattr(n.path, out)
+}
+
+// remoteGetattr answers a path stat from the daemon, propagating its numeric
+// errno rather than flattening every failure to EIO.
+func (n *Node) remoteGetattr(p string, out *fuse.AttrOut) syscall.Errno {
+	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
 	if err != nil {
-		return syscall.EIO
+		return errnoFromErr(err)
 	}
 	switch resp.Kind {
 	case proto.KNone:
 		return syscall.ENOENT
 	case proto.KErr:
 		return errnoOf(resp.Err)
+	case proto.KStat:
+		out.Attr = attrOfRemote(resp.Attr, remoteIno(resp.Attr, p))
+		return 0
 	}
-	out.Attr = attrOfRemote(resp.Attr, remoteIno(resp.Attr, n.path))
-	return 0
+	return syscall.EIO
+}
+
+// remoteLookup resolves a path on the daemon, as the Lookup tail does; exec
+// directories fall back here for names that are not allowlisted programs.
+func (n *Node) remoteLookup(ctx context.Context, p string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
+	if err != nil {
+		return nil, errnoFromErr(err)
+	}
+	switch resp.Kind {
+	case proto.KNone:
+		return nil, syscall.ENOENT
+	case proto.KErr:
+		return nil, errnoOf(resp.Err)
+	case proto.KStat:
+		mode := uint32(syscall.S_IFREG)
+		switch kind(resp.Attr.Mode) {
+		case proto.SIFDIR:
+			mode = syscall.S_IFDIR
+		case proto.SIFLNK:
+			mode = syscall.S_IFLNK
+		}
+		out.Attr = attrOfRemote(resp.Attr, remoteIno(resp.Attr, p))
+		child := &Node{lay: n.lay, path: p}
+		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: mode, Ino: out.Attr.Ino}), 0
+	}
+	return nil, syscall.EIO
 }
 
 func (n *Node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
@@ -741,26 +771,137 @@ func (n *Node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	return resp.Data, 0
 }
 
-// heads are file handles: immutable files are served from the host, remote
-// files are materialised once so writes behave like a normal filesystem.
+// A handle is one open descriptor. A local file holds a real host fd; a
+// remote file holds a live daemon handle and every read, write, fsync and
+// stat asks the file where it actually lives. Nothing is ever copied off the
+// daemon into a scratch snapshot: an in-place write by another client has to
+// be seen by the next read of an existing descriptor.
 type handle struct {
-	f     *os.File
-	temp  string
-	dirty bool
-	path  string
-	lay   *Layout
-	// base is the state the file had when it was opened. A remote write that
-	// changed it since then is a real conflict: two writers, one file.
+	// fd is set for local files (and the trampoline): all kernel operations
+	// go through it.
+	fd *os.File
+	// rhandle is the daemon-side handle for a remote file, 0 when unset.
+	rhandle uint64
+	// dir marks a directory handle opened by OpendirHandle; Release closes
+	// it as a directory descriptor and Fsyncdir syncs it.
+	dir bool
+	// diroff walks a remote listing one entry per Readdirent call.
+	diroff int
+	ents   []proto.DirEntry
+	path   string
+	lay    *Layout
+	// base is the state the file had when it was opened; for a remote handle
+	// it is refreshed by every FxFstat, so Getattr on a descriptor always
+	// answers the inode that descriptor holds.
 	base proto.Attr
-	// private marks a temp file that belongs to this handle alone, so it is
-	// removed on release. A write buffer uses the shared cache key instead.
-	private bool
-	// appendOnly marks handles opened for append, where the bytes are appended
-	// on the daemon instead of being replayed from a local copy.
+	// appendOnly marks handles opened for append: the daemon fd carries
+	// O_APPEND and a positioned write is sent with Offset -1.
 	appendOnly bool
-	// remote marks a handle whose writes go to the daemon rather than a local
-	// copy.
-	remote string
+	// phantom marks a handle for a sandbox-reserved bind target: the launcher
+	// mounts a real file there, so the daemon is never consulted.
+	phantom bool
+}
+
+// OpendirHandle opens a directory descriptor. The remote branch asks the
+// daemon for a real directory fd, so Fsyncdir can sync the same handle the
+// entries were listed from — an fsync(dirfd) proof needs the descriptor, not
+// a path. Local trees open their own host directory fd.
+func (n *Node) OpendirHandle(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	if _, ok := n.hostRoot(n.path); ok {
+		d, err := os.Open(n.path)
+		if err != nil {
+			return nil, 0, errnoOf(err.Error())
+		}
+		return &handle{fd: d, dir: true, path: n.path, lay: n.lay}, 0, 0
+	}
+	if n.inSynthetic(n.path) {
+		// A bind target the launcher made itself has no daemon counterpart;
+		// the node's own child list is the whole directory.
+		return &handle{dir: true, path: n.path, lay: n.lay}, 0, 0
+	}
+	h, _, errno := n.openRemote(n.path, uint32(os.O_RDONLY|syscall.O_DIRECTORY), 0)
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	h.dir = true
+	return h, 0, 0
+}
+
+// Readdirent serves one directory entry from the descriptor OpendirHandle
+// opened. A remote handle lists from the daemon; a local fd reads names
+// through the open directory fd; a synthetic placeholder has no entries.
+func (h *handle) Readdirent(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
+	if h.fd != nil {
+		names, err := h.fd.Readdirnames(1)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, errnoOf(err.Error())
+		}
+		if len(names) == 0 {
+			return nil, 0
+		}
+		name := names[0]
+		mode := uint32(proto.SIFREG)
+		if fi, err := os.Lstat(path.Join(h.path, name)); err == nil {
+			switch {
+			case fi.IsDir():
+				mode = proto.SIFDIR
+			case fi.Mode()&os.ModeSymlink != 0:
+				mode = proto.SIFLNK
+			}
+		}
+		return &fuse.DirEntry{Name: name, Mode: mode}, 0
+	}
+	if h.rhandle != 0 {
+		if h.ents == nil {
+			resp, err := h.lay.Remote.Do(&proto.FxReq{Op: proto.FxList, Path: h.path})
+			if err != nil {
+				return nil, errnoFromErr(err)
+			}
+			if resp.Errno != 0 {
+				return nil, syscall.Errno(resp.Errno)
+			}
+			h.ents = resp.Ents
+		}
+		if h.diroff >= len(h.ents) {
+			return nil, 0
+		}
+		e := h.ents[h.diroff]
+		h.diroff++
+		return &fuse.DirEntry{Name: e.Name, Mode: e.Mode, Ino: ino(path.Join(h.path, e.Name))}, 0
+	}
+	// Synthetic placeholder directory: its entries are the launcher's mount
+	// targets and never real content.
+	return nil, 0
+}
+
+// Fsyncdir syncs a directory descriptor, as an fsync(dirfd) proof requires.
+// go-fuse routes FSYNC with a directory handle here when the handle
+// implements FileFsyncdirer; the descriptor is the one OpendirHandle opened.
+func (h *handle) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
+	if h.fd != nil {
+		err := h.fd.Sync()
+		if err != nil {
+			switch {
+			case errors.Is(err, syscall.EINVAL), errors.Is(err, syscall.ENOTSUP):
+				return 0
+			}
+			return errnoOf(err.Error())
+		}
+		return 0
+	}
+	if h.rhandle != 0 {
+		resp, err := h.lay.Remote.Do(&proto.FxReq{Op: proto.FxFsync, Handle: h.rhandle, Flags: flags})
+		if err != nil {
+			return errnoFromErr(err)
+		}
+		if resp.Errno != 0 {
+			return syscall.Errno(resp.Errno)
+		}
+		return 0
+	}
+	// A synthetic placeholder has nothing to sync: the launcher owns the bind
+	// target, and this filesystem never wrote to it.
+	return 0
 }
 
 // statOf records a handle's underlying file as a proto.Attr, for Getattr to
@@ -777,6 +918,7 @@ func statOf(f *os.File) proto.Attr {
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		a.Ino = st.Ino
+		a.Dev = uint64(st.Dev)
 		a.Nlink = uint32(st.Nlink)
 	}
 	return a
@@ -787,10 +929,7 @@ func statOf(f *os.File) proto.Attr {
 // in the handle until the file is finally released, and an append that reopens
 // the path in between sees nothing.
 func (h *handle) Flush(ctx context.Context) syscall.Errno {
-	if h.f != nil {
-		h.f.Sync()
-	}
-	return 0
+	return h.Fsync(ctx, 0)
 }
 
 // Fsync is the node-level form, which go-fuse dispatches when a handler
@@ -808,59 +947,61 @@ func (n *Node) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall
 // implementation the kernel answers ENOTSUP, which agents report as
 // "EIO: i/o error, write" and retry forever.
 func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	if h.f == nil {
-		return 0
-	}
-	if h.remote != "" {
-		// A remote write is already applied on the daemon side, one operation
-		// per write; there is no local buffer left to flush.
-		return 0
-	}
-	if err := h.f.Sync(); err != nil {
-		switch {
-		case errors.Is(err, syscall.EINVAL), errors.Is(err, syscall.ENOTSUP):
-			return 0
+	if h.fd != nil {
+		if err := h.fd.Sync(); err != nil {
+			switch {
+			case errors.Is(err, syscall.EINVAL), errors.Is(err, syscall.ENOTSUP):
+				return 0
+			}
+			return errnoOf(err.Error())
 		}
-		return errnoOf(err.Error())
+		return 0
 	}
-	return 0
+	if h.rhandle != 0 {
+		resp, err := h.lay.Remote.Do(&proto.FxReq{Op: proto.FxFsync, Handle: h.rhandle, Flags: flags})
+		if err != nil {
+			return errnoFromErr(err)
+		}
+		if resp.Errno != 0 {
+			return syscall.Errno(resp.Errno)
+		}
+		return 0
+	}
+	// A remote handle with no daemon descriptor and no local fd has nothing
+	// real to sync; claiming success would be a lie about durability.
+	return syscall.EBADF
 }
 
-// Release flushes a modified remote file back to the daemon.
-//
-// Two processes can hold the same path at once: a local one going through this
-// filesystem, and a redirected one whose writes go straight to the daemon's
-// disk. Replacement is therefore last-writer-wins, which is what a normal
-// shared filesystem does too — but appends are merged, because an append is the
-// one case where neither side can reconstruct the other's data.
+// Release closes the descriptor. A remote handle's bytes are already on the
+// daemon, so there is nothing left to write back — dirty temp files and
+// whole-file snapshots no longer exist.
 func (h *handle) Release(ctx context.Context) syscall.Errno {
-	if h.f != nil {
-		h.f.Close()
+	if h.fd != nil {
+		h.fd.Close()
+		h.fd = nil
 	}
-	if h.remote != "" {
-		return 0
-	}
-	// A read handle owns a private copy of the bytes it was opened on, and
-	// nothing else refers to it once the descriptor is gone.
-	if h.temp != "" && !h.dirty && h.private {
-		os.Remove(h.temp)
-	}
-	if !h.dirty || h.temp == "" {
-		return 0
-	}
-	defer os.Remove(h.temp)
-	data, err := os.ReadFile(h.temp)
-	if err != nil {
-		return syscall.EIO
-	}
-	if err := h.lay.Remote.WriteFile(h.path, data); err != nil {
-		return syscall.EIO
+	if h.rhandle != 0 {
+		_, err := h.lay.Remote.Do(&proto.FxReq{Op: proto.FxClose, Handle: h.rhandle})
+		if err != nil {
+			return errnoFromErr(err)
+		}
+		h.rhandle = 0
 	}
 	return 0
 }
 
 func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	writes := flags&(uint32(os.O_WRONLY)|uint32(os.O_RDWR)|uint32(os.O_TRUNC)|uint32(os.O_APPEND)) != 0
+	appendMode := flags&uint32(os.O_APPEND) != 0
+	// A reserved bind target exists only so the launcher has somewhere to
+	// mount the real helper. It holds no bytes of its own.
+	if n.isSyntheticFile(n.path) || n.isSyntheticDir(n.path) {
+		f, err := os.OpenFile(os.DevNull, int(flags&uint32(syscall.O_ACCMODE)), 0)
+		if err != nil {
+			return nil, 0, errnoFromErr(err)
+		}
+		return &handle{fd: f, path: n.path, lay: n.lay, phantom: true}, 0, 0
+	}
 	if trap, ok := n.trapFor(n.path); ok {
 		if writes {
 			return nil, 0, syscall.EROFS
@@ -869,7 +1010,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if err != nil {
 			return nil, 0, syscall.EIO
 		}
-		return &handle{f: f, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
+		return &handle{fd: f, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
 	}
 	if host, ok := n.hostRoot(n.path); ok {
 		if writes && !n.writable(n.path) {
@@ -884,8 +1025,8 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 			return nil, 0, errnoOf(err.Error())
 		}
 		return &handle{
-			f: f, path: n.path, lay: n.lay,
-			appendOnly: flags&uint32(os.O_APPEND) != 0,
+			fd: f, path: n.path, lay: n.lay,
+			appendOnly: appendMode,
 			// A local file is the host's own: an open descriptor keeps the
 			// inode it opened, even if the name is later replaced. Getattr on
 			// that descriptor has to report the same size Read serves, so base
@@ -893,35 +1034,12 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 			base: statOf(f),
 		}, 0, 0
 	}
-	// A member of an exec-policy directory is served from the host, and the
-	// policy decides which file that is: the local binary, or the trampoline.
-	//
-	// Only a redirected name is read-only. Data files in the same directory
-	// keep working normally: an agent's state directory often holds one .node
-	// or .so, and making the whole tree unwritable because of it broke session
-	// persistence with EROFS.
+	// A member of an exec-policy directory is served from the host only for
+	// the allowlisted executable or the trampoline; the directory does not
+	// expose any other host file, so everything else falls through to the
+	// remote branches below.
 	if n.isExecDir(n.path) {
-		_, trapped := n.trapFor(n.path)
-		if trapped {
-			// The trampoline is immutable: writing to it would replace the
-			// program, not the data.
-			if writes {
-				return nil, 0, syscall.EROFS
-			}
-			f, err := os.Open(n.lay.Trampoline)
-			if err != nil {
-				return nil, 0, errnoOf(err.Error())
-			}
-			return &handle{f: f, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
-		}
-		// Any other name is ordinary host data, writable like any local file.
-		// An exec directory is defined by holding programs, not by being
-		// read-only: an agent's state tree commonly carries one .node or .so.
-		//
-		// A name with no local file is remote content that happens to live in an
-		// exec directory. Opening it here would fail with ENOENT for a file the
-		// session can see, so fall through to the remote branches below.
-		if n.existsHere(n.path) {
+		if _, ok := n.allowedExec(n.path); ok {
 			openFlags := flags
 			if !writes {
 				openFlags = uint32(os.O_RDONLY)
@@ -931,91 +1049,37 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 				return nil, 0, errnoOf(err.Error())
 			}
 			return &handle{
-				f: f, path: n.path, lay: n.lay,
-				appendOnly: flags&uint32(os.O_APPEND) != 0,
+				fd: f, path: n.path, lay: n.lay,
+				appendOnly: appendMode,
 				base:       statOf(f),
 			}, 0, 0
 		}
-	}
-	// Every O_APPEND open, create or not, streams appends to the daemon: the
-	// kernel may reuse an inode and skip CREATE entirely for the second
-	// ">> file", so OPEN has to make the same choice.
-	if writes {
-		// A writable remote file stays on the daemon: the local copy could not
-		// see what a redirected program writes, and would overwrite it.
-		return &handle{
-			remote: n.path, path: n.path, lay: n.lay,
-			appendOnly: flags&uint32(os.O_APPEND) != 0,
-		}, 0, 0
-	}
-	// remote file: materialise into scratch so ordinary read/write works.
-	// The materialised copy is reused, which keeps repeated execs of the
-	// same remote binary to one round trip.
-	if !writes {
-		if cached, attr, err := n.lay.cached(n.path); err == nil {
-			f, err := os.Open(cached)
-			if err == nil {
-				// A cached hit is a snapshot of the file at fetch time, and this
-				// handle will serve that snapshot. Its attributes have to match
-				// what the handle actually returns, or a reader that stats then
-				// reads sees two different files: stat reports the daemon's
-				// live size while read serves the cached bytes. That is
-				// impossible on a local filesystem and corrupts any program
-				// that sizes its buffer from a stat.
-				return &handle{f: f, path: n.path, lay: n.lay, base: attr}, fuse.FOPEN_KEEP_CACHE, 0
+		if _, trapped := n.trapFor(n.path); trapped {
+			// The trampoline is immutable: writing to it would replace the
+			// program, not the data.
+			if writes {
+				return nil, 0, syscall.EROFS
 			}
+			f, err := os.Open(n.lay.Trampoline)
+			if err != nil {
+				return nil, 0, errnoOf(err.Error())
+			}
+			return &handle{fd: f, path: n.path, lay: n.lay}, fuse.FOPEN_KEEP_CACHE, 0
 		}
 	}
-	data, attr, err := n.lay.Remote.ReadFile(n.path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, 0, syscall.ENOENT
-		}
-		return nil, 0, errnoOf(err.Error())
+	// A remote open is a daemon-side descriptor. The daemon fd carries
+	// O_APPEND (so the append position is decided where the file lives) and
+	// keeps the inode it opened across rename and unlink.
+	h, _, errno := n.openRemote(n.path, flags, 0)
+	if errno != 0 {
+		return nil, 0, errno
 	}
-	temp := filepath.Join(n.lay.Cache, hash(n.path))
-	if err := os.MkdirAll(n.lay.Cache, 0o700); err != nil {
-		return nil, 0, syscall.EIO
-	}
-	if err := os.WriteFile(temp, data, 0o600); err != nil {
-		return nil, 0, syscall.EIO
-	}
-	// The stamp is what makes the copy usable later: it records the daemon's
-	// metadata at fetch time, so a later open can tell whether it is stale.
-	if err := os.WriteFile(temp+".meta", []byte(stampOf(attr)), 0o600); err != nil {
-		return nil, 0, syscall.EIO
-	}
-	n.lay.trimCache()
-	// This handle gets its own copy, not the shared cache entry.
-	//
-	// An open descriptor must keep reading the bytes it was opened on, even if
-	// the name is later rewritten or removed. Sharing the cache file breaks
-	// that: the next write rewrites the same path, and the holder starts reading
-	// somebody else's content — or, once the entry is dropped, nothing at all.
-	// The cache entry stays as the fast path for the next open; this private
-	// copy is what the descriptor reads.
-	priv, err := os.CreateTemp(filepath.Dir(temp), "open-*")
-	if err != nil {
-		return nil, 0, syscall.EIO
-	}
-	if _, err := priv.Write(data); err != nil {
-		priv.Close()
-		os.Remove(priv.Name())
-		return nil, 0, syscall.EIO
-	}
-	f, err := os.Open(priv.Name())
-	priv.Close()
-	if err != nil {
-		os.Remove(priv.Name())
-		return nil, 0, syscall.EIO
-	}
-	temp = priv.Name()
-	privateCopy := true
-	// Keep the metadata the copy was fetched at. A handle-scoped getattr has to
-	// answer with the file's own times, not the local copy's: tar stats a file,
-	// reads it, then stats again, and reports "file changed as we read it" when
-	// the second answer differs.
-	return &handle{f: f, temp: temp, private: privateCopy, path: n.path, lay: n.lay, base: attr}, fuse.FOPEN_KEEP_CACHE, 0
+	// Direct I/O is what makes a remote descriptor trustworthy: with
+	// FOPEN_KEEP_CACHE the kernel would keep serving page-cache content read
+	// before a redirected program wrote the file in place, and never ask this
+	// daemon again. There is no mmap for a FUSE direct-I/O file; a program that
+	// mmaps a remote file gets SIGBUS rather than knowingly stale bytes.
+	return h, fuse.FOPEN_DIRECT_IO, 0
 }
 
 func (n *Node) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -1023,32 +1087,47 @@ func (n *Node) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64
 	if !ok {
 		return fuse.ReadResultData(nil), syscall.EBADF
 	}
-	if h.f == nil {
-		// A remote write handle has no local file. Returning an empty success
-		// here is silent data corruption: a database that writes and then reads
-		// back the same page sees zeros and concludes it is damaged. Read the
-		// bytes from the daemon instead, which is where they are.
-		if h.remote == "" {
-			return fuse.ReadResultData(nil), syscall.EBADF
-		}
-		data, _, err := h.lay.Remote.ReadFile(h.remote)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return fuse.ReadResultData(nil), syscall.ENOENT
-			}
-			return fuse.ReadResultData(nil), syscall.EIO
-		}
-		if off >= int64(len(data)) {
+	if h.fd != nil {
+		cnt, err := h.fd.ReadAt(dest, off)
+		if cnt == 0 && err != nil {
 			return fuse.ReadResultData(nil), 0
 		}
-		n := copy(dest, data[off:])
-		return fuse.ReadResultData(dest[:n]), 0
+		return fuse.ReadResultData(dest[:cnt]), 0
 	}
-	cnt, err := h.f.ReadAt(dest, off)
-	if cnt == 0 && err != nil {
-		return fuse.ReadResultData(nil), 0
+	if h.rhandle == 0 {
+		return fuse.ReadResultData(nil), syscall.EBADF
 	}
-	return fuse.ReadResultData(dest[:cnt]), 0
+	// A remote descriptor reads where the file lives, chunked under the frame
+	// limit. There is no snapshot: an in-place write by another client shows
+	// up in the next read, exactly as on a local filesystem.
+	var got []byte
+	remaining := int64(len(dest))
+	pos := off
+	for remaining > 0 {
+		chunk := int64(proto.MaxIO)
+		if remaining < chunk {
+			chunk = remaining
+		}
+		resp, err := h.lay.Remote.Do(&proto.FxReq{
+			Op: proto.FxPread, Handle: h.rhandle, Offset: pos, Size: uint32(chunk),
+		})
+		if err != nil {
+			return fuse.ReadResultData(nil), errnoFromErr(err)
+		}
+		if resp.Errno != 0 {
+			return fuse.ReadResultData(nil), syscall.Errno(resp.Errno)
+		}
+		if len(resp.Data) == 0 {
+			break
+		}
+		got = append(got, resp.Data...)
+		pos += int64(len(resp.Data))
+		remaining -= int64(len(resp.Data))
+		if len(resp.Data) < int(chunk) {
+			break
+		}
+	}
+	return fuse.ReadResultData(got), 0
 }
 
 func (n *Node) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
@@ -1056,174 +1135,163 @@ func (n *Node) Write(ctx context.Context, f fs.FileHandle, data []byte, off int6
 	if !ok {
 		return 0, syscall.EBADF
 	}
-	if h.f == nil && h.remote == "" {
+	if h.fd != nil {
+		// A file opened with O_APPEND rejects WriteAt outright; its writes must
+		// go through Write, which the kernel positions at the end. Agents open
+		// their own logs and transcripts that way.
+		var cnt int
+		var err error
+		if h.appendOnly {
+			cnt, err = h.fd.Write(data)
+		} else {
+			cnt, err = h.fd.WriteAt(data, off)
+		}
+		if err != nil {
+			return 0, errnoOf(err.Error())
+		}
+		return uint32(cnt), 0
+	}
+	if h.rhandle == 0 {
 		return 0, syscall.EIO
 	}
-	// Remote files are never written locally. Two writers can hold the same
-	// path, and a local copy would replay stale bytes over the daemon's disk.
-	if h.remote != "" {
-		req := &proto.FxReq{Op: proto.FxAppend, Path: h.path, Data: data}
-		if !h.appendOnly {
-			req.Op = proto.FxWriteAt
-			req.Arg = itoa(uint64(off))
+	// The daemon-side fd enforces O_APPEND itself; a positioned write is a
+	// pwrite on the same live descriptor. Chunks stay under the frame limit.
+	sent := uint32(0)
+	for sent < uint32(len(data)) {
+		end := sent + proto.MaxIO
+		if end > uint32(len(data)) {
+			end = uint32(len(data))
 		}
-		if _, err := h.lay.Remote.Do(req); err != nil {
-			return 0, syscall.EIO
+		req := &proto.FxReq{
+			Op: proto.FxPwrite, Handle: h.rhandle,
+			Data: data[sent:end], Offset: off + int64(sent),
 		}
-		h.lay.invalidate(h.remote)
-		return uint32(len(data)), 0
+		if h.appendOnly {
+			req.Offset = -1
+		}
+		resp, err := h.lay.Remote.Do(req)
+		if err != nil {
+			return sent, errnoFromErr(err)
+		}
+		if resp.Errno != 0 {
+			return sent, syscall.Errno(resp.Errno)
+		}
+		if resp.Count == 0 {
+			return sent, syscall.EIO
+		}
+		sent += resp.Count
 	}
-	// A file opened with O_APPEND rejects WriteAt outright; its writes must go
-	// through Write, which the kernel positions at the end. Agents open their
-	// own logs and transcripts that way, so this is the common case, not an
-	// edge one.
-	var cnt int
-	var err error
-	if h.appendOnly {
-		cnt, err = h.f.Write(data)
-	} else {
-		cnt, err = h.f.WriteAt(data, off)
-	}
-	if err != nil {
-		return 0, errnoOf(err.Error())
-	}
-	h.dirty = true
-	return uint32(cnt), 0
+	return sent, 0
 }
 
-// Setattr handles truncate and chmod on remote files.
+// Setattr handles metadata changes on remote files.
+//
 // Byte-range locks.
 //
 // SQLite takes one before it touches a database file and treats a failure as
-// "disk I/O error". go-fuse answers ENOSYS when no handler is installed, so a
-// database on a remote tree was unopenable: the first write always failed.
-//
-// Arbitration is per mount, in this process. That is exactly the set of writers
-// this kernel can route through here; a program running on the daemon reaches
-// its own copy of the file by a different path and is covered by the daemon's
-// own locking, not by pretending two lock tables are one.
-
-type region struct {
-	typ        uint32 // FUSE_GETLK_RDLCK / WRLCK / UNLCK
-	start, end uint64
-	pid        uint32
-}
-
-var (
-	lockMu sync.Mutex
-	locks  = map[string][]region{}
-)
-
-// overlap reports whether a conflicts with b, treating end == ^uint64(0) as
-// "to infinity". Two ranges overlap when each starts before the other ends.
-func overlap(a, b region) bool {
-	return a.start <= b.end && b.start <= a.end
-}
-
-// conflicting returns the first held lock that blocks want, ignoring locks
-// owned by the same owner. A shared lock conflicts only with an exclusive one.
-func conflicting(path string, want region) (region, bool) {
-	lockMu.Lock()
-	defer lockMu.Unlock()
-	for _, held := range locks[path] {
-		if held.typ == syscall.F_UNLCK || held.pid == want.pid {
-			continue
-		}
-		if !overlap(held, want) {
-			continue
-		}
-		if want.typ == syscall.F_RDLCK && held.typ == syscall.F_RDLCK {
-			continue
-		}
-		return held, true
-	}
-	return region{}, false
-}
+// "disk I/O error". Locks have to be arbitrated where the bytes live: a
+// program running on the daemon, or another client, reaches the same file
+// through its own path. A per-mount table here would believe it held a lock
+// that the daemon granted to somebody else, so every lock question goes to the
+// daemon's own descriptor for this open file. Local trees keep the kernel
+// lock on their real fd.
 
 func (n *Node) Getlk(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32, out *fuse.FileLock) syscall.Errno {
-	want := region{typ: lk.Typ, start: lk.Start, end: lk.End, pid: lk.Pid}
-	if held, ok := conflicting(n.path, want); ok {
-		out.Typ, out.Start, out.End, out.Pid = held.typ, held.start, held.end, held.pid
+	h, _ := f.(*handle)
+	if h != nil && h.rhandle != 0 {
+		resp, err := h.lay.Remote.Do(&proto.FxReq{
+			Op: proto.FxGetlk, Handle: h.rhandle, Owner: owner,
+			Lock: &proto.LockInfo{Typ: lk.Typ, Start: lk.Start, End: lk.End, Pid: lk.Pid},
+		})
+		if err != nil {
+			return errnoFromErr(err)
+		}
+		if resp.Errno != 0 {
+			return syscall.Errno(resp.Errno)
+		}
+		if resp.Lock != nil {
+			out.Typ, out.Start, out.End, out.Pid = resp.Lock.Typ, resp.Lock.Start, resp.Lock.End, resp.Lock.Pid
+		} else {
+			out.Typ = syscall.F_UNLCK
+		}
 		return 0
 	}
-	out.Typ = syscall.F_UNLCK
-	return 0
+	if h != nil && h.fd != nil {
+		fl := syscall.Flock_t{Type: int16(lk.Typ), Start: int64(lk.Start), Len: int64(lk.End - lk.Start + 1)}
+		if err := syscall.FcntlFlock(h.fd.Fd(), syscall.F_GETLK, &fl); err != nil {
+			return errnoOf(err.Error())
+		}
+		out.Typ, out.Start, out.End = uint32(fl.Type), uint64(fl.Start), uint64(fl.Start+fl.Len-1)
+		if fl.Type == syscall.F_UNLCK {
+			out.Typ = syscall.F_UNLCK
+		}
+		return 0
+	}
+	return syscall.EBADF
 }
 
 func (n *Node) Setlk(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
-	return n.setlk(f, lk, flags, false)
+	return n.setlk(f, owner, lk, false)
 }
 
 func (n *Node) Setlkw(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
-	return n.setlk(f, lk, flags, true)
+	return n.setlk(f, owner, lk, true)
 }
 
-func (n *Node) setlk(f fs.FileHandle, lk *fuse.FileLock, flags uint32, wait bool) syscall.Errno {
-	r := region{typ: lk.Typ, start: lk.Start, end: lk.End, pid: lk.Pid}
-	if r.typ == syscall.F_UNLCK {
-		lockMu.Lock()
-		defer lockMu.Unlock()
-		kept := locks[n.path][:0]
-		for _, held := range locks[n.path] {
-			if held.pid == r.pid && overlap(held, r) {
-				continue
-			}
-			kept = append(kept, held)
+func (n *Node) setlk(f fs.FileHandle, owner uint64, lk *fuse.FileLock, wait bool) syscall.Errno {
+	h, _ := f.(*handle)
+	op := byte(proto.FxSetlk)
+	if wait {
+		op = proto.FxSetlkw
+	}
+	if h != nil && h.rhandle != 0 {
+		resp, err := h.lay.Remote.Do(&proto.FxReq{
+			Op: op, Handle: h.rhandle, Owner: owner,
+			Lock: &proto.LockInfo{Typ: lk.Typ, Start: lk.Start, End: lk.End, Pid: lk.Pid},
+		})
+		if err != nil {
+			return errnoFromErr(err)
 		}
-		locks[n.path] = kept
+		return respErrno(resp)
+	}
+	if h != nil && h.fd != nil {
+		cmd := syscall.F_SETLK
+		if wait {
+			cmd = syscall.F_SETLKW
+		}
+		fl := syscall.Flock_t{Type: int16(lk.Typ), Start: int64(lk.Start), Len: int64(lk.End - lk.Start + 1)}
+		if err := syscall.FcntlFlock(h.fd.Fd(), cmd, &fl); err != nil {
+			return errnoOf(err.Error())
+		}
 		return 0
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		lockMu.Lock()
-		var clash bool
-		for _, held := range locks[n.path] {
-			if held.typ == syscall.F_UNLCK || held.pid == r.pid {
-				continue
-			}
-			if !overlap(held, r) {
-				continue
-			}
-			if r.typ == syscall.F_RDLCK && held.typ == syscall.F_RDLCK {
-				continue
-			}
-			clash = true
-			break
-		}
-		if !clash {
-			locks[n.path] = append(locks[n.path], r)
-			lockMu.Unlock()
-			return 0
-		}
-		lockMu.Unlock()
-		// EAGAIN is what fcntl(F_SETLK) reports for a held lock, and what
-		// SQLite expects before it backs off and retries.
-		if !wait || time.Now().After(deadline) {
-			return syscall.EAGAIN
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	return syscall.EBADF
 }
 
 func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	if h, ok := f.(*handle); ok && h.temp != "" {
-		if size, ok := in.GetSize(); ok {
-			if err := h.f.Truncate(int64(size)); err != nil {
-				return errnoOf(err.Error())
-			}
-			h.dirty = true
-		}
-		fi, err := h.f.Stat()
-		if err != nil {
-			return syscall.EIO
-		}
-		out.Attr = attrOf(proto.SIFREG|0o644, uint64(fi.Size()), ino(n.path))
-		return 0
-	}
+	h, _ := f.(*handle)
 	// A local tree is this machine's own file: rename, chmod and utimes go
 	// straight to the host call. The kernel routes all of them through Setattr,
 	// so leaving any of them unhandled makes the operation report success while
 	// changing nothing.
+	if h != nil && h.fd != nil {
+		if size, ok := in.GetSize(); ok {
+			if err := h.fd.Truncate(int64(size)); err != nil {
+				return errnoOf(err.Error())
+			}
+		}
+		if mode, ok := in.GetMode(); ok {
+			if err := h.fd.Chmod(os.FileMode(mode & 0o7777)); err != nil {
+				return errnoOf(err.Error())
+			}
+		}
+		if wantTimes(in) {
+			if err := applyTimes(h.fd.Name(), in); err != nil {
+				return errnoOf(err.Error())
+			}
+		}
+		return n.handleGetattr(h, out)
+	}
 	if host, ok := n.hostRoot(n.path); ok {
 		if !n.writable(n.path) {
 			return syscall.EROFS
@@ -1245,20 +1313,71 @@ func (n *Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		}
 		return n.Getattr(ctx, f, out)
 	}
+	// Metadata on an opened remote descriptor acts on that descriptor's own
+	truncOp, chmodOp, utimesOp := byte(proto.FxTruncate), byte(proto.FxChmod), byte(proto.FxUtimes)
+	req := &proto.FxReq{Path: n.path}
+	if h != nil && h.rhandle != 0 {
+		truncOp, chmodOp, utimesOp = proto.FxFtruncate, proto.FxFchmod, proto.FxFutimes
+		req.Handle = h.rhandle
+		req.Path = ""
+	}
 	if size, ok := in.GetSize(); ok {
-		n.lay.Remote.Do(&proto.FxReq{Op: proto.FxTruncate, Path: n.path,
-			Arg: itoa(uint64(size))})
-		n.lay.invalidate(n.path)
+		req.Op, req.Arg = truncOp, itoa(size)
+		if e := n.metaErr(req); e != 0 {
+			return e
+		}
 	}
 	if mode, ok := in.GetMode(); ok {
-		n.lay.Remote.Do(&proto.FxReq{Op: proto.FxChmod, Path: n.path,
-			Arg: strconv.FormatUint(uint64(mode&0o7777), 8)})
+		req.Op, req.Arg = chmodOp, strconv.FormatUint(uint64(mode&0o7777), 8)
+		if e := n.metaErr(req); e != 0 {
+			return e
+		}
 	}
 	if wantTimes(in) {
-		n.lay.Remote.Do(&proto.FxReq{Op: proto.FxUtimes, Path: n.path,
-			Arg: timesArg(in)})
+		req.Op, req.Arg = utimesOp, timesArg(in)
+		if e := n.metaErr(req); e != 0 {
+			return e
+		}
 	}
 	return n.Getattr(ctx, f, out)
+}
+
+// metaErr performs one metadata mutation on the daemon and maps its numeric
+// errno. A mutation is never reported as success when the daemon failed.
+func (n *Node) metaErr(req *proto.FxReq) syscall.Errno {
+	resp, err := n.lay.Remote.Do(req)
+	if err != nil {
+		return errnoFromErr(err)
+	}
+	return respErrno(resp)
+}
+
+// handleGetattr answers a stat from the open descriptor itself.
+func (n *Node) handleGetattr(h *handle, out *fuse.AttrOut) syscall.Errno {
+	if h.fd != nil {
+		fi, err := h.fd.Stat()
+		if err != nil {
+			return errnoOf(err.Error())
+		}
+		out.Attr = attrOfFI(h.base.Mode, fi, h.base.Ino)
+		return 0
+	}
+	if h.rhandle != 0 {
+		resp, err := h.lay.Remote.Do(&proto.FxReq{Op: proto.FxFstat, Handle: h.rhandle})
+		if err != nil {
+			return errnoFromErr(err)
+		}
+		if resp.Errno != 0 {
+			return syscall.Errno(resp.Errno)
+		}
+		if resp.Kind != proto.KStat && resp.Kind != proto.KHandle {
+			return syscall.EIO
+		}
+		h.base = resp.Attr
+		out.Attr = attrOfRemote(resp.Attr, remoteIno(resp.Attr, h.path))
+		return 0
+	}
+	return syscall.EBADF
 }
 
 // wantTimes reports whether the caller asked to set either timestamp. A
@@ -1272,31 +1391,27 @@ func wantTimes(in *fuse.SetAttrIn) bool {
 
 // timesArg encodes the requested times for the daemon. A side that was not
 // mentioned keeps its value, which utimensat spells as UTIME_OMIT: -1 here.
+// timesArg encodes the timestamps a SETATTR actually asked for. A field with
+// no FATTR_*_NOW and no FATTR_* flag must travel as UTIME_OMIT: GetATime and
+// GetMTime turn *_NOW into time.Now(), which would silently substitute a
+// current timestamp for "leave it alone".
 func timesArg(in *fuse.SetAttrIn) string {
 	a, m := int64(-1), int64(-1)
-	if v, ok := in.GetATime(); ok {
-		a = v.UnixNano()
+	if in.Valid&fuse.FATTR_ATIME != 0 && in.Valid&fuse.FATTR_ATIME_NOW == 0 {
+		a = time.Unix(int64(in.Atime), int64(in.Atimensec)).UnixNano()
 	}
-	if v, ok := in.GetMTime(); ok {
-		m = v.UnixNano()
+	if in.Valid&fuse.FATTR_MTIME != 0 && in.Valid&fuse.FATTR_MTIME_NOW == 0 {
+		m = time.Unix(int64(in.Mtime), int64(in.Mtimensec)).UnixNano()
 	}
 	return strconv.FormatInt(a, 10) + "," + strconv.FormatInt(m, 10)
 }
 
 // applyTimes sets timestamps on a host file, leaving an unmentioned side alone.
+// A side the caller did not mention keeps its value, which utimensat spells as
+// UTIME_OMIT; reading the old value back and rewriting it loses sub-nanosecond
+// precision and races a concurrent writer.
 func applyTimes(host string, in *fuse.SetAttrIn) error {
-	fi, err := os.Stat(host)
-	if err != nil {
-		return err
-	}
-	atime, mtime := fi.ModTime(), fi.ModTime()
-	if v, ok := in.GetATime(); ok {
-		atime = v
-	}
-	if v, ok := in.GetMTime(); ok {
-		mtime = v
-	}
-	return os.Chtimes(host, atime, mtime)
+	return setFileTimes(host, in)
 }
 
 func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
@@ -1307,69 +1422,52 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 		}
 		return n.createLocal(ctx, host, name, flags, mode, out)
 	}
-	// A reserved file mount point is created as a placeholder: bwrap replaces
-	// it with the real bind, and nothing may reach the daemon's tree.
-	if n.isSyntheticFile(p) {
+	// A reserved file mount point is created as a placeholder: the launcher
+	// replaces it with the real bind, and nothing may reach the daemon's tree.
+	// The handle carries the phantom mark too, so Open and Getattr on it stay
+	// in the sandbox and never ask the daemon about a file that is not there.
+	if n.isSyntheticFile(p) || n.isSyntheticDir(n.path) {
 		out.Attr = attrOf(proto.SIFREG|0o600, 0, ino(p))
 		child := &Node{lay: n.lay, path: p, phantom: true}
 		inode := n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)})
-		return inode, &handle{path: p, lay: n.lay}, 0, 0
+		return inode, &handle{path: p, lay: n.lay, phantom: true}, 0, 0
 	}
-	// Mount points inside synthetic dirs are placeholders: bwrap replaces
-	// them with the real bind mount, so they must exist but hold no data.
-	if n.isSyntheticDir(n.path) {
-		out.Attr = attrOf(proto.SIFREG|0o600, 0, ino(p))
-		child := &Node{lay: n.lay, path: p, phantom: true}
-		inode := n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)})
-		return inode, &handle{path: p, lay: n.lay}, 0, 0
+	// The daemon opens the file with O_CREAT and the caller's exact mode, so
+	// 0600 stays 0600 regardless of the client's umask. O_CREAT on an existing
+	// name keeps its bytes; only O_TRUNC clears them. O_APPEND is carried on
+	// the daemon fd, so the append position is decided where the file lives.
+	of := flags | uint32(syscall.O_CREAT)
+	h, inoN, errno := n.openRemote(p, of, mode)
+	if errno != 0 {
+		return nil, nil, 0, errno
 	}
-	// O_APPEND creates without truncating: an existing file keeps its bytes,
-	// and the appends themselves are streamed by Open/Write.
-	if flags&uint32(os.O_APPEND) != 0 {
-		// create + append: touch the daemon side, never truncating
-		if _, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxAppend, Path: p}); err != nil {
-			return nil, nil, 0, syscall.EIO
-		}
-		out.Attr = attrOf(proto.SIFREG|mode, 0, ino(p))
-		child := &Node{lay: n.lay, path: p}
-		inode := n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)})
-		return inode, &handle{remote: p, path: p, lay: n.lay, appendOnly: true}, 0, 0
-	}
-	if flags&uint32(os.O_EXCL) != 0 {
-		if resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p}); err == nil && resp.Kind == proto.KStat {
-			return nil, nil, 0, syscall.EEXIST
-		}
-	}
-	// A writable remote file stays on the daemon, exactly as it does when Open
-	// takes the same decision. Buffering it locally first would make the file
-	// briefly empty on the daemon — and a database that creates its journal,
-	// writes the page, then re-reads the file through a second descriptor
-	// would find nothing there. O_TRUNC is the only request that clears the
-	// existing bytes; O_CREAT on an existing file must leave them alone.
-	exists := false
-	if resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p}); err == nil {
-		exists = resp.Kind == proto.KStat
-	}
-	if !exists || flags&uint32(os.O_TRUNC) != 0 {
-		if err := n.lay.Remote.WriteFile(p, nil); err != nil {
-			return nil, nil, 0, syscall.EIO
-		}
-		n.lay.invalidate(p)
-	}
-	// Use the identity the daemon just assigned. A path-derived number here
-	// would differ from the one Lookup reports for the same file, and a later
-	// hard link to it would appear to live on a different inode.
-	stats := proto.Attr{Mode: proto.SIFREG | mode}
-	if resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p}); err == nil && resp.Kind == proto.KStat {
-		stats = resp.Attr
-	}
-	out.Attr = attrOfRemote(stats, remoteIno(stats, p))
+	out.Attr = attrOfRemote(h.base, inoN)
 	child := &Node{lay: n.lay, path: p}
 	inode := n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: out.Attr.Ino})
-	return inode, &handle{
-		remote: p, path: p, lay: n.lay,
-		appendOnly: flags&uint32(os.O_APPEND) != 0,
-	}, 0, 0
+	return inode, h, 0, 0
+}
+
+// openRemote opens a daemon-side descriptor. It returns the handle, the inode
+// number to present for the entry, and a numeric errno.
+func (n *Node) openRemote(p string, flags uint32, mode uint32) (*handle, uint64, syscall.Errno) {
+	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxOpen, Path: p, Flags: flags, Mode: mode})
+	if err != nil {
+		return nil, 0, errnoFromErr(err)
+	}
+	if resp.Errno != 0 {
+		return nil, 0, syscall.Errno(resp.Errno)
+	}
+	if resp.Kind != proto.KHandle || resp.Handle == 0 {
+		return nil, 0, syscall.EIO
+	}
+	h := &handle{
+		rhandle:    resp.Handle,
+		path:       p,
+		lay:        n.lay,
+		appendOnly: flags&uint32(syscall.O_APPEND) != 0,
+		base:       resp.Attr,
+	}
+	return h, remoteIno(resp.Attr, p), 0
 }
 
 func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -1385,16 +1483,20 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 		child := &Node{lay: n.lay, path: p}
 		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: ino(p)}), 0
 	}
-	// inside a sandbox mount point, mkdir only needs to succeed so bwrap can
+	// inside a reserved mount point, mkdir only needs to succeed so the
+	// launcher has a target to mount over
 	// prepare its bind targets; the directory holds nothing of its own
 	if n.inSynthetic(p) {
 		out.Attr = attrOf(proto.SIFDIR|mode, 0, ino(p))
 		child := &Node{lay: n.lay, path: p}
 		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFDIR, Ino: ino(p)}), 0
 	}
-	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxMkdir, Path: p, Arg: itoa(uint64(mode))})
-	if err != nil || resp.Kind == proto.KErr {
-		return nil, syscall.EIO
+	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxMkdir, Path: p, Arg: strconv.FormatUint(uint64(mode), 10)})
+	if err != nil {
+		return nil, errnoFromErr(err)
+	}
+	if e := respErrno(resp); e != 0 {
+		return nil, e
 	}
 	out.Attr = attrOf(proto.SIFDIR|mode, 0, ino(p))
 	child := &Node{lay: n.lay, path: p}
@@ -1419,7 +1521,7 @@ func (n *Node) createLocal(ctx context.Context, host, name string, flags, mode u
 	child := &Node{lay: n.lay, path: p}
 	inode := n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)})
 	return inode, &handle{
-		f: f, path: p, lay: n.lay,
+		fd: f, path: p, lay: n.lay,
 		// An O_APPEND file rejects WriteAt; remember how it was opened so Write
 		// picks the right call. Agents create-then-append their logs this way.
 		appendOnly: flags&uint32(os.O_APPEND) != 0,
@@ -1440,7 +1542,7 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 	}
 	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxUnlink, Path: p})
 	if err != nil {
-		return syscall.EIO
+		return errnoFromErr(err)
 	}
 	if e := respErrno(resp); e != 0 {
 		return e
@@ -1487,6 +1589,9 @@ func respErrno(resp *proto.FxResp) syscall.Errno {
 	if resp == nil {
 		return syscall.EIO
 	}
+	if resp.Errno != 0 {
+		return syscall.Errno(resp.Errno)
+	}
 	switch resp.Kind {
 	case proto.KOk, proto.KStat:
 		return 0
@@ -1525,12 +1630,12 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return 0
 	}
 	if n.inSynthetic(p) {
-		// a bind target bwrap made itself; removing it would only be undone
+		// a bind target the launcher owns; removing it would only be undone
 		return 0
 	}
 	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxRmdir, Path: p})
 	if err != nil {
-		return syscall.EIO
+		return errnoFromErr(err)
 	}
 	return respErrno(resp)
 }
@@ -1552,7 +1657,7 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 	}
 	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxSymlink, Path: p, Arg: target})
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, errnoFromErr(err)
 	}
 	if e := respErrno(resp); e != 0 {
 		return nil, e
@@ -1579,8 +1684,6 @@ func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 	if srcLocal != dstLocal {
 		return nil, syscall.EPERM
 	}
-	n.lay.invalidate(p)
-	n.lay.invalidate(src)
 	if dstLocal {
 		if !n.writable(p) {
 			return nil, syscall.EROFS
@@ -1591,12 +1694,11 @@ func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 	} else {
 		resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxLink, Path: p, Arg: src})
 		if err != nil {
-			return nil, syscall.EIO
+			return nil, errnoFromErr(err)
 		}
 		if e := respErrno(resp); e != 0 {
 			return nil, e
 		}
-		n.lay.invalidate(p)
 	}
 	// Answer with the file's real identity: the daemon's inode number, link
 	// count and times. Both names of a hard link must present the same inode, or
@@ -1635,24 +1737,18 @@ func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		if err := os.Rename(from, to); err != nil {
 			return errnoOf(err.Error())
 		}
-		n.lay.invalidate(from)
-		n.lay.invalidate(to)
 		n.repoint(moved(name, from, to))
 		return 0
 	}
 	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxRename, Path: from, Arg: to})
 	if err != nil {
-		return syscall.EIO
+		return errnoFromErr(err)
 	}
 	if e := respErrno(resp); e != 0 {
 		return e
 	}
-	// Both paths in a rename describe the same bytes: the destination now has
-	// them and the source no longer does. A cached copy of either would be
-	// served to the next open, and git reads its object back immediately after
-	// renaming it into place.
-	n.lay.invalidate(from)
-	n.lay.invalidate(to)
+	// An open descriptor follows its inode across a rename on the daemon, so
+	// nothing cached has to be dropped here.
 	n.repoint(moved(name, from, to))
 	return 0
 }
@@ -1703,6 +1799,25 @@ func reanchor(in *fs.Inode, from, to string) {
 	}
 }
 
+// errnoFromErr preserves a typed syscall.Errno carried by a transport error.
+// A remote Do returns the daemon's errno directly, so this never guesses from
+// message text when the error already names an errno.
+func errnoFromErr(err error) syscall.Errno {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return syscall.ENOENT
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return syscall.EACCES
+	}
+	if errors.Is(err, os.ErrExist) {
+		return syscall.EEXIST
+	}
+	return errnoOf(err.Error())
+}
 func errnoOf(msg string) syscall.Errno {
 	switch {
 	case strings.Contains(msg, "no such file"):
@@ -1721,15 +1836,6 @@ func errnoOf(msg string) syscall.Errno {
 	return syscall.EIO
 }
 
-func hash(p string) string {
-	var h uint64 = 1469598103934665603
-	for i := 0; i < len(p); i++ {
-		h ^= uint64(p[i])
-		h *= 1099511628211
-	}
-	return strings.TrimPrefix(itoa(h), "-")
-}
-
 func itoa(v uint64) string {
 	if v == 0 {
 		return "0"
@@ -1744,106 +1850,10 @@ func itoa(v uint64) string {
 	return string(b[i:])
 }
 
-var _ = sync.Mutex{}
-
-// cached returns the copy of a remote path that is still current.
-//
-// Current means the daemon's metadata for that path still matches the metadata
-// recorded when the copy was made. Comparing the copy's own age would only tell
-// us how long ago we fetched it, which says nothing about whether the daemon
-// changed the file since.
-func (l *Layout) cached(p string) (string, proto.Attr, error) {
-	full := filepath.Join(l.Cache, hash(p))
-	fi, err := os.Stat(full)
-	if err != nil {
-		return "", proto.Attr{}, err
-	}
-	stamp, err := os.ReadFile(full + ".meta")
-	if err != nil {
-		return "", proto.Attr{}, os.ErrNotExist
-	}
-	remote, err := l.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
-	if err != nil {
-		return "", proto.Attr{}, err
-	}
-	if remote.Kind != proto.KStat || string(stamp) != stampOf(remote.Attr) {
-		return "", proto.Attr{}, os.ErrNotExist
-	}
-	attr := remote.Attr
-	attr.Size = uint64(fi.Size())
-	return full, attr, nil
-}
-
-// stampOf renders the metadata that decides whether a cached copy is current.
-// invalidate drops the cached copy of a remote path.
-//
-// The cache is keyed by path and stamped with the daemon's metadata at fetch
-// time, so a stale entry is normally detected on the next open. A write through
-// this mount is the one case where the mount knows better: it changed the file
-// itself, and the stamp it holds was taken before that. Leaving the entry means
-// the next open serves the pre-write content, which a database then reports as
-// "no such table" — a silent revert, not an error.
-func (l *Layout) invalidate(p string) {
-	if l == nil || l.Cache == "" {
-		return
-	}
-	full := filepath.Join(l.Cache, hash(p))
-	os.Remove(full)
-	os.Remove(full + ".meta")
-}
-
-// cacheLimit bounds the read cache. Every remote read that is not already a hit
-// writes a body plus a stamp, and those entries have no natural expiry: a long
-// session reading many files leaves every one of them behind, growing without
-// limit. Keeping the newest limit files and dropping the rest bounds the space
-// to something a session can actually use. The stamp still decides staleness,
-// so evicting an entry only costs a refetch, never correctness.
-const cacheLimit = 2048
-
-// trimCache keeps the cache directory at or under cacheLimit entries, oldest
-// first. It is called after a new entry is written, so a burst of reads does not
-// overshoot by more than one.
-func (l *Layout) trimCache() {
-	if l == nil || l.Cache == "" {
-		return
-	}
-	des, err := os.ReadDir(l.Cache)
-	if err != nil {
-		return
-	}
-	// Trim a little above the limit rather than on every single write: the
-	// listing costs a directory read, and doing it per fetch would double the
-	// work of a workload that only reads.
-	if len(des) <= cacheLimit*5/4 {
-		return
-	}
-	type ent struct {
-		name  string
-		mtime time.Time
-	}
-	ents := make([]ent, 0, len(des))
-	for _, d := range des {
-		if d.IsDir() {
-			continue
-		}
-		fi, err := d.Info()
-		if err != nil {
-			continue
-		}
-		ents = append(ents, ent{d.Name(), fi.ModTime()})
-	}
-	if len(ents) <= cacheLimit {
-		return
-	}
-	sort.Slice(ents, func(i, j int) bool { return ents[i].mtime.Before(ents[j].mtime) })
-	for i := 0; i < len(ents)-cacheLimit; i++ {
-		os.Remove(filepath.Join(l.Cache, ents[i].name))
-	}
-}
-
-func stampOf(a proto.Attr) string {
-	return fmt.Sprintf("%d:%d:%d", a.Size, a.Mtime, a.Ino)
-}
+// There is deliberately no whole-file cache here. Every remote read, write,
+// stat and fsync is answered by the daemon's own descriptor for the file, so
+// there is no local copy that a rename, unlink or external writer could leave
+// stale; correctness no longer depends on invalidating a snapshot.
 
 // ino is a synthetic inode number; the kernel only needs uniqueness within a
 // directory, so a hash of the sandbox path is enough and survives restarts.

@@ -5,8 +5,11 @@
 # A cache entry is a path hash plus a stamp of the daemon's metadata. Two
 # sessions fetching at once must not see a half-written entry, and a changed
 # file must not be served from a stale one.
+# Destructive probe: RSBX_PROJ must be a disposable scratch directory; it is
+# never safe to fall back to a host /proj, which this probe wipes clean.
 set -u
-R=${RSBX_PROJ:-/proj/cache}
+: "${RSBX_PROJ:?set RSBX_PROJ to a disposable scratch directory for this destructive probe}"
+R=$RSBX_PROJ
 mkdir -p "$R" 2>/dev/null
 if [ -d "$R" ]; then find "$R" -mindepth 1 -delete 2>/dev/null; fi
 mkdir -p "$R" || { echo "FAIL setup: cannot create $R"; exit 1; }
@@ -22,11 +25,13 @@ concurrent_read(){
   seq 1 5000 > "$f" || return 1
   local want; want=$(wc -l < "$f")
   [ "$want" = 5000 ] || { echo "seed=$want"; return 1; }
-  local i bad=0
+  local i pids=() pid rc=0
   for i in $(seq 1 8); do
-    ( local n; n=$(wc -l < "$f"); [ "$n" = 5000 ] || exit 1 ) &
+    ( local n; n=$(wc -l < "$f"); [ "$n" = 5000 ] || { echo "reader saw $n lines"; exit 1; } ) &
+    pids+=($!)
   done
-  wait
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  [ $rc -eq 0 ] || return 1
 }
 t_concurrent_read(){ local e; e=$(concurrent_read 2>&1); [ $? -eq 0 ] && ok concurrent_read || bad concurrent_read "${e:0:100}"; }
 

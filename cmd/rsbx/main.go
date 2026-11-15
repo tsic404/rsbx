@@ -1,5 +1,10 @@
 // Command rsbx gives the caller a shell whose stdout, filesystem and child
 // processes live on the daemon — except the programs listed in local.allow.
+//
+// The first thing main does is check whether this process was started as the
+// sandbox launcher. That path exits into the entry program and never reaches
+// the flag package, so the internal launch flag cannot collide with any
+// user-visible option.
 package main
 
 import (
@@ -19,6 +24,10 @@ import (
 var version = "dev"
 
 func main() {
+	if sandbox.MaybeRunLauncher() {
+		return
+	}
+
 	var (
 		cfgPath = flag.String("config", "", "configuration file (default ~/.rsbx/config.toml)")
 		noMount = flag.Bool("no-mount", false, "print the computed plan and exit")
@@ -89,13 +98,16 @@ func main() {
 		} else {
 			fmt.Fprintf(os.Stderr, "rsbx: /usr/bin: %v\n", err)
 		}
-		fmt.Fprintf(os.Stderr, "rsbx: bwrap argv = %q\n", plan.BwrapArgs(flag.Args()))
 	}
 
 	if *serve {
-		// Keep the filesystem mounted without starting any program, so the
-		// mount can be inspected on its own.
-		select {}
+		sigc := make(chan os.Signal, 1)
+		signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		sig := <-sigc
+		signal.Stop(sigc)
+		stop()
+		_ = plan.Remote.Close()
+		os.Exit(128 + int(sig.(syscall.Signal)))
 	}
 	argv := flag.Args()
 	if len(argv) == 0 {
@@ -105,18 +117,6 @@ func main() {
 		}
 		argv = []string{entry}
 	}
-	// A signal ends this process without running any defer. Intercept the ones
-	// that stop a build or a CI job, unmount, then die by the same signal so
-	// the exit status still says how it ended.
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	go func() {
-		s := <-sigc
-		stop()
-		if sg, ok := s.(syscall.Signal); ok {
-			syscall.Kill(os.Getpid(), sg)
-		}
-	}()
 
 	code, err := plan.Run(argv)
 	if err != nil {
@@ -124,6 +124,7 @@ func main() {
 		fatal(err)
 	}
 	stop()
+	_ = plan.Remote.Close()
 	os.Exit(code)
 }
 

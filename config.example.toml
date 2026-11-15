@@ -1,5 +1,10 @@
 # rsbx — a shell whose view of the machine is the daemon's, except for the
-# programs and paths listed under [local].
+# programs and paths explicitly listed under [local].
+#
+# The defaults need no configuration: /bin/sh (the entry shell) is the only
+# local executable, every other command runs on the daemon, and no host
+# library or /usr/bin tree is pulled in implicitly. This file just names the
+# socket; everything commented out is the default.
 
 [daemon]
 # "unix"  : rsbxd listens on a socket on this machine
@@ -10,58 +15,48 @@ socket    = "~/.rsbx/daemon.sock"
 [local]
 # -- which programs run HERE --
 #
-# Anything not listed executes on the daemon. That is the intended default, and
-# it is not a privilege question: `ls` and `stat` work perfectly well remotely.
+# By default this list is empty. The only local command is local.entry below;
+# everything else — /bin/ls, /bin/cat, a shell tool, a coding agent — executes
+# on the daemon under its own filesystem view. That is the intended default,
+# and it is not a privilege question: the daemon's / is the machine you are
+# reaching, so ordinary commands and the project tree live there naturally.
 #
-# The one thing a daemon-side program cannot do is see a [local.paths] tree,
-# because the two sides have different filesystem views. So a tool belongs here
-# only when it must read local content: an agent inspecting its own state, or a
-# build reading a local checkout. When such a tool fails, the sandbox says so:
+# Add a program only when it must read local content. A daemon-side program
+# cannot see a [local.paths] tree, because the two sides have different
+# filesystem views. When such a tool fails, the sandbox says so:
 #
 #   rsbx: stat ran on the daemon and cannot see the local tree /work/a.txt;
 #         add /usr/bin/stat to local.allow to run it here instead
-allow = [
-  # shells and coreutils
-  "/usr/bin/bash", "/usr/bin/env", "/usr/bin/true",
-  "/usr/bin/ls", "/usr/bin/stat", "/usr/bin/cat", "/usr/bin/head",
-  "/usr/bin/tail", "/usr/bin/grep", "/usr/bin/find", "/usr/bin/wc",
-  "/usr/bin/sed", "/usr/bin/awk", "/usr/bin/sort", "/usr/bin/uniq",
-  "/usr/bin/cut", "/usr/bin/tr", "/usr/bin/xargs", "/usr/bin/tar",
-  "/usr/bin/mkdir", "/usr/bin/rm", "/usr/bin/cp", "/usr/bin/mv",
-  "/usr/bin/chmod", "/usr/bin/ln", "/usr/bin/readlink", "/usr/bin/dirname",
-  "/usr/bin/tee", "/usr/bin/which", "/usr/bin/id", "/usr/bin/date",
-  "/usr/bin/printenv", "/usr/bin/diff", "/usr/bin/touch",
+allow = []
 
-  # coding agents: they hold their own state, so they run locally.
-  # Also list the helpers a redirected command cannot provide: `timeout` and
-  # similar wrappers used inside scripts must run where the paths exist.
-  "/usr/local/bin/codex",
-  "/usr/local/bin/claude",
-  "/usr/bin/timeout",
-]
 # The shell the session starts. It runs locally by definition, so it does not
 # need to be repeated in local.allow; a path outside a local tree would fail at
 # start-up, which is the error that rule exists to prevent.
-entry = "/usr/bin/bash"
+entry = "/bin/sh"
 
 # -- which files are LOCAL --
 # Trees read and written on this machine. A redirected program on the daemon
-# cannot see them at all.
-paths = [
-  "/work",
-  "/home/me/.codex",
-  "/home/me/.claude",
-  "/home/me/.config",
-]
-# Toolchain and device trees: served locally, read-only.
-read_only_paths = ["/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
+# cannot see them at all. Empty by default: the client's filesystem is the
+# daemon's, except for these trees and local.allow's executable bytes.
+paths = []
 
-# There is no [remote] table: the daemon-side root is a property of the daemon.
-#   rsbxd -socket ~/.rsbx/daemon.sock -root /srv/tree
+# Toolchain and device trees, served locally, read-only. Empty by default; add
+# a directory here only to make it local on purpose, never to reconstruct the
+# host /usr or library tree that the daemon already serves.
+read_only_paths = []
+
+# There is no [remote] table and no daemon-side root. rsbxd runs on the remote
+# host and its / is that machine's own root: a path you see in the sandbox is a
+# path the daemon can open, sent verbatim.
 
 [sandbox]
 mount = "~/.rsbx/sandbox"
-# Disposable copies of remote files read by this machine.
+# Disposable runtime scratch the client stages transient data in. It is not a
+# snapshot of remote files and nothing is ever served from it, so deleting it
+# only costs the client re-staging what it needs.
 cache = "~/.rsbx/cache"
 # Agents talk to their APIs, so they need the network.
 # share_network = false
+# Inside a container the runtime has already created a user namespace; nested
+# creation is refused on some hosts, so set unshare_user = false there.
+# unshare_user = false

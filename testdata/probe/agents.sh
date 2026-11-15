@@ -2,8 +2,11 @@
 # Several agents working at once in one project, which is what a shared sandbox
 # actually sees. Asserts that concurrent sessions do not corrupt each other's
 # state and that each one's own view stays consistent.
+# Destructive probe: RSBX_PROJ must be a disposable scratch directory; it is
+# never safe to fall back to a host /proj, which this probe wipes clean.
 set -u
-R=${RSBX_PROJ:-/proj/fleet}
+: "${RSBX_PROJ:?set RSBX_PROJ to a disposable scratch directory for this destructive probe}"
+R=$RSBX_PROJ
 mkdir -p "$R" 2>/dev/null
 if [ -d "$R" ]; then
   find "$R" -mindepth 1 -delete 2>/dev/null || rm -rf "${R:?}"/* 2>/dev/null
@@ -19,6 +22,7 @@ skip(){ echo "SKIP $1: $2"; }
 # never share a name, which is how agents in one repo stay out of each other's
 # way; the filesystem must not introduce interference of its own.
 sessions(){
+  local pids=() pid rc=0
   local i
   for i in 1 2 3 4; do
     (
@@ -33,8 +37,10 @@ sessions(){
       done
       rm -f "$d/session.lock" || exit 1
     ) &
+    pids+=($!)
   done
-  wait
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  [ $rc -eq 0 ] || { echo "a worker exited nonzero"; return 1; }
   for i in 1 2 3 4; do
     local d=$R/agent-$i
     [ "$(wc -l < "$d/transcript.jsonl" 2>/dev/null)" = 30 ] || { echo "agent $i lines=$(wc -l < "$d/transcript.jsonl" 2>/dev/null)"; return 1; }
@@ -48,6 +54,7 @@ t_sessions(){ local e; e=$(sessions 2>&1); [ $? -eq 0 ] && ok concurrent_session
 # Two sessions writing one shared file under a lock, the way a build cache does.
 # The winner's content must be one of the two whole writes, never a mixture.
 sharedlock(){
+  local pids=() pid rc=0
   printf 'init' > "$R/shared.cache" || return 1
   local i
   for i in 1 2; do
@@ -59,8 +66,10 @@ sharedlock(){
         rm -f "$R/shared.lock"
       done
     ) &
+    pids+=($!)
   done
-  wait
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  [ $rc -eq 0 ] || { echo "a writer exited nonzero"; return 1; }
   local v; v=$(cat "$R/shared.cache")
   case "$v" in
     writer-[12]-[0-9]*) return 0 ;;
@@ -107,9 +116,9 @@ rmwhile(){
   local i
   for i in $(seq 1 100); do printf 'v' > "$d/f$i"; done
   ( sleep 0.02; rm -rf "$d" ) &
-  local j
+  local j pid=$!
   for j in $(seq 1 100); do cat "$d/f$j" >/dev/null 2>&1 || true; done
-  wait
+  wait "$pid" || { echo "remover failed"; return 1; }
   [ ! -e "$d" ] || { echo "tree survived removal"; return 1; }
 }
 t_rmwhile(){ local e; e=$(rmwhile 2>&1); [ $? -eq 0 ] && ok remove_while_reading || bad remove_while_reading "${e:0:100}"; }

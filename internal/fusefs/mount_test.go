@@ -70,7 +70,6 @@ func mounted(t *testing.T) (mnt, tree string) {
 		// mount is a separate directory on the host. That is the production
 		// arrangement: the mount point must never sit inside the tree it serves.
 		Local:      viewLocal{prefix: mnt, tree: tree},
-		Cache:      filepath.Join(base, "cache"),
 		Trampoline: filepath.Join(base, "tramp"),
 		HostDirs:   hostDirs,
 	}

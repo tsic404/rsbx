@@ -5,6 +5,10 @@
 // caller exec'd), then asks the daemon to run exactly that command and bridges
 // stdio. Being statically linked is deliberate: it must work even when the
 // program the user tried to run was itself static.
+//
+// The daemon's native filesystem is the sandbox's /: the trampoline reads no
+// root override, strips no mount prefix, and adds no path translation. The
+// only thing it needs is the private broker socket the launcher binds for it.
 package main
 
 import (
@@ -12,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"rsbx/internal/proto"
 	"rsbx/internal/rpc"
@@ -33,8 +36,8 @@ func main() {
 	if env := os.Getenv("RSBX_TARGET"); env != "" {
 		target = env
 	}
-	// The transport is either a unix socket (daemon on this host) or a
-	// command that speaks the protocol on its stdio (ssh).
+	// The transport is either the private broker socket or a command that
+	// speaks the protocol on its stdio.
 	sock := os.Getenv("RSBX_TRAMP_SOCK")
 	cmdSpec := os.Getenv("RSBX_TRAMP_CMD")
 	if sock == "" && cmdSpec == "" {
@@ -46,14 +49,11 @@ func main() {
 		Env:  os.Environ(),
 		TTY:  isCharDevice(os.Stdin) && isCharDevice(os.Stdout),
 	}
-	// The daemon operates on its own root, not on the sandbox's mount path,
-	// so the working directory travels as a sandbox-absolute path.
-	// Inside bwrap the mount *is* /, so the cwd is already correct there.
+	// The sandbox root is the daemon view, so the process's own cwd is already
+	// the daemon-absolute path the request needs. If it cannot be read the
+	// daemon starts in the caller's home rather than a guessed directory.
 	if cwd, err := os.Getwd(); err == nil {
-		req.Dir = sandboxPath(cwd)
-	}
-	if root := os.Getenv("RSBX_ROOT"); root != "" {
-		req.Env = append(req.Env, "RSBX_ROOT="+root)
+		req.Dir = cwd
 	}
 	transport := rpc.Target{Socket: sock}
 	if cmdSpec != "" {
@@ -97,23 +97,6 @@ func firstLocalArg(argv []string, trees string) string {
 	return ""
 }
 
-// sandboxPath strips the FUSE mount prefix so the daemon sees "/proj" rather
-// than "/home/user/.rsbx/sandbox/proj".
-func sandboxPath(p string) string {
-	mount := os.Getenv("RSBX_SANDBOX_MOUNT")
-	if mount == "" || !strings.HasPrefix(p, mount) {
-		return p
-	}
-	rest := strings.TrimPrefix(p, mount)
-	if rest == "" {
-		return "/"
-	}
-	if !strings.HasPrefix(rest, "/") {
-		rest = "/" + rest
-	}
-	return rest
-}
-
 // splitArgs splits a whitespace separated command line into argv.
 func splitArgs(s string) []string {
 	var out []string
@@ -141,5 +124,3 @@ func isCharDevice(f *os.File) bool {
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
 }
-
-var _ = syscall.Getpid

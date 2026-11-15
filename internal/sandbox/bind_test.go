@@ -3,130 +3,154 @@ package sandbox
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"rsbx/internal/config"
 	"rsbx/internal/paths"
 	"rsbx/internal/policy"
 )
 
-// bwrap only offers a -try form for user and cgroup namespaces. Asking for
-// --unshare-net-try made every non-ssh sandbox fail to start, so the argument
-// list must never contain it.
-func TestNoUnsupportedBwrapTryFlags(t *testing.T) {
-	dir := tempDirOutsideTmp(t)
-	pol, _ := policy.New([]string{"/usr/bin/true"})
-	local, _ := paths.New([]string{dir}, false)
-	plan := &Plan{Exec: pol, Local: local, Cfg: testCfg(), Mount: "/mnt/x"}
-	args := plan.BwrapArgs([]string{"/bin/true"})
-	allowed := map[string]bool{
-		"--unshare-user-try": true, "--unshare-cgroup-try": true,
+// planFor builds a Plan the way Prepare would, without touching a mount.
+func planFor(t *testing.T, dir string, allow []string, localTrees []string) *Plan {
+	t.Helper()
+	pol, err := policy.New(allow)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, a := range args {
-		if strings.HasPrefix(a, "--unshare-") && strings.HasSuffix(a, "-try") && !allowed[a] {
-			t.Errorf("bwrap does not accept %s", a)
+	local, err := paths.New(localTrees, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Sandbox.Mount = "/mnt/x"
+	cfg.Sandbox.Cache = filepath.Join(dir, "cache")
+	return &Plan{
+		Cfg:   cfg,
+		Exec:  pol,
+		Local: local,
+		Mount: cfg.Sandbox.Mount,
+	}
+}
+
+// The layout must reserve every internal bind target as synthetic. The
+// launcher creates these itself; if FUSE forwarded one to the daemon it would
+// materialise a stray file or directory in the daemon tree.
+func TestReservedPathsAreSynthetic(t *testing.T) {
+	plan := planFor(t, tempDirOutsideTmp(t), []string{"/bin/sh"}, nil)
+	lay := plan.Layout()
+	synthetic := map[string]bool{}
+	for _, s := range lay.Synthetic {
+		synthetic[s] = true
+	}
+	for _, want := range []string{BrokerDir, OldRootPath, "/proc", "/dev"} {
+		if !synthetic[want] {
+			t.Errorf("%s not reserved as a synthetic mount point", want)
+		}
+	}
+	for _, f := range lay.SyntheticFiles {
+		if f != GuardPath && f != TrampolinePath {
+			t.Errorf("unexpected synthetic file %s", f)
 		}
 	}
 }
 
-// The caller's directory is only used when the sandbox will have it; /tmp is
-// replaced by a tmpfs, so starting there must fall back instead of failing.
-func TestChdirSkippedForPathsHiddenByTmpfs(t *testing.T) {
-	pol, _ := policy.New([]string{"/usr/bin/true"})
-	local, _ := paths.New(nil, false)
-	plan := &Plan{Exec: pol, Local: local, Cfg: testCfg(), Mount: "/mnt/x"}
-	if plan.hasPath("/tmp/anything") {
-		t.Error("/tmp path reported reachable; it is a tmpfs")
-	}
-	if plan.hasPath("/some/daemon/path") {
-		t.Error("unknown path reported reachable")
-	}
-	if !plan.hasPath("/proc") {
-		t.Error("synthetic path reported unreachable")
-	}
-}
-
-// Local trees are served by FUSE, never bound: a bind would make bwrap create
-// the intermediate directories, and that creation replaces the FUSE entries at
-// the same paths, leaving the tree empty inside the sandbox.
-func TestLocalTreesAreNeverBound(t *testing.T) {
+// The broker directory is the only host directory the launcher binds. Nothing
+// else may appear as a host passthrough that the policy did not grant.
+func TestOnlyBrokerIsHostBound(t *testing.T) {
 	dir := tempDirOutsideTmp(t)
-	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	pol, _ := policy.New([]string{"/usr/bin/true"})
-	local, _ := paths.New([]string{dir}, false)
-	plan := &Plan{Exec: pol, Local: local, Cfg: testCfg(), Mount: "/mnt/x"}
-	args := plan.BwrapArgs([]string{"/bin/true"})
-	for i := 0; i+2 < len(args); i++ {
-		if args[i] != "--bind" && args[i] != "--ro-bind" && args[i] != "--bind-try" && args[i] != "--ro-bind-try" {
+	plan := planFor(t, dir, []string{"/bin/sh"}, []string{dir})
+	lay := plan.Layout()
+	// HostDirs is the ancestor closure of the local trees; nothing outside
+	// them may appear there.
+	for d := range lay.HostDirs {
+		if d == "/" {
+			// The root is the view itself, not a host passthrough.
 			continue
 		}
-		if args[i+1] == dir || args[i+2] == dir {
-			t.Fatalf("local tree bound from the host: %v", args[i:i+3])
+		if !plan.Local.IsLocal(d) && !isAncestorOf(d, plan.Local.Roots()) {
+			t.Errorf("%s is not part of any local tree", d)
 		}
+	}
+	if lay.SystemLinks != nil && len(lay.SystemLinks) != 0 {
+		t.Errorf("host system links leaked into the layout: %v", lay.SystemLinks)
 	}
 }
 
-// A local tree can live deep in the host filesystem. Its ancestors must be
-// present in the view as plain directories, and the root itself must not be
-// turned into an empty placeholder, or the tree appears with no contents.
-func TestDeepLocalTreeIsReachable(t *testing.T) {
-	base := tempDirOutsideTmp(t)
-	deep := filepath.Join(base, "a", "b", "c")
-	if err := os.MkdirAll(deep, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(deep, "file.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	pol, _ := policy.New([]string{"/usr/bin/true"})
-	local, _ := paths.New([]string{deep}, false)
-	plan := &Plan{Exec: pol, Local: local, Cfg: testCfg(), Mount: "/mnt/x"}
-	lay := plan.Layout()
-
-	for _, dir := range []string{filepath.Dir(deep), filepath.Dir(filepath.Dir(deep))} {
-		if !lay.HostDirs[dir] {
-			t.Errorf("ancestor %s missing from HostDirs", dir)
-		}
-		found := false
-		for _, s := range lay.Synthetic {
-			if s == dir {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("ancestor %s not reserved as a mount point", dir)
+func isAncestorOf(dir string, roots []string) bool {
+	for _, r := range roots {
+		if r == dir || len(dir) < len(r) && r[len(dir)] == '/' && r[:len(dir)] == dir {
+			return true
 		}
 	}
-	for _, s := range lay.Synthetic {
-		if s == deep {
-			t.Errorf("local tree root %s served as an empty placeholder", deep)
-		}
-	}
-	if !plan.hasPath(deep) {
-		t.Errorf("local tree %s reported unreachable", deep)
-	}
-	if !plan.hasPath(filepath.Dir(deep)) {
-		t.Errorf("ancestor %s reported unreachable", filepath.Dir(deep))
-	}
+	return false
 }
 
-// The trampoline needs the local tree list to explain a failure. Without it the
-// user only sees a bare ENOENT and has to infer the cause.
-func TestLocalTreesReachTheSandbox(t *testing.T) {
+// The launcher spec is the only thing crossing the process boundary. It must
+// never carry host credentials: the daemon transport is dialled by the broker
+// outside the root, so the spec has no socket path, no ssh command and no
+// environment of its own beyond what the entry already has.
+func TestLaunchSpecCarriesNoDaemonTransport(t *testing.T) {
 	dir := tempDirOutsideTmp(t)
-	pol, _ := policy.New([]string{"/usr/bin/true"})
-	local, _ := paths.New([]string{dir}, false)
-	plan := &Plan{Exec: pol, Local: local, Cfg: testCfg(), Mount: "/mnt/x"}
-	args := plan.BwrapArgs([]string{"/bin/true"})
-	found := false
-	for i := 0; i+2 < len(args); i++ {
-		if args[i] == "--setenv" && args[i+1] == "RSBX_LOCAL_TREES" && args[i+2] == dir {
-			found = true
+	cfg := config.Default()
+	cfg.Daemon.Transport = "ssh"
+	cfg.Daemon.Command = `ssh host rsbxd --socket /x`
+	plan := planFor(t, dir, []string{"/bin/sh"}, nil)
+	plan.Cfg = cfg
+	plan.Target = targetOf(cfg)
+	b, err := newBroker(plan.Target, filepath.Join(dir, "broker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop()
+	spec := plan.launchSpec([]string{"/bin/sh"}, b)
+	if spec.Mount != plan.Mount || spec.BrokerDir != b.HostDir() {
+		t.Errorf("spec mispoints the root or broker: %+v", spec)
+	}
+	for _, kv := range spec.Env {
+		if kv == "RSBX_TRAMP_SOCK=" || kv == "RSBX_TRAMP_CMD=" {
+			t.Errorf("spec leaks trampoline transport: %q", kv)
 		}
 	}
-	if !found {
-		t.Fatalf("RSBX_LOCAL_TREES not passed to the sandbox: %v", args)
+}
+
+// A working directory the sandbox cannot have must not be carried into the
+// launcher: /tmp stays the daemon's directory, so starting there means the
+// entry starts at / instead.
+func TestHiddenCwdFallsBackToRoot(t *testing.T) {
+	dir := tempDirOutsideTmp(t)
+	plan := planFor(t, dir, []string{"/bin/sh"}, []string{dir})
+	b, err := newBroker(plan.Target, filepath.Join(dir, "broker"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer b.Stop()
+	// /tmp is the daemon's directory, so it is reachable through the view;
+	// it must never be treated as a host tree the launcher replaces.
+	if !plan.hasPath("/tmp") {
+		t.Error("daemon /tmp must stay visible in the view")
+	}
+	if plan.Local.IsLocal("/tmp") || plan.Local.IsLocal("/tmp/anything") {
+		t.Error("/tmp must not be served as a local tree")
+	}
+	spec := plan.launchSpec([]string{"/bin/sh"}, b)
+	if spec.Cwd == "/tmp" || filepath.HasPrefix(spec.Cwd, "/tmp/") {
+		t.Errorf("cwd %q cannot exist in the sandbox view", spec.Cwd)
+	}
+}
+
+// tempDirOutsideTmp creates a scratch directory that is not under /tmp. The
+// sandbox keeps /tmp as daemon content, so trees living there would be served
+// by FUSE rather than from the host, which would invalidate these tests.
+func tempDirOutsideTmp(t *testing.T) string {
+	t.Helper()
+	base := os.Getenv("RSBX_TEST_SCRATCH")
+	if base == "" {
+		base = "/var/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "rsbx-test-")
+	if err != nil {
+		t.Skipf("no writable scratch outside /tmp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
 }

@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-// The daemon has to be a single instance per socket. Two daemons sharing one
-// socket path race for every connection, so a client stalls whenever its
-// connection lands on the wrong one — which is nearly impossible to see from
-// the outside and reads as a hang.
+// The daemon must be a single instance per socket path. Without a lock a
+// second daemon could unlink the path, bind again, and leave two listeners
+// where only the last one is reachable — which reads as an intermittent
+// "daemon hangs" and is nearly impossible to see from the outside.
 func TestLockInstanceAllowsOneHolder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.sock.lock")
 	unlock, err := lockInstance(path)
@@ -17,7 +17,9 @@ func TestLockInstanceAllowsOneHolder(t *testing.T) {
 	}
 	defer unlock()
 
-	if _, err := lockInstance(path); err == nil {
+	if unlock2, err := lockInstance(path); err == nil {
+		// Release immediately so the second acquisition is not leaked.
+		unlock2()
 		t.Fatal("a second holder acquired the same lock")
 	}
 }
@@ -32,7 +34,9 @@ func TestLockInstanceReleasedOnUnlock(t *testing.T) {
 	}
 	unlock()
 
-	if _, err := lockInstance(path); err != nil {
+	unlock2, err := lockInstance(path)
+	if err != nil {
 		t.Fatalf("second holder refused after release: %v", err)
 	}
+	unlock2()
 }

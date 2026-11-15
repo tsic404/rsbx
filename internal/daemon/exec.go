@@ -1,27 +1,23 @@
 // Package daemon implements the remote side: it runs processes and owns the
-// remote filesystem tree.
+// remote filesystem tree. The daemon's native view is the remote filesystem:
+// there is no jail, no root override and no path translation.
 package daemon
 
 import (
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"syscall"
-	"time"
 
 	"rsbx/internal/proto"
 	"rsbx/internal/pty"
 )
 
-// Server serves exec sessions and filesystem requests for one remote root.
+// Server serves exec sessions and filesystem requests.
 type Server struct {
-	Root string
 	// Logf is optional.
 	Logf func(format string, args ...any)
 }
@@ -51,162 +47,201 @@ func (s *Server) ServeConn(c net.Conn) {
 	}
 }
 
-// resolve maps an absolute sandbox path to the daemon root.
-func (s *Server) resolve(p string) string {
-	clean := filepath.Clean("/" + p)
-	if clean == "/" {
-		return s.Root
-	}
-	return filepath.Join(s.Root, clean)
-}
-
 func (s *Server) serveExec(c net.Conn, payload []byte) {
 	req, err := proto.DecodeExecReq(payload)
 	if err != nil || len(req.Argv) == 0 {
 		proto.WriteFrame(c, proto.TErr, []byte("rsbxd: bad exec request"))
+		proto.WriteFrame(c, proto.TExit, proto.ExitPayload(127))
 		return
-	}
-	dir := s.resolve(req.Dir)
-	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-		dir = s.Root
 	}
 	if req.TTY {
-		s.execTTY(c, req, dir)
+		s.execTTY(c, req)
 		return
 	}
-	s.execPipes(c, req, dir)
+	s.execPipes(c, req)
 }
 
-// build constructs the child command. The child sees s.Root as "/", so a path
-// the client sends means the same thing on both sides. bwrap provides that
-// view; without it the daemon would have to translate every argument.
+// resolveCwd validates the requested working directory. There is no fallback:
+// the client said where to run, and silently running somewhere else changes
+// what the command does. On failure it reports the error on the connection and
+// returns false so the caller aborts.
+func (s *Server) resolveCwd(c net.Conn, dir string) (string, bool) {
+	if dir == "" {
+		return "", true
+	}
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		proto.WriteFrame(c, proto.TErr, []byte(fmt.Sprintf("rsbxd: chdir %s: no such directory", dir)))
+		proto.WriteFrame(c, proto.TExit, proto.ExitPayload(127))
+		return "", false
+	}
+	return dir, true
+}
+
+// build constructs the child command from the request verbatim. Argv, cwd and
+// env are used exactly as sent; an empty env is left nil so the child inherits
+// the daemon's environment. The child runs in its own process group so a
+// signal reaches the whole tree and a disconnect can take every descendant
+// with it.
 func (s *Server) build(req *proto.ExecReq, dir string) *exec.Cmd {
-	var cmd *exec.Cmd
-	if jail, err := s.jail(req); err == nil {
-		cmd = jail
-	} else {
-		cmd = exec.Command(req.Argv[0], req.Argv[1:]...)
-		cmd.Dir = dir
-	}
-	env := req.Env
-	if len(env) == 0 {
-		env = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/", "TERM=xterm-256color"}
-	}
-	cmd.Env = env
+	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
+	cmd.Dir = dir
+	cmd.Env = req.Env
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return cmd
 }
 
-// jail wraps argv in a bwrap invocation that makes Root the child's /.
-func (s *Server) jail(req *proto.ExecReq) (*exec.Cmd, error) {
-	bwrap, err := exec.LookPath("bwrap")
-	if err != nil {
-		return nil, err
+func (s *Server) execPipes(c net.Conn, req *proto.ExecReq) {
+	dir, ok := s.resolveCwd(c, req.Dir)
+	if !ok {
+		return
 	}
-	args := []string{
-		"--bind", s.Root, "/",
-		"--proc", "/proc",
-		"--dev", "/dev",
-		"--tmpfs", "/tmp",
-	}
-	// the toolchain the remote side needs to run anything at all
-	for _, d := range []string{"/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"} {
-		args = append(args, "--ro-bind-try", d, d)
-	}
-	if req.Dir != "" {
-		args = append(args, "--chdir", req.Dir)
-	}
-	args = append(args, "--die-with-parent")
-	args = append(args, req.Argv...)
-	return exec.Command(bwrap, args...), nil
-}
-
-func (s *Server) execPipes(c net.Conn, req *proto.ExecReq, dir string) {
 	cmd := s.build(req, dir)
+
+	// Child stdin is an exec-managed pipe: Wait closes the write end on exit,
+	// which is exactly the EOF the child should see/value for stdin.
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		proto.WriteFrame(c, proto.TErr, []byte(err.Error()))
 		return
 	}
-	stdout, err := cmd.StdoutPipe()
+	// stdout/stderr are plain os.Pipes assigned to cmd.Stdout/cmd.Stderr, not
+	// StdoutPipe/StderrPipe. Wait therefore does not own them: it would close
+	// a pipe with unread buffered data and drop the tail of the output. We
+	// close the parent's write ends right after Start and drain the read ends
+	// ourselves to EOF, so nothing is lost.
+	outR, outW, err := os.Pipe()
 	if err != nil {
+		stdin.Close()
 		proto.WriteFrame(c, proto.TErr, []byte(err.Error()))
 		return
 	}
-	stderr, err := cmd.StderrPipe()
+	errR, errW, err := os.Pipe()
 	if err != nil {
+		stdin.Close()
+		outR.Close()
+		outW.Close()
 		proto.WriteFrame(c, proto.TErr, []byte(err.Error()))
 		return
 	}
+	cmd.Stdout = outW
+	cmd.Stderr = errW
 	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		outR.Close()
+		outW.Close()
+		errR.Close()
+		errW.Close()
 		proto.WriteFrame(c, proto.TErr, []byte(fmt.Sprintf("rsbxd: exec %s: %v", req.Argv[0], err)))
 		proto.WriteFrame(c, proto.TExit, proto.ExitPayload(127))
 		return
 	}
+	// The parent no longer needs the write ends; EOF on the read ends is the
+	// signal that the child (and its descendants) closed them.
+	outW.Close()
+	errW.Close()
+
 	var wmu sync.Mutex
-	send := func(typ byte, p []byte) {
+	send := func(typ byte, p []byte) bool {
 		wmu.Lock()
-		proto.WriteFrame(c, typ, p)
-		wmu.Unlock()
+		defer wmu.Unlock()
+		return proto.WriteFrame(c, typ, p) == nil
 	}
 	send(proto.TReady, nil)
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	pump := func(r io.Reader, typ byte) {
-		defer wg.Done()
+	pgid := -cmd.Process.Pid
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	pump := func(r *os.File, typ byte) {
+		defer pumps.Done()
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := r.Read(buf)
-			if n > 0 {
-				send(typ, buf[:n])
+			if n > 0 && !send(typ, buf[:n]) {
+				// The client is gone: that is a cancel, not a reason to keep
+				// the child alive.
+				syscall.Kill(pgid, syscall.SIGKILL)
+				r.Close()
+				return
 			}
 			if err != nil {
+				r.Close()
 				return
 			}
 		}
 	}
-	go pump(stdout, proto.TStdout)
-	go pump(stderr, proto.TStderr)
+	go pump(outR, proto.TStdout)
+	go pump(errR, proto.TStderr)
 
+	// The control reader and the stdin writer are separate goroutines. If they
+	// shared one loop, a child that stops reading its stdin would block the
+	// reader forever on a pipe write, and it could never forward TSig or
+	// notice a disconnect. The reader hands frames to an unbounded queue, so
+	// backpressure stays in the writer: it parks on a blocked pipe write (and
+	// is unblocked on disconnect by stdin.Close()), while the reader keeps
+	// handling signals. done cancels both helpers at teardown.
 	done := make(chan struct{})
-	go func() {
-		defer close(done)
+	queue := newStdinQueue(done)
+	var stdinWg sync.WaitGroup
+	stdinWg.Add(1)
+	go func() { // stdin writer
+		defer stdinWg.Done()
+		for {
+			data, open := queue.next()
+			if !open {
+				return
+			}
+			if data == nil { // EOF sentinel
+				stdin.Close()
+				return
+			}
+			if _, err := stdin.Write(data); err != nil {
+				return
+			}
+		}
+	}()
+	go func() { // control reader
 		for {
 			f, err := proto.ReadFrame(c)
 			if err != nil {
+				// Disconnect: cancel the whole tree and unblock a stdin write
+				// that is parked because the child stopped reading.
+				syscall.Kill(pgid, syscall.SIGKILL)
 				stdin.Close()
 				return
 			}
 			switch f.Type {
-			case proto.TStdin:
-				if len(f.Payload) == 0 {
-					stdin.Close()
-					continue
-				}
-				if _, err := stdin.Write(f.Payload); err != nil {
-					return
-				}
 			case proto.TSig:
 				if len(f.Payload) >= 4 {
-					_ = cmd.Process.Signal(syscall.Signal(int(int32(f.Payload[0]))))
+					syscall.Kill(pgid, decodeSignal(f.Payload))
 				}
+			case proto.TStdin:
+				// nil is the EOF sentinel the writer recognises; a non-empty
+				// payload is data.
+				var data []byte
+				if len(f.Payload) > 0 {
+					data = f.Payload
+				}
+				queue.add(data)
 			}
 		}
 	}()
-	wg.Wait()
-	status := waitStatus(cmd)
-	wmu.Lock()
-	proto.WriteFrame(c, proto.TExit, proto.ExitPayload(status))
-	wmu.Unlock()
-	// give the reader goroutine a moment to notice the closed socket rather
-	// than tearing the connection down from under a pending write
-	select {
-	case <-done:
-	case <-time.After(100 * time.Millisecond):
-	}
+
+	// Wait exactly once so the reported status is the real one. Wait does not
+	// manage the stdout/stderr pipes, so it cannot drop their buffered output:
+	// we drain both to EOF first, then report.
+	_ = cmd.Wait()
+	pumps.Wait()
+	send(proto.TExit, proto.ExitPayload(waitStatus(cmd)))
+	close(done)
+	stdinWg.Wait()
 }
 
-func (s *Server) execTTY(c net.Conn, req *proto.ExecReq, dir string) {
+func (s *Server) execTTY(c net.Conn, req *proto.ExecReq) {
+	dir, ok := s.resolveCwd(c, req.Dir)
+	if !ok {
+		return
+	}
 	master, slave, err := pty.Open()
 	if err != nil {
 		proto.WriteFrame(c, proto.TErr, []byte("rsbxd: pty: "+err.Error()))
@@ -218,6 +253,9 @@ func (s *Server) execTTY(c net.Conn, req *proto.ExecReq, dir string) {
 
 	cmd := s.build(req, dir)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
+	// A pty session is its own session, with the pty slave as controlling
+	// terminal. That makes it the session (and process group) leader, so
+	// signalling -pid reaches the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	if err := cmd.Start(); err != nil {
 		slave.Close()
@@ -228,19 +266,25 @@ func (s *Server) execTTY(c net.Conn, req *proto.ExecReq, dir string) {
 	slave.Close()
 
 	var wmu sync.Mutex
-	send := func(typ byte, p []byte) {
+	send := func(typ byte, p []byte) bool {
 		wmu.Lock()
-		proto.WriteFrame(c, typ, p)
-		wmu.Unlock()
+		defer wmu.Unlock()
+		return proto.WriteFrame(c, typ, p) == nil
 	}
 	send(proto.TReady, nil)
 
+	// Pump the pty output to the client. EIO marks the child's natural exit:
+	// the controlling terminal hangs up when its session leader dies.
+	pumpDone := make(chan struct{})
 	go func() {
+		defer close(pumpDone)
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := master.Read(buf)
-			if n > 0 {
-				send(proto.TTty, buf[:n])
+			if n > 0 && !send(proto.TTty, buf[:n]) {
+				// A failed send is a cancel: take the whole tree down.
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				return
 			}
 			if err != nil {
 				return
@@ -248,40 +292,92 @@ func (s *Server) execTTY(c net.Conn, req *proto.ExecReq, dir string) {
 		}
 	}()
 
-	for {
-		f, err := proto.ReadFrame(c)
-		if err != nil {
-			_ = cmd.Process.Signal(syscall.SIGKILL)
-			break
+	// Handle input, resizes and signals until the connection goes away. A
+	// disconnect kills the tree so nothing outlives the session.
+	go func() {
+		for {
+			f, err := proto.ReadFrame(c)
+			if err != nil {
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				return
+			}
+			switch f.Type {
+			case proto.TTty, proto.TStdin:
+				if _, err := master.Write(f.Payload); err != nil {
+					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					return
+				}
+			case proto.TWinch:
+				if len(f.Payload) >= 4 {
+					rows := uint16(f.Payload[0])<<8 | uint16(f.Payload[1])
+					cols := uint16(f.Payload[2])<<8 | uint16(f.Payload[3])
+					_ = pty.SetWinsize(master, rows, cols)
+				}
+			case proto.TSig:
+				if len(f.Payload) >= 4 {
+					syscall.Kill(-cmd.Process.Pid, decodeSignal(f.Payload))
+				}
+			}
 		}
-		switch f.Type {
-		case proto.TTty, proto.TStdin:
-			if _, err := master.Write(f.Payload); err != nil {
-				_ = cmd.Process.Signal(syscall.SIGKILL)
-			}
-		case proto.TWinch:
-			if len(f.Payload) >= 4 {
-				rows := uint16(f.Payload[0])<<8 | uint16(f.Payload[1])
-				cols := uint16(f.Payload[2])<<8 | uint16(f.Payload[3])
-				_ = pty.SetWinsize(master, rows, cols)
-			}
-		case proto.TSig:
-			if len(f.Payload) >= 4 {
-				sig := syscall.Signal(int32(f.Payload[0])<<24>>24 | int32(f.Payload[1])<<16 | int32(f.Payload[2])<<8 | int32(f.Payload[3]))
-				_ = cmd.Process.Signal(sig)
-			}
-		}
+	}()
+
+	// Wait for the child to exit naturally, then let the pump observe the
+	// hangup and drain the last bytes before reporting the real status.
+	_ = cmd.Wait()
+	<-pumpDone
+	send(proto.TExit, proto.ExitPayload(waitStatus(cmd)))
+}
+
+// decodeSignal reads the 4-byte big-endian i32 signal id in a TSig frame.
+func decodeSignal(p []byte) syscall.Signal {
+	return syscall.Signal(int32(p[0])<<24 | int32(p[1])<<16 | int32(p[2])<<8 | int32(p[3]))
+}
+
+// stdinQueue is an unbounded FIFO of stdin frames between the control reader
+// and the stdin writer. It is deliberately unbounded: the writer parks on a
+// blocked pipe write, so queueing is where backpressure lives, and an
+// unbounded queue keeps the reader free to serve TSig and detect a disconnect
+// no matter how much data the child has stopped consuming. next reports
+// open=false once done closes, which releases a parked writer.
+type stdinQueue struct {
+	cond   *sync.Cond
+	q      [][]byte
+	closed bool
+}
+
+func newStdinQueue(done <-chan struct{}) *stdinQueue {
+	q := &stdinQueue{cond: sync.NewCond(&sync.Mutex{})}
+	go func() {
+		<-done
+		q.cond.L.Lock()
+		q.closed = true
+		q.cond.L.Unlock()
+		q.cond.Broadcast()
+	}()
+	return q
+}
+
+func (q *stdinQueue) add(data []byte) {
+	q.cond.L.Lock()
+	if !q.closed {
+		q.q = append(q.q, data)
 	}
-	if err := cmd.Wait(); err != nil {
-		var ee *exec.ExitError
-		if !errors.As(err, &ee) {
-			s.logf("rsbxd: wait: %v", err)
-		}
+	q.cond.L.Unlock()
+	q.cond.Broadcast()
+}
+
+func (q *stdinQueue) next() (data []byte, open bool) {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	for len(q.q) == 0 && !q.closed {
+		q.cond.Wait()
 	}
-	status := waitStatus(cmd)
-	wmu.Lock()
-	proto.WriteFrame(c, proto.TExit, proto.ExitPayload(status))
-	wmu.Unlock()
+	if len(q.q) == 0 {
+		return nil, false
+	}
+	data = q.q[0]
+	q.q = q.q[1:]
+	return data, true
 }
 
 // waitStatus reports the exit code, or 128+signal when the child was killed.

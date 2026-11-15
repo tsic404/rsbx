@@ -26,13 +26,14 @@ ENTRYPOINT ["go"]
 CMD ["test", "./..."]
 
 # ---- runtime --------------------------------------------------------------
-# A sandbox needs bubblewrap (the view), fuse3 (the mount) and the agent
-# toolchain the configuration allows to run locally.
+# A client needs fuse3 (the mount) and the agent toolchain the configuration
+# allows to run locally. There is no bwrap: the client mounts its own
+# namespaces, and the daemon runs on its native host with no jail at all.
 FROM debian:stable-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      bubblewrap fuse3 ca-certificates \
+      fuse3 ca-certificates \
       coreutils findutils grep sed gawk tar diffutils \
  && rm -rf /var/lib/apt/lists/*
 
@@ -52,9 +53,11 @@ WORKDIR /home/rsbx
 #   docker run --rm -it --privileged -v /dev/fuse \
 #     -v /srv/tree:/work -v ~/.codex:/home/rsbx/.codex rsbx
 #
-# To serve a remote tree instead, override the entry point:
+# To serve a remote tree instead, override the entry point. The daemon runs
+# directly on the container's own filesystem — that IS the remote tree — so
+# the project is simply mounted in and served as it is:
 #
-#   docker run --rm --entrypoint rsbxd -v /srv/tree:/tree rsbx \
-#     -socket /run/rsbx/daemon.sock -root /tree
+#   docker run --rm --entrypoint rsbxd -v /srv/tree:/work rsbx \
+#     -socket /run/rsbx/daemon.sock
 ENTRYPOINT ["rsbx"]
 CMD ["-config", "/etc/rsbx/config.toml"]

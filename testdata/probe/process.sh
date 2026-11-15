@@ -4,8 +4,11 @@
 # These are about what the sandbox does around a program, not the filesystem: a
 # session's status must reach the caller unchanged, output must not be merged,
 # and binary data must survive the bridge.
+# Destructive probe: RSBX_PROJ must be a disposable scratch directory; it is
+# never safe to fall back to a host /proj, which this probe wipes clean.
 set -u
-R=${RSBX_PROJ:-/proj/proc}
+: "${RSBX_PROJ:?set RSBX_PROJ to a disposable scratch directory for this destructive probe}"
+R=$RSBX_PROJ
 mkdir -p "$R" 2>/dev/null
 if [ -d "$R" ]; then find "$R" -mindepth 1 -delete 2>/dev/null; fi
 mkdir -p "$R" || { echo "FAIL setup: cannot create $R"; exit 1; }
@@ -104,11 +107,13 @@ t_partial_on_failure(){ local e; e=$(partial_on_failure 2>&1); [ $? -eq 0 ] && o
 
 # Several sessions at once, each with its own output.
 concurrent_sessions(){
-  local i out
+  local i pids=() pid rc=0
   for i in 1 2 3 4 5 6; do
-    ( out=$(printf 'session-%d' "$i"); [ "$out" = "session-$i" ] || exit 1 ) &
+    ( out=$(printf 'session-%d' "$i"); [ "$out" = "session-$i" ] || { echo "got [$out]"; exit 1; } ) &
+    pids+=($!)
   done
-  wait
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  [ $rc -eq 0 ] || return 1
 }
 t_concurrent_sessions(){ local e; e=$(concurrent_sessions 2>&1); [ $? -eq 0 ] && ok concurrent_sessions || bad concurrent_sessions "${e:0:100}"; }
 

@@ -29,9 +29,10 @@ const (
 )
 
 const (
+	// Path operations act on native absolute paths in the daemon's own
+	// filesystem. The daemon's / is the remote tree: there is no alternate
+	// root and no path translation. Arg carries a path or textual argument.
 	FxStat     = 1
-	FxRead     = 2 // whole file: the sandbox materialises on open
-	FxWrite    = 3 // whole file, replaces content
 	FxList     = 4
 	FxReadlink = 5
 	FxMkdir    = 6
@@ -40,41 +41,61 @@ const (
 	FxTruncate = 9
 	FxChmod    = 10
 	FxAccess   = 11
-	// FxAppend adds bytes to the end of a file on the daemon. Appends cannot be
-	// replayed from a local copy: the end position must be decided where the
-	// file actually lives, or two writers tell each other's tail from nothing.
-	FxAppend = 12
-	// FxWriteAt writes at an explicit offset; Arg carries the decimal offset.
-	FxWriteAt = 13
-	// FxSymlink creates a symbolic link named by Path pointing at Arg. It
-	// carries the target as data, not a path, so it is never resolved here.
+	// FxSymlink creates a symbolic link named by Path pointing at Arg. The
+	// link text travels as data: it is never resolved as a path here.
 	FxSymlink = 14
-	// FxLink creates a hard link: Path is the existing file, Arg the new name.
+	// FxLink creates a hard link: Path is the new name, Arg the existing file.
 	FxLink = 15
 	// FxRmdir removes an empty directory. Unlink must not: a build tool that
 	// deletes a directory and one that deletes a file are asking different
 	// questions, and answering both with RemoveAll silently destroys data.
 	FxRmdir = 16
 	// FxUtimes sets access and modification times. Arg is "<atime>,<mtime>" in
-	// decimal nanoseconds; an empty field means "leave unchanged".
+	// decimal nanoseconds; a negative field is UTIME_OMIT, which keeps the
+	// timestamp that is actually there rather than inventing a current one.
 	FxUtimes = 17
-	// FxGetlk asks whether a lock would conflict; FxSetlk takes or drops one.
-	// Arg is "<owner>,<type>,<start>,<end>", all decimal. Locks have to be
-	// arbitrated where the file actually is: a database opened here and by a
-	// program on the daemon is one file, and two lock tables would each believe
-	// they held it.
-	FxGetlk = 18
-	FxSetlk = 19
+	// FxGetlk asks whether a lock would conflict; FxSetlk takes or drops one
+	// without waiting; FxSetlkw waits. Handle names the open file and Owner
+	// the caller's lock identity. Locks are arbitrated by the kernel on the
+	// real file, so a program on the daemon and every client contend for one
+	// lock, not one per lock table.
+	FxGetlk  = 18
+	FxSetlk  = 19
+	FxSetlkw = 20
+
+	// Handle operations act on a descriptor the daemon opened. A handle keeps
+	// the inode it opened across rename and unlink: reopening the current path
+	// would redirect writes to a replacement file or resurrect a name its
+	// owner removed.
+	FxOpen      = 21 // Path, Flags (Linux O_*), Mode -> KHandle
+	FxClose     = 22 // Handle
+	FxFstat     = 23 // Handle -> KStat
+	FxPread     = 24 // Handle, Offset, Size (<= MaxIO) -> KData
+	FxPwrite    = 25 // Handle, Data, Offset -> KOk with Count
+	FxFsync     = 26 // Handle (file or directory fd)
+	FxFtruncate = 27 // Handle, Offset (new length)
+	FxFchmod    = 28 // Handle, Mode (permission bits)
+	FxFutimes   = 29 // Handle, Arg "<atime>,<mtime>" ns, negative field = omit
 )
 
 const (
+	// KNone answers a metadata lookup that found nothing. It is never a
+	// mutation's success: a failed open, write or close is KErr with Errno.
 	KNone = 0
-	KFile = 1
 	KDir  = 2
-	KErr  = 3
+	// KErr is a failure. Errno is the authoritative syscall errno; Err is a
+	// detail message for logs, never a value to parse back.
+	KErr = 3
+	// KStat carries a filled Attr.
 	KStat = 4
-	KOk   = 5
+	// KOk is a successful operation whose payload is Count and optional Lock.
+	KOk = 5
+	// KLink carries readlink's target in Data.
 	KLink = 6
+	// KHandle carries an open descriptor in Handle and its Attr.
+	KHandle = 7
+	// KData carries read bytes in Data, their number in Count.
+	KData = 8
 )
 
 const (
@@ -83,6 +104,8 @@ const (
 	SIFLNK = 0o120000
 
 	MaxFrame = 32 << 20
+	// MaxIO caps one Pread/Pwrite payload; transfers are chunked below MaxFrame.
+	MaxIO = 1 << 20
 )
 
 type Frame struct {
@@ -91,6 +114,9 @@ type Frame struct {
 }
 
 func WriteFrame(w io.Writer, typ byte, p []byte) error {
+	if len(p) > MaxFrame {
+		return fmt.Errorf("frame too large (%d bytes)", len(p))
+	}
 	var h [5]byte
 	binary.BigEndian.PutUint32(h[:4], uint32(len(p)))
 	h[4] = typ
@@ -269,6 +295,14 @@ type Attr struct {
 	UID   uint32
 	GID   uint32
 	Nlink uint32
+	// Nanosecond precision for all three times; Ctime/Atime are seconds.
+	MtimeNsec uint32
+	Ctime     int64
+	CtimeNsec uint32
+	Atime     int64
+	AtimeNsec uint32
+	// Dev plus Ino give stable identity across mounted filesystems.
+	Dev uint64
 }
 
 func (a *Attr) encode(e *Enc) {
@@ -279,6 +313,12 @@ func (a *Attr) encode(e *Enc) {
 	e.U32(a.UID)
 	e.U32(a.GID)
 	e.U32(a.Nlink)
+	e.U32(a.MtimeNsec)
+	e.U64(uint64(a.Ctime))
+	e.U32(a.CtimeNsec)
+	e.U64(uint64(a.Atime))
+	e.U32(a.AtimeNsec)
+	e.U64(a.Dev)
 }
 
 func decodeAttr(d *Dec) Attr {
@@ -290,6 +330,12 @@ func decodeAttr(d *Dec) Attr {
 	a.UID = d.U32()
 	a.GID = d.U32()
 	a.Nlink = d.U32()
+	a.MtimeNsec = d.U32()
+	a.Ctime = int64(d.U64())
+	a.CtimeNsec = d.U32()
+	a.Atime = int64(d.U64())
+	a.AtimeNsec = d.U32()
+	a.Dev = d.U64()
 	return a
 }
 
@@ -305,6 +351,14 @@ type FxReq struct {
 	Path string
 	Arg  string
 	Data []byte
+
+	Handle uint64 // open descriptor for handle ops
+	Offset int64  // Pread/Pwrite position, Ftruncate length
+	Size   uint32 // Pread request size, <= MaxIO
+	Flags  uint32 // FxOpen Linux O_* flags
+	Mode   uint32 // FxOpen/FxFchmod permission bits
+	Owner  uint64 // lock owner identity, meaningful across clients
+	Lock   *LockInfo
 }
 
 func (r *FxReq) Encode() []byte {
@@ -315,6 +369,21 @@ func (r *FxReq) Encode() []byte {
 	e.Str(r.Arg)
 	e.U32(uint32(len(r.Data)))
 	e.Raw(r.Data)
+	e.U64(r.Handle)
+	e.U64(uint64(r.Offset))
+	e.U32(r.Size)
+	e.U32(r.Flags)
+	e.U32(r.Mode)
+	e.U64(r.Owner)
+	if r.Lock != nil {
+		e.U8(1)
+		e.U32(r.Lock.Typ)
+		e.U64(r.Lock.Start)
+		e.U64(r.Lock.End)
+		e.U32(r.Lock.Pid)
+	} else {
+		e.U8(0)
+	}
 	return e.B
 }
 
@@ -324,6 +393,15 @@ func DecodeFxReq(p []byte) (*FxReq, error) {
 	r.Path = d.Str()
 	r.Arg = d.Str()
 	r.Data = d.Raw(int(d.U32()))
+	r.Handle = d.U64()
+	r.Offset = int64(d.U64())
+	r.Size = d.U32()
+	r.Flags = d.U32()
+	r.Mode = d.U32()
+	r.Owner = d.U64()
+	if d.U8() != 0 {
+		r.Lock = &LockInfo{Typ: d.U32(), Start: d.U64(), End: d.U64(), Pid: d.U32()}
+	}
 	if d.Err != nil {
 		return nil, d.Err
 	}
@@ -337,6 +415,10 @@ type FxResp struct {
 	Data []byte
 	Ents []DirEntry
 	Err  string
+
+	Handle uint64 // KHandle, and echoed for handle ops
+	Count  uint32 // bytes transferred (KData, KOk)
+	Errno  uint32 // numeric errno; non-zero only for failures
 	// Lock reports the conflicting lock for FxGetlk, if any.
 	Lock *LockInfo
 }
@@ -354,11 +436,7 @@ func (r *FxResp) Encode() []byte {
 	e.U32(r.ID)
 	e.U8(r.Kind)
 	switch r.Kind {
-	case KFile:
-		e.U32(uint32(len(r.Data)))
-		e.Raw(r.Data)
-		r.Attr.encode(&e)
-	case KStat:
+	case KStat, KHandle:
 		r.Attr.encode(&e)
 	case KLink:
 		e.Str(string(r.Data))
@@ -368,8 +446,25 @@ func (r *FxResp) Encode() []byte {
 			e.Str(it.Name)
 			e.U32(it.Mode)
 		}
+	case KData:
+		e.U32(uint32(len(r.Data)))
+		e.Raw(r.Data)
 	case KErr:
 		e.Str(r.Err)
+	case KOk:
+		// Count and optional Lock are in the fixed tail below.
+	}
+	e.U64(r.Handle)
+	e.U32(r.Count)
+	e.U32(r.Errno)
+	if r.Lock != nil {
+		e.U8(1)
+		e.U32(r.Lock.Typ)
+		e.U64(r.Lock.Start)
+		e.U64(r.Lock.End)
+		e.U32(r.Lock.Pid)
+	} else {
+		e.U8(0)
 	}
 	return e.B
 }
@@ -378,11 +473,7 @@ func DecodeFxResp(p []byte) (*FxResp, error) {
 	d := &Dec{B: p}
 	r := &FxResp{ID: d.U32(), Kind: d.U8()}
 	switch r.Kind {
-	case KFile:
-		n := int(d.U32())
-		r.Data = append([]byte(nil), d.Raw(n)...)
-		r.Attr = decodeAttr(d)
-	case KStat:
+	case KStat, KHandle:
 		r.Attr = decodeAttr(d)
 	case KLink:
 		r.Data = []byte(d.Str())
@@ -393,8 +484,17 @@ func DecodeFxResp(p []byte) (*FxResp, error) {
 			mode := d.U32()
 			r.Ents = append(r.Ents, DirEntry{Name: name, Mode: mode})
 		}
+	case KData:
+		n := int(d.U32())
+		r.Data = append([]byte(nil), d.Raw(n)...)
 	case KErr:
 		r.Err = d.Str()
+	}
+	r.Handle = d.U64()
+	r.Count = d.U32()
+	r.Errno = d.U32()
+	if d.U8() != 0 {
+		r.Lock = &LockInfo{Typ: d.U32(), Start: d.U64(), End: d.U64(), Pid: d.U32()}
 	}
 	if d.Err != nil {
 		return nil, d.Err

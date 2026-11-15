@@ -40,7 +40,7 @@ func TestAppendHandleDoesNotUseWriteAt(t *testing.T) {
 	}
 	defer f.Close()
 
-	h := &handle{f: f, path: p, lay: newLocalLayout(t, dir), appendOnly: true}
+	h := &handle{fd: f, path: p, lay: newLocalLayout(t, dir), appendOnly: true}
 	n := &Node{lay: h.lay, path: p}
 
 	for _, line := range []string{"one\n", "two\n", "three\n"} {
@@ -72,7 +72,7 @@ func TestFsyncSucceedsForLocalFiles(t *testing.T) {
 	if _, err := f.Write([]byte("data")); err != nil {
 		t.Fatal(err)
 	}
-	h := &handle{f: f, path: p, lay: newLocalLayout(t, dir)}
+	h := &handle{fd: f, path: p, lay: newLocalLayout(t, dir)}
 	n := &Node{lay: h.lay, path: p}
 
 	if errno := n.Fsync(nil, h, 0); errno != 0 {

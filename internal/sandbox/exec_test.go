@@ -33,7 +33,9 @@ func TestAllowlistedCommandIsNotTrapped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lay := (&Plan{Exec: pol, Local: local}).Layout()
+	cfg := testCfg()
+	plan := &Plan{Cfg: cfg, Exec: pol, Local: local, Mount: cfg.Sandbox.Mount}
+	lay := plan.Layout()
 	if lay.LocalExec == nil {
 		t.Fatal("LocalExec not wired")
 	}
@@ -42,5 +44,16 @@ func TestAllowlistedCommandIsNotTrapped(t *testing.T) {
 	}
 	if lay.LocalExec(other) {
 		t.Errorf("non-allowlisted %s reported local", other)
+	}
+	// The directory itself is where FUSE arbitrates; the trampoline replaces
+	// only the names the policy declined.
+	found := false
+	for _, d := range lay.ExecDirs {
+		if d == binDir {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("exec directory %s not arbitrated: %v", binDir, lay.ExecDirs)
 	}
 }

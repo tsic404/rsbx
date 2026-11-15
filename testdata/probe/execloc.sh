@@ -2,9 +2,12 @@
 # A directory the policy uses to decide where programs run also holds ordinary
 # files. This checks the two are told apart: a program is redirected or run
 # here, and everything else is data.
+# Destructive probe: RSBX_PROJ must be a disposable scratch directory; it is
+# never safe to fall back to a host /proj.
 set -u
 D=${RSBX_EXEC_DIR:-/opt/tools}
-R=${RSBX_PROJ:-/proj/execloc}
+: "${RSBX_PROJ:?set RSBX_PROJ to a disposable scratch directory for this destructive probe}"
+R=$RSBX_PROJ
 # The working directory doubles as the exec directory under test, so it is never
 # cleaned wholesale: the probes themselves may live there, and deleting the
 # directory's contents deletes the script that is running. Each check removes

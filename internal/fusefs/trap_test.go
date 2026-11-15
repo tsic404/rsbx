@@ -8,6 +8,35 @@ import (
 	"rsbx/internal/proto"
 )
 
+// stubRemote answers stat with a fixed attribute, so trap decisions can be
+// tested without a live daemon connection.
+type stubRemote struct {
+	attr  proto.Attr
+	found bool
+}
+
+func (s *stubRemote) Do(req *proto.FxReq) (*proto.FxResp, error) {
+	if req.Op != proto.FxStat {
+		return &proto.FxResp{Kind: proto.KOk}, nil
+	}
+	if !s.found {
+		return &proto.FxResp{Kind: proto.KNone}, nil
+	}
+	return &proto.FxResp{Kind: proto.KStat, Attr: s.attr}, nil
+}
+
+func (s *stubRemote) ReadFile(string) ([]byte, proto.Attr, error) {
+	return nil, proto.Attr{}, os.ErrNotExist
+}
+
+func (s *stubRemote) WriteFile(string, []byte) error { return nil }
+
+type stubLocal struct{}
+
+func (stubLocal) IsLocal(string) bool  { return false }
+func (stubLocal) Writable(string) bool { return false }
+func (stubLocal) Roots() []string      { return nil }
+
 // A program that exists only on the daemon, named from a directory the policy
 // reserves for programs, has to resolve to the trampoline.
 //

@@ -54,9 +54,10 @@ type Local struct {
 type Sandbox struct {
 	// Mount is where the sandbox view appears on this machine.
 	Mount string `json:"mount"`
-	// Cache holds copies of remote files that the sandbox has read, so
-	// running the same remote binary repeatedly costs one small stat instead
-	// of a full transfer. It is disposable: deleting it only costs bandwidth.
+	// Cache is disposable runtime scratch the client and its helpers use to
+	// stage transient data. It is not a snapshot of remote files: no file is
+	// ever served from a stale copy of the daemon's tree, so deleting it
+	// only costs the client re-staging what it needs.
 	Cache string `json:"cache"`
 	// ShareNetwork keeps the host network namespace inside the sandbox
 	// instead of creating a private one. Set it when the daemon is reached
@@ -76,7 +77,11 @@ func Default() *Config {
 	return &Config{
 		Daemon: Daemon{Transport: "unix", Socket: filepath.Join(home, ".rsbx", "daemon.sock")},
 		Local: Local{
-			Allow: []string{"/usr/bin", "/bin", "/usr/lib", "/lib", "/usr/lib64", "/lib64"},
+			// Nothing on this machine is allowlisted by default. The entry
+			// shell runs here implicitly and every other command runs on the
+			// daemon; no host /usr/bin tree or library directory is pulled
+			// in implicitly.
+			Allow: []string{},
 			Entry: "/bin/sh",
 		},
 		Sandbox: Sandbox{
@@ -102,7 +107,7 @@ func Load(path string) (*Config, error) {
 // Parse understands the subset described in parseValue.
 func Parse(src string) (*Config, error) {
 	cfg := Default()
-	cfg.Local.Allow = nil
+	cfg.Local.Allow = []string{}
 	table := ""
 	lines := strings.Split(src, "\n")
 	for i := 0; i < len(lines); i++ {
@@ -211,9 +216,10 @@ func assign(cfg *Config, table, key, raw string) error {
 			return str(&cfg.Local.Entry)
 		}
 	case "remote":
-		// Removed: the remote root belongs to rsbxd (-root), not to the
-		// client, and accepting the key silently did nothing.
-		return fmt.Errorf("the [remote] table was removed; pass the daemon-side root to rsbxd with -root instead")
+		// Removed: rsbxd runs on its own host, so the tree it serves is that
+		// machine's native filesystem. Accepting a root here silently did
+		// nothing.
+		return fmt.Errorf("the [remote] table was removed: rsbxd serves its own filesystem, so paths are native paths on that machine")
 
 	case "sandbox_old_share":
 		return fmt.Errorf("unreachable")
@@ -238,13 +244,13 @@ func assign(cfg *Config, table, key, raw string) error {
 			cfg.Sandbox.UnshareUser = v
 			return nil
 		case "remote", "root":
-			return fmt.Errorf("the daemon-side root is not a client setting; pass it to rsbxd with -root")
+			return fmt.Errorf("the daemon's filesystem is not a client setting: rsbxd serves its own filesystem, so paths are native paths on that machine")
 		}
 	case "":
 		return fmt.Errorf("key %q outside a table", key)
 	}
 	if table == "sandbox" && key == "share" {
-		return fmt.Errorf("sandbox.share was renamed to sandbox.cache: it holds copies of remote files, not a shared tree")
+		return fmt.Errorf("sandbox.share was renamed to sandbox.cache: it is disposable runtime scratch, not a shared tree")
 	}
 	return fmt.Errorf("unknown key %s.%s", table, key)
 }
