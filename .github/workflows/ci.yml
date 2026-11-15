@@ -332,7 +332,7 @@ jobs:
             'socket = "/run/rsbx/daemon.sock"' \
             '' \
             '[local]' \
-            'allow = ["/usr/bin/bash", "/bin"]' \
+            'allow = ["/usr/bin/bash", "/bin", "/usr/bin"]' \
             'entry = "/bin/sh"' \
             '' \
             '[sandbox]' \

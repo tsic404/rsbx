@@ -279,7 +279,12 @@ func (p *Plan) MountRoot() (*fuse.Server, error) {
 		// the extra lookups, and the tree is remote anyway, so the kernel cache
 		// was never going to save the round trip that mattered.
 		EntryTimeout: durp(0),
-		AttrTimeout:  durp(1),
+		// The same argument applies to attributes and to the data behind them.
+		// A cached mtime or size is a claim about a file another process may
+		// already have replaced, and a rename the kernel has not invalidated
+		// reads back as the old bytes. Every lookup costs one round trip on a
+		// tree that is remote either way.
+		AttrTimeout: durp(0),
 	}
 	srv, err := fs.Mount(p.Mount, fusefs.NewRoot(p.Layout()), opts)
 	if err != nil {

@@ -43,7 +43,18 @@ run_session(){
 # host path here would be the wrong filesystem entirely.
 sread(){ run_session 1 "cat $1" 2>/dev/null; }
 slines(){ run_session 1 "wc -l < $1" 2>/dev/null | tr -d '[:space:]'; }
-reset(){ run_session 1 "rm -rf '$R' && mkdir -p '$R'"; }
+# Every check starts from an empty tree. The mount points are unmounted first:
+# a session that died uncleanly can leave sb1 mounted, and the next start of
+# the same config would then find its own mount point busy.
+reset(){
+  local n
+  for n in 1 2 3 4; do
+    fusermount3 -uz "$MNT/sb$n" 2>/dev/null || true
+  done
+  # $R is a sandbox path; clear it through one short session so the daemon
+  # tree is empty even though the mount points were just released.
+  run_session 1 "mkdir -p '$R' && find '$R' -mindepth 1 -delete 2>/dev/null; true" >/dev/null 2>&1 || true
+}
 
 # make_cfg writes a config with its own mount point and cache, so several
 # sessions can run at once. A shared mount point is not a load test: it is two
@@ -190,16 +201,16 @@ four_sessions(){
   for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
   [ $rc -eq 0 ] || { echo "a session exited nonzero or was killed"; return 1; }
   local out
-  out=$(run_session 1 '
+  out=$(run_session 1 "
     rc=0
     for d in p1 p2 p3 p4; do
-      n=$(ls "$R/$d" 2>/dev/null | wc -l)
-      [ "$n" = 25 ] || { echo "$d has $n files"; rc=1; }
-      v=$(cat "$R/$d/f7" 2>/dev/null)
-      [ "$v" = "${d#p}-7" ] || { echo "$d/f7=[$v]"; rc=1; }
+      n=\$(ls $R/\$d 2>/dev/null | wc -l)
+      [ \"\$n\" = 25 ] || { echo \"\$d has \$n files\"; rc=1; }
+      v=\$(cat $R/\$d/f7 2>/dev/null)
+      [ \"\$v\" = \"\$d-7\" ] || { echo \"\$d/f7=[\$v]\"; rc=1; }
     done
-    exit $rc
-  ' 2>&1)
+    exit \$rc
+  " 2>&1)
   rc=$?
   [ $rc -eq 0 ] || { echo "${out:0:80}"; return 1; }
 }
@@ -235,7 +246,7 @@ same_fd_rename_consumer(){
   # the name it would read 'new'; a dropped or reopened handle would error
   # or return empty. It must read 'old'.
   run_session 1 "
-    for _ in \$(seq 1 100); do [ -s $R/.ready ] && break; sleep 0.05; done
+    for _ in \$(seq 1 100); do [ -e $R/.ready ] && break; sleep 0.05; done
     printf 'new' > $R/f.new && mv -f $R/f.new $R/f.txt
     sleep 0.3
   " &
