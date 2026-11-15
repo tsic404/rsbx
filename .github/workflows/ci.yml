@@ -155,6 +155,11 @@ jobs:
           docker volume create "$RUN_VOL"
           docker run --rm --user 0 -v "$PROJ_VOL":/seed --entrypoint /bin/sh rsbx:ci \
             -c 'printf REMOTE-MARKER > /seed/remote.txt && chmod 777 /seed/remote.txt'
+          # A fresh named volume is root-owned, and the image runs as the
+          # unprivileged rsbx user; an unprepared socket directory makes the
+          # daemon exit before it listens.
+          docker run --rm --user 0 -v "$RUN_VOL":/run/rsbx --entrypoint /bin/sh rsbx:ci \
+            -c 'mkdir -p /run/rsbx && chown 1000:1000 /run/rsbx'
           docker run -d --rm --name rsbxd --network rsbx-e2e \
             -v "$PROJ_VOL":/proj -v "$RUN_VOL":/run/rsbx \
             --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
@@ -292,6 +297,8 @@ jobs:
           docker volume create "$RUN_VOL"
           docker volume create rsbx-state
           docker network create rsbx-dual 2>/dev/null || true
+          docker run --rm --user 0 -v "$RUN_VOL":/run/rsbx --entrypoint /bin/sh rsbx:ci \
+            -c 'mkdir -p /run/rsbx && chown 1000:1000 /run/rsbx'
           docker run -d --rm --name rsbxd --network rsbx-dual \
             -v "$PROJ_VOL":/proj -v "$RUN_VOL":/run/rsbx \
             --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
