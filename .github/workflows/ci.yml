@@ -256,6 +256,7 @@ jobs:
           # directory on the throwaway volume the daemon container serves.
           docker run --rm --privileged --user 0 --network rsbx-e2e \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
+            -v "$PWD/e2e/probe.toml:/e2e/probe.toml:ro" \
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/sandbox /e2e/state/cache
               rsbx -config /e2e/probe.toml -- /bin/sh -c "
