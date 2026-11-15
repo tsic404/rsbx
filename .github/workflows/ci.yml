@@ -266,11 +266,12 @@ jobs:
             -v "$PWD/e2e/probe.toml:/e2e/probe.toml:ro" \
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/sandbox /e2e/state/cache
+              mkdir -p /e2e/state/probe && chmod 777 /e2e/state/probe
               rsbx -config /e2e/probe.toml -- /bin/sh -c "
                 echo \"=== atomic write (create, rename, reopen) ===\"
-                /proj/probe/atomic_write /proj/probe/write session.jsonl
+                /proj/probe/atomic_write /e2e/state/probe session.jsonl
                 echo \"=== durable write (fsync, wal) ===\"
-                /proj/probe/durable_write /proj/probe/write
+                /proj/probe/durable_write /e2e/state/probe
                 RSBX_PROJ=/proj/probe/run /proj/probe/workload.sh
                 RSBX_PROJ=/proj/probe/deep /proj/probe/semantics.sh
                 RSBX_PROJ=/proj/probe/fleet /proj/probe/agents.sh
