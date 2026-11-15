@@ -89,3 +89,60 @@ func TestMissingEverywhereStaysMissing(t *testing.T) {
 		t.Fatalf("missing name resolved to %q", trap)
 	}
 }
+
+// A newly created file in an exec directory is not a program.
+//
+// Every new file is absent locally until it is written, so "the host does not
+// have this name" is the ordinary state of a file the session just made. Treating
+// that as a daemon program made stat report the trampoline's size and any read
+// return its bytes: creating an empty file in an allowlisted directory handed
+// back a 3 MB copy of rsbx-tramp.
+func TestNewFileInExecDirIsNotTrapped(t *testing.T) {
+	dir := t.TempDir()
+	tramp := filepath.Join(dir, "tramp")
+	if err := os.WriteFile(tramp, []byte("\x7fELF-trampoline"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	remote := &stubRemote{
+		found: true,
+		// a regular file, as a just-created empty file would be
+		attr: proto.Attr{Mode: proto.SIFREG | 0o644, Size: 0},
+	}
+	lay := &Layout{
+		Remote:     remote,
+		Local:      stubLocal{},
+		ExecDirs:   []string{"/opt/tools"},
+		Trampoline: tramp,
+		LocalExec:  func(string) bool { return false },
+	}
+	n := &Node{lay: lay, path: "/opt/tools"}
+
+	if trap, ok := n.trapFor("/opt/tools/new.txt"); ok {
+		t.Fatalf("a data file resolved to %q; it must stay data", trap)
+	}
+}
+
+// A daemon file that is not executable is data, whatever its name.
+func TestNonExecutableDaemonFileIsNotTrapped(t *testing.T) {
+	dir := t.TempDir()
+	tramp := filepath.Join(dir, "tramp")
+	if err := os.WriteFile(tramp, []byte("\x7fELF"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	remote := &stubRemote{
+		found: true,
+		attr:  proto.Attr{Mode: proto.SIFREG | 0o600, Size: 10},
+	}
+	lay := &Layout{
+		Remote:     remote,
+		Local:      stubLocal{},
+		ExecDirs:   []string{"/opt/tools"},
+		Trampoline: tramp,
+		LocalExec:  func(string) bool { return false },
+	}
+	n := &Node{lay: lay, path: "/opt/tools"}
+
+	if trap, ok := n.trapFor("/opt/tools/notes.txt"); ok {
+		t.Fatalf("a non-executable file resolved to %q", trap)
+	}
+}

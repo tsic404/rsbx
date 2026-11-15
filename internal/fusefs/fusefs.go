@@ -276,11 +276,27 @@ func (n *Node) trapFor(p string) (string, bool) {
 	// installed on the other side. Without this the name resolves to ENOENT and
 	// the session cannot use the daemon's programs at all.
 	if !n.existsHere(p) {
-		if kind, ok := n.remoteKind(p); ok && kind != proto.SIFDIR {
+		// The name has to be a program on the daemon, not merely present.
+		// Anything else — a data file, a directory, a placeholder — is content
+		// that belongs to the session, and answering it with the trampoline
+		// replaces the user's file with a copy of this binary. Creating a file
+		// in an exec directory is an ordinary thing to do, and every new file
+		// is absent locally by definition.
+		if n.remoteIsProgram(p) {
 			return n.lay.Trampoline, true
 		}
 	}
 	return "", false
+}
+
+// remoteIsProgram reports whether the daemon holds an executable regular file at
+// this path.
+func (n *Node) remoteIsProgram(p string) bool {
+	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
+	if err != nil || resp.Kind != proto.KStat {
+		return false
+	}
+	return kind(resp.Attr.Mode) == proto.SIFREG && resp.Attr.Mode&0o111 != 0
 }
 
 // trapForExact is the original decision: the name is a local file that the
@@ -852,18 +868,24 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		// Any other name is ordinary host data, writable like any local file.
 		// An exec directory is defined by holding programs, not by being
 		// read-only: an agent's state tree commonly carries one .node or .so.
-		openFlags := flags
-		if !writes {
-			openFlags = uint32(os.O_RDONLY)
+		//
+		// A name with no local file is remote content that happens to live in an
+		// exec directory. Opening it here would fail with ENOENT for a file the
+		// session can see, so fall through to the remote branches below.
+		if n.existsHere(n.path) {
+			openFlags := flags
+			if !writes {
+				openFlags = uint32(os.O_RDONLY)
+			}
+			f, err := os.OpenFile(n.path, int(openFlags), 0)
+			if err != nil {
+				return nil, 0, errnoOf(err.Error())
+			}
+			return &handle{
+				f: f, path: n.path, lay: n.lay,
+				appendOnly: flags&uint32(os.O_APPEND) != 0,
+			}, 0, 0
 		}
-		f, err := os.OpenFile(n.path, int(openFlags), 0)
-		if err != nil {
-			return nil, 0, errnoOf(err.Error())
-		}
-		return &handle{
-			f: f, path: n.path, lay: n.lay,
-			appendOnly: flags&uint32(os.O_APPEND) != 0,
-		}, 0, 0
 	}
 	// Every O_APPEND open, create or not, streams appends to the daemon: the
 	// kernel may reuse an inode and skip CREATE entirely for the second
@@ -906,6 +928,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if err := os.WriteFile(temp+".meta", []byte(stampOf(attr)), 0o600); err != nil {
 		return nil, 0, syscall.EIO
 	}
+	n.lay.trimCache()
 	// This handle gets its own copy, not the shared cache entry.
 	//
 	// An open descriptor must keep reading the bytes it was opened on, even if
@@ -936,22 +959,6 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	// reads it, then stats again, and reports "file changed as we read it" when
 	// the second answer differs.
 	return &handle{f: f, temp: temp, private: privateCopy, path: n.path, lay: n.lay, base: attr}, fuse.FOPEN_KEEP_CACHE, 0
-}
-
-// writeTemp is the scratch file that buffers a remote write before it is
-// flushed back, created through Create().
-func (n *Node) writeTemp(p string) (*handle, syscall.Errno) {
-	// Write buffers get their own key: reusing the read-cache key would let a
-	// small write truncate a large cached body that nothing asked to discard.
-	temp := filepath.Join(n.lay.Cache, hash(p)+".w")
-	if err := os.MkdirAll(n.lay.Cache, 0o700); err != nil {
-		return nil, syscall.EIO
-	}
-	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, syscall.EIO
-	}
-	return &handle{f: f, temp: temp, path: p, lay: n.lay, dirty: true}, 0
 }
 
 func (n *Node) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -1726,6 +1733,55 @@ func (l *Layout) invalidate(p string) {
 	full := filepath.Join(l.Cache, hash(p))
 	os.Remove(full)
 	os.Remove(full + ".meta")
+}
+
+// cacheLimit bounds the read cache. Every remote read that is not already a hit
+// writes a body plus a stamp, and those entries have no natural expiry: a long
+// session reading many files leaves every one of them behind, growing without
+// limit. Keeping the newest limit files and dropping the rest bounds the space
+// to something a session can actually use. The stamp still decides staleness,
+// so evicting an entry only costs a refetch, never correctness.
+const cacheLimit = 2048
+
+// trimCache keeps the cache directory at or under cacheLimit entries, oldest
+// first. It is called after a new entry is written, so a burst of reads does not
+// overshoot by more than one.
+func (l *Layout) trimCache() {
+	if l == nil || l.Cache == "" {
+		return
+	}
+	des, err := os.ReadDir(l.Cache)
+	if err != nil {
+		return
+	}
+	// Trim a little above the limit rather than on every single write: the
+	// listing costs a directory read, and doing it per fetch would double the
+	// work of a workload that only reads.
+	if len(des) <= cacheLimit*5/4 {
+		return
+	}
+	type ent struct {
+		name  string
+		mtime time.Time
+	}
+	ents := make([]ent, 0, len(des))
+	for _, d := range des {
+		if d.IsDir() {
+			continue
+		}
+		fi, err := d.Info()
+		if err != nil {
+			continue
+		}
+		ents = append(ents, ent{d.Name(), fi.ModTime()})
+	}
+	if len(ents) <= cacheLimit {
+		return
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].mtime.Before(ents[j].mtime) })
+	for i := 0; i < len(ents)-cacheLimit; i++ {
+		os.Remove(filepath.Join(l.Cache, ents[i].name))
+	}
 }
 
 func stampOf(a proto.Attr) string {

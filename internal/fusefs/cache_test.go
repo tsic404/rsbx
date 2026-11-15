@@ -1,9 +1,11 @@
 package fusefs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"rsbx/internal/proto"
 )
@@ -140,5 +142,48 @@ func TestCacheMissWithoutStamp(t *testing.T) {
 	}
 	if _, _, err := lay.cached("/a"); err == nil {
 		t.Fatal("unstamped copy served")
+	}
+}
+
+// The read cache must not grow without bound.
+//
+// Every remote read that misses writes a body and a stamp, and neither has a
+// natural expiry. A session that reads many files — a build, a test run, an
+// agent walking a repo — leaves every one of them behind, so the cache
+// directory grows with the work done rather than with the files kept open.
+func TestCacheIsBounded(t *testing.T) {
+	lay := &Layout{Cache: t.TempDir()}
+	now := time.Now()
+	// Write more entries than the limit, with distinct times so the eviction
+	// order is defined.
+	total := cacheLimit*3/2 + 100
+	for i := 0; i < total; i++ {
+		name := filepath.Join(lay.Cache, hash(fmt.Sprintf("/f%d", i)))
+		if err := os.WriteFile(name, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stamp := now.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(name, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lay.trimCache()
+
+	des, err := os.ReadDir(lay.Cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(des) > cacheLimit {
+		t.Fatalf("cache holds %d entries, limit is %d", len(des), cacheLimit)
+	}
+	// The newest entries are the ones worth keeping: a file read a moment ago is
+	// more likely to be read again than one from the start of the session.
+	newest := filepath.Join(lay.Cache, hash(fmt.Sprintf("/f%d", total-1)))
+	if _, err := os.Stat(newest); err != nil {
+		t.Fatalf("the newest entry was evicted: %v", err)
+	}
+	oldest := filepath.Join(lay.Cache, hash("/f0"))
+	if _, err := os.Stat(oldest); !os.IsNotExist(err) {
+		t.Fatalf("the oldest entry survived eviction: %v", err)
 	}
 }
