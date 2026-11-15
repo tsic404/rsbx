@@ -74,8 +74,17 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The entry program is what the session starts, so it runs locally by
+	// definition. Requiring it in local.allow as well would be a rule that
+	// only ever produces "execvp: No such file or directory" at start-up.
+	if entry := cfg.Local.Entry; entry != "" {
+		pol = pol.WithExtra(entry)
+		if !strings.HasPrefix(entry, "/") {
+			return nil, fmt.Errorf("local.entry must be an absolute path: %q", entry)
+		}
+	}
 	if len(pol.Local) == 0 {
-		return nil, fmt.Errorf("local.allow selects no executable: nothing could run locally")
+		return nil, fmt.Errorf("local.allow selects no executable and local.entry is empty: nothing could run locally")
 	}
 	tramp := filepath.Join(exeDir, "rsbx-tramp")
 	if _, err := os.Stat(tramp); err != nil {

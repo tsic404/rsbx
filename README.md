@@ -203,6 +203,22 @@ paths = ["/work", "/home/me/.codex", "/home/me/.claude"]
 The same rule explains the small warning a static agent may print on start-up:
 a redirected helper fails, and the agent continues without it.
 
+`local.entry` is exempt: it is the program the session starts, so it runs
+locally without being listed. A minimal setup needs only the agent and the
+directories it reads:
+
+```toml
+[local]
+allow = ["/opt/agents"]          # the agent binary
+paths = ["/opt/agents",          # where it lives
+         "/home/me/.codex"]      # and what it reads
+entry = "/opt/agents/bash"
+```
+
+Everything else — `/usr`, the project tree, the rest of the host — is answered
+by the daemon. A dynamic agent's shared objects are still mapped at exec time
+through the sandbox, because the loader runs then and not later.
+
 Redirection is deliberately limited to the directories where the allowlist
 lives. A data file that merely has the execute bit set — a script in a project
 tree, a `chmod +x` text file — passes through untouched, so an agent reading its

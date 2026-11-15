@@ -39,6 +39,9 @@ allow = [
   "/usr/local/bin/claude",
   "/usr/bin/timeout",
 ]
+# The shell the session starts. It runs locally by definition, so it does not
+# need to be repeated in local.allow; a path outside a local tree would fail at
+# start-up, which is the error that rule exists to prevent.
 entry = "/usr/bin/bash"
 
 # -- which files are LOCAL --
