@@ -267,6 +267,10 @@ jobs:
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/sandbox /e2e/state/cache
               rsbx -config /e2e/probe.toml -- /bin/sh -c "
+                echo \"=== atomic write (create, rename, reopen) ===\"
+                /proj/probe/atomic_write /proj/probe/write session.jsonl
+                echo \"=== durable write (fsync, wal) ===\"
+                /proj/probe/durable_write /proj/probe/write
                 RSBX_PROJ=/proj/probe/run /proj/probe/workload.sh
                 RSBX_PROJ=/proj/probe/deep /proj/probe/semantics.sh
                 RSBX_PROJ=/proj/probe/fleet /proj/probe/agents.sh
@@ -285,7 +289,9 @@ jobs:
             echo "workload checks failed:"; grep "^FAIL" probe-out.txt; exit 1
           fi
           total=$(grep -cE '^(OK|SKIP)' probe-out.txt)
-          test "$total" -eq 84
+          # Every check reports exactly one line; a short count means a probe
+          # died before printing, which the FAIL gate alone would not catch.
+          test "$total" -eq 83
 
       # Two rsbx clients sharing one daemon tree, which is what an agent team
       # in a repo is. The single-session probes cannot exercise this; it needs
