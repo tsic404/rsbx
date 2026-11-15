@@ -967,7 +967,12 @@ func (n *Node) createLocal(ctx context.Context, host, name string, flags, mode u
 	p := path.Join(n.path, name)
 	child := &Node{lay: n.lay, path: p}
 	inode := n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)})
-	return inode, &handle{f: f, path: p, lay: n.lay}, 0, 0
+	return inode, &handle{
+		f: f, path: p, lay: n.lay,
+		// An O_APPEND file rejects WriteAt; remember how it was opened so Write
+		// picks the right call. Agents create-then-append their logs this way.
+		appendOnly: flags&uint32(os.O_APPEND) != 0,
+	}, 0, 0
 }
 
 func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
