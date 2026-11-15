@@ -208,6 +208,8 @@ jobs:
               # GitHub refuses a nested uid map.
               unshare_user = false
               CFG
+              cat /e2e/state/config.toml
+              rsbx -no-mount -config /e2e/state/config.toml
               rsbx -config /e2e/state/config.toml -- /bin/sh -c "
                 echo \"remote file: \$(cat /proj/remote.txt)\"
                 test \"\$(cat /proj/remote.txt)\" = REMOTE-MARKER
