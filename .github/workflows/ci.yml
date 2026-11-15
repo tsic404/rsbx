@@ -233,8 +233,14 @@ jobs:
           # Seed the daemon's project volume. The client side never mounts it.
           # The image runs as the unprivileged rsbx user, so the seed write runs
           # as root and then hands the disposable volume to the sandbox user.
+          # RSBX_PROJ points at /proj/probe/<name>, so the scripts belong in
+          # /proj/probe, next to the probe binaries.
           docker run --rm --user 0 -v "$PROJ_VOL":/seed -v "$PWD/e2e:/e2e" \
-            --entrypoint /bin/bash rsbx:ci -c 'cp /e2e/probes/* /seed/ && chmod -R 777 /seed'
+            -v "$PWD/testdata/probe:/probes:ro" \
+            --entrypoint /bin/bash rsbx:ci \
+            -c 'mkdir -p /seed/probe && cp /e2e/probes/* /seed/probe/ &&
+                cp /probes/*.sh /probes/*.c /seed/probe/ &&
+                chmod -R 777 /seed'
           printf '%s\n' \
             '[daemon]' \
             'transport = "unix"' \
