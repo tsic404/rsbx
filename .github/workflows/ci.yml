@@ -346,8 +346,8 @@ jobs:
               chmod 777 /e2e/state
               D=/e2e/state MNT=/e2e/state TREE=/proj/dual SOCK=/run/rsbx/daemon.sock \
                 F=$(command -v rsbx) CFG_BASE=/e2e/state/cfg/base.toml \
-                bash -x /probe/dual.sh
-            ' | tee dual-out.txt
+                bash -x /probe/dual.sh 2>&1
+            ' 2>&1 | tee dual-out.txt
           if grep -q "^FAIL" dual-out.txt; then
             echo "dual-session checks failed:"; grep "^FAIL" dual-out.txt; exit 1
           fi
