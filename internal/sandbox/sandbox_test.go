@@ -92,9 +92,13 @@ func TestCwdOutsideViewIsDropped(t *testing.T) {
 	}
 }
 
-// The Landlock list is the allowlist plus the helpers, never the directories
-// holding them.
-func TestLandlockListIsPathsNotDirs(t *testing.T) {
+// The Landlock list holds the allowlist files, the helpers, and the
+// directories where the policy arbitrates per name — and nothing else.
+//
+// The directory grant is what lets a redirected name execute at all: Landlock
+// grants an inode, the trampoline is a different inode, so a file-only list
+// refused the redirect and a session could not run a daemon-only program.
+func TestLandlockListGrantsPolicyDirs(t *testing.T) {
 	base := tempDirOutsideTmp(t)
 	bin := filepath.Join(base, "bin")
 	if err := os.MkdirAll(bin, 0o755); err != nil {
@@ -102,6 +106,15 @@ func TestLandlockListIsPathsNotDirs(t *testing.T) {
 	}
 	tool := filepath.Join(bin, "tool")
 	if err := os.WriteFile(tool, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A directory holding no allowlisted name is not a policy directory: it
+	// must not be granted, or the grant would cover names FUSE never vetted.
+	other := filepath.Join(base, "other")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "bystander"), []byte("x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	tramp := filepath.Join(base, "rsbx-tramp")
@@ -124,16 +137,16 @@ func TestLandlockListIsPathsNotDirs(t *testing.T) {
 		Mount: filepath.Join(base, "mnt"), Cache: filepath.Join(base, "cache"),
 		Trampoline: tramp, Guard: guard,
 	}
-	list := strings.Split(strings.Join(plan.SandboxExecPaths(), ":"), ":")
+	list := plan.SandboxExecPaths()
 	for _, p := range list {
-		if p == bin {
-			t.Errorf("policy directory %s granted wholesale: %v", bin, list)
-		}
 		if !filepath.IsAbs(p) {
 			t.Errorf("non-absolute Landlock path %q in %v", p, list)
 		}
+		if p == other {
+			t.Errorf("non-policy directory %s granted: %v", other, list)
+		}
 	}
-	for _, want := range []string{tool, GuardPath, TrampolinePath} {
+	for _, want := range []string{tool, bin, GuardPath, TrampolinePath} {
 		found := false
 		for _, p := range list {
 			if p == want {
@@ -172,5 +185,40 @@ func TestPolicyDirsAreNotBound(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("policy directory %s missing from the exec layout: %v", dir, lay.ExecDirs)
+	}
+}
+
+// A name nobody listed still has to be decided, because the rule is that
+// anything not allowlisted runs on the daemon. That can only happen in a
+// directory the policy arbitrates per name, so the PATH directories are
+// arbitrary even when the configuration never mentions them: without this a
+// host CLI's `git` was served from the daemon and executed here, which is the
+// opposite of the documented placement.
+func TestPathDirsAreArbitrated(t *testing.T) {
+	base := tempDirOutsideTmp(t)
+	tool := filepath.Join(base, "tool")
+	if err := os.WriteFile(tool, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pol, err := policy.New([]string{tool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := paths.New(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &Plan{Exec: pol, Local: local, Cfg: testCfg(), Mount: filepath.Join(base, "mnt")}
+	dirs := plan.PolicyDirs()
+	if len(pathDirs) == 0 {
+		t.Fatal("no PATH directories configured")
+	}
+	for _, d := range pathDirs {
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+			continue // this machine does not have it
+		}
+		if !dirs[d] {
+			t.Errorf("PATH directory %s is not arbitrated: a name in it would run here", d)
+		}
 	}
 }

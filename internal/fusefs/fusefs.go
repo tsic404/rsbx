@@ -594,15 +594,25 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		}
 	}
 	// Names of an exec-policy directory that only exist here are injected:
-	// the allowlisted executable itself, and local names the daemon declined
-	// (each of those is the trampoline).
+	// the allowlisted executable itself, and the local executables the policy
+	// declines to run here (each of those is the trampoline).
+	//
+	// The per-name decision is made from what this machine has, not by asking
+	// the daemon about every entry: a PATH directory holds hundreds of names,
+	// and one listing must not become hundreds of round trips. A name that is
+	// absent here but is a program on the daemon still resolves correctly when
+	// the kernel looks it up, which is the request that actually needs the
+	// answer.
 	if execDir {
 		if des, err := os.ReadDir(n.path); err == nil {
 			for _, de := range des {
 				child := path.Join(n.path, de.Name())
+				if fi, err := os.Lstat(child); err != nil || fi.Mode()&0o111 == 0 {
+					continue
+				}
 				if _, ok := n.allowedExec(child); ok {
 					push(de.Name(), proto.SIFREG|0o555)
-				} else if _, ok := n.trapFor(child); ok {
+				} else if n.lay.LocalExec == nil || !n.lay.LocalExec(child) {
 					push(de.Name(), proto.SIFREG|0o555)
 				}
 			}

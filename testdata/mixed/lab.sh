@@ -36,11 +36,10 @@ transport = "unix"
 socket = "$SOCK"
 
 [local]
-# multica and the agent CLIs are named one by one; /usr/bin is listed as a
-# directory so the names inside it are arbitrated per program. A name in a
-# listed directory that the policy does not allowlist runs on the daemon; a
-# name in a directory never listed is ordinary host content and runs here.
-allow = ["/usr/local/bin/multica", "/usr/local/bin/omp", "/usr/local/bin/codex", "/usr/local/bin/claude", "/bin/sh", "/usr/bin"]
+# The host programs, named one by one, and the shell. Nothing else: every
+# other name a session runs comes from a PATH directory, which the policy
+# arbitrates per name, so it runs on the daemon.
+allow = ["/usr/local/bin/multica", "/usr/local/bin/omp", "/usr/local/bin/codex", "/usr/local/bin/claude", "/bin/sh"]
 entry = "/bin/sh"
 # The agent's configuration tree is local: the program must read and write it
 # as this user, and it must never land on the daemon.

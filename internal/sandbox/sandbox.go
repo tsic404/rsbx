@@ -321,21 +321,39 @@ func durp(sec float64) *time.Duration {
 // SandboxExecPaths lists, in sandbox coordinates, every path Landlock must
 // keep executable.
 //
-// The list is the allowlist itself, not the directories holding it: a
-// directory-wide rule would let any name that survived redirection execute.
-// The allowlist is expanded with the real target of every alias, so a
-// distribution symlink such as /bin/sh -> dash also grants the file it names.
+// Two grants, for two different jobs:
+//
+//   - The allowlist files, expanded with the real target of every alias so a
+//     distribution symlink such as /bin/sh -> dash also grants the file the
+//     kernel actually loads.
+//   - The directories the policy arbitrates, because Landlock grants an inode
+//     and a redirected name is not the inode of the file behind it. FUSE serves
+//     the trampoline for that name, so the kernel resolves the exec against a
+//     different inode than the allowlist named; without the directory grant the
+//     kernel refused the trampoline itself, which is the opposite of running
+//     the program on the daemon.
+//
+// The directory grant does not widen the policy: inside a policy directory
+// FUSE has already decided every name, serving host bytes only for the
+// allowlist and the trampoline for anything else. Landlock still refuses a name
+// FUSE never presented as a program.
 func (p *Plan) SandboxExecPaths() []string {
 	out := []string{GuardPath, TrampolinePath}
 	if p.Exec == nil {
 		return out
 	}
 	seen := map[string]bool{GuardPath: true, TrampolinePath: true}
-	for _, e := range p.Exec.ExecPaths() {
+	add := func(e string) {
 		if e != "" && !seen[e] {
 			seen[e] = true
 			out = append(out, e)
 		}
+	}
+	for _, e := range p.Exec.ExecPaths() {
+		add(e)
+	}
+	for d := range p.PolicyDirs() {
+		add(d)
 	}
 
 	sort.Strings(out)
@@ -385,7 +403,15 @@ func dedupePaths(in []string) []string {
 	return out
 }
 
-// PolicyDirs are the directories where the policy must decide per name.
+// pathDirs are the directories a command is looked up in. A program on PATH is
+// decided per name: the policy says which of those names run here, so the
+// others run on the daemon. Without this, a name the configuration never
+// mentions would be served as this machine's file and executed here — the
+// opposite of the documented rule that anything not allowlisted runs remotely.
+var pathDirs = []string{"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"}
+
+// PolicyDirs are the directories where the policy must decide per name: the
+// directories the allowlist names, plus the PATH directories themselves.
 func (p *Plan) PolicyDirs() map[string]bool {
 	out := map[string]bool{}
 	if p.Exec == nil {
@@ -398,6 +424,14 @@ func (p *Plan) PolicyDirs() map[string]bool {
 			continue
 		}
 		out[filepath.Dir(e)] = true
+	}
+	// A PATH directory is where programs are looked up, so it is where the
+	// policy has to answer per name. Only directories that exist here are
+	// added: a path this machine does not have is served by the daemon whole.
+	for _, d := range pathDirs {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			out[d] = true
+		}
 	}
 	return out
 }
