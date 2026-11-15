@@ -231,7 +231,7 @@ namespace plan) without starting anything.
 ## Running coding agents inside the sandbox
 
 An agent is an ordinary local program as far as the sandbox is concerned, with
-two consequences worth knowing before configuring one.
+a few consequences worth knowing before configuring one.
 
 **The agent must be listed in `local.allow`.** It keeps its own state, so it
 belongs on this machine. Anything else runs on the daemon, under the daemon's
@@ -264,10 +264,35 @@ Everything else — `/usr`, the project tree, the rest of the host — is answer
 by the daemon. The project path itself is the daemon's absolute path: an agent
 told to work in `/proj` opens `/proj` on the daemon, not a translated copy.
 
-Redirection is deliberately limited to the directories where the allowlist
-lives. A data file that merely has the execute bit set — a script in a project
-tree, a `chmod +x` text file — passes through untouched, so an agent reading its
-own files never receives the trampoline by accident.
+Redirection is deliberately limited to the directories the allowlist names. A
+data file that merely has the execute bit set — a script in a project tree, a
+`chmod +x` text file — passes through untouched, so an agent reading its own
+files never receives the trampoline by accident.
+
+That limit has a consequence worth knowing when a host CLI drives work on the
+daemon: a **directory** in `local.allow` is decided per name, so one directory
+can hold programs that run on different sides. Listing `/usr/bin` makes the
+names inside it arbitrated — an allowlisted one runs here, any other runs on
+the daemon — while a name in a directory that was never listed stays ordinary
+host content. Naming a single file (`/usr/local/bin/multica`) does **not**
+extend to its directory: `/usr/local/bin` is then just a directory of this
+machine, and everything in it runs here.
+
+```toml
+[local]
+allow = ["/usr/local/bin/multica",   # the host CLI: runs here
+         "/usr/local/bin/omp",       # the agent: runs here
+         "/bin/sh",
+         "/usr/bin"]                 # arbitrated per name: git runs on the
+                                     # daemon, allowlisted names run here
+entry = "/bin/sh"
+paths = ["/work/agent"]              # the agent's own state stays local
+```
+
+With that configuration a `multica` that shells out to `git` gets the daemon's
+git working on the daemon's project tree: the CLI runs here, the code it
+fetches lands there. `testdata/mixed` measures exactly this, reading placement
+from `/proc/1` — the init of the machine a process really runs on.
 
 Verified with a separate daemon container serving its own `/proj` — the agent
 binary is local, everything it does to the project is a daemon-side write:
