@@ -323,30 +323,35 @@ jobs:
             '
           # Copy the probe in, then run it: one container hosts the two client
           # sessions because they need a shared MNT scratch home.
+          # The base config comes from the runner, so the container script
+          # stays a single short command.
+          mkdir -p e2e/dual-cfg
+          printf '%s\n' \
+            '[daemon]' \
+            'transport = "unix"' \
+            'socket = "/run/rsbx/daemon.sock"' \
+            '' \
+            '[local]' \
+            'allow = ["/usr/bin/bash", "/bin"]' \
+            'entry = "/bin/sh"' \
+            '' \
+            '[sandbox]' \
+            'mount = "#MOUNT#"' \
+            'cache = "#CACHE#"' \
+            'share_network = true' \
+            'unshare_user = false' \
+            > e2e/dual-cfg/base.toml
           docker run --rm --privileged --user 0 --network rsbx-dual \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             -v "$PWD/testdata/probe/dual.sh:/probe/dual.sh:ro" \
+            -v "$PWD/e2e/dual-cfg/base.toml:/e2e/state/base.toml:ro" \
             --entrypoint /bin/bash rsbx:ci -c '
-              mkdir -p /e2e/state/cfg
-              printf '%s\n' \
-                '[daemon]' \
-                'transport = "unix"' \
-                'socket = "#SOCK#"' \
-                '' \
-                '[local]' \
-                'allow = ["/usr/bin/bash", "/bin"]' \
-                'entry = "/bin/sh"' \
-                '' \
-                '[sandbox]' \
-                'mount = "#MOUNT#"' \
-                'cache = "#CACHE#"' \
-                'share_network = true' \
-                'unshare_user = false' \
-                > /e2e/state/cfg/base.toml
+              mkdir -p /e2e/state/cfg /e2e/state/sandbox /e2e/state/cache
               chmod 777 /e2e/state
-              D=/e2e/state MNT=/e2e/state TREE=/proj/dual SOCK=/run/rsbx/daemon.sock \
-                F=$(command -v rsbx) CFG_BASE=/e2e/state/cfg/base.toml \
-                bash -x /probe/dual.sh 2>&1
+              D=/e2e/state MNT=/e2e/state TREE=/proj/dual \
+                SOCK=/run/rsbx/daemon.sock F=$(command -v rsbx) \
+                CFG_BASE=/e2e/state/base.toml \
+                bash /probe/dual.sh
             ' 2>&1 | tee dual-out.txt
           if grep -q "^FAIL" dual-out.txt; then
             echo "dual-session checks failed:"; grep "^FAIL" dual-out.txt; exit 1
