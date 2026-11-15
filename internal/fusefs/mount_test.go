@@ -70,9 +70,9 @@ func mounted(t *testing.T) (mnt, tree string) {
 	}
 	one := time.Second
 	srv, err := fs.Mount(mnt, NewRoot(lay), &fs.Options{
-		MountOptions:  fuse.MountOptions{FsName: "rsbx-test", DisableSplice: true},
-		EntryTimeout:  &one,
-		AttrTimeout:   &one,
+		MountOptions: fuse.MountOptions{FsName: "rsbx-test", DisableSplice: true},
+		EntryTimeout: &one,
+		AttrTimeout:  &one,
 	})
 	if err != nil {
 		t.Skipf("cannot mount FUSE here: %v", err)
