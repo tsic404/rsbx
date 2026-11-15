@@ -22,8 +22,22 @@
 #                    hid a directory created microseconds earlier
 set -u
 R=${RSBX_PROJ:-/proj/run}
+# Start from a clean directory. Every check asserts on an exact result, so state
+# left by an earlier run turns into a false failure — a leftover file makes
+# "ln" fail with EEXIST and a leftover directory makes "mkdir" fail the same way.
+#
+# The directory itself is emptied rather than removed: $R may be the root of the
+# tree under test, whose parent is not writable.
+mkdir -p "$R" 2>/dev/null
+if [ -d "$R" ]; then
+  find "$R" -mindepth 1 -delete 2>/dev/null || rm -rf "${R:?}"/* 2>/dev/null
+fi
+mkdir -p "$R" || { echo "FAIL setup: cannot create $R"; exit 1; }
 ok(){ echo "OK $1"; }
 bad(){ echo "FAIL $1: $2"; }
+# A check whose program is not installed is not a filesystem failure. Reported
+# separately so a slim image can still run the rest of the suite honestly.
+skip(){ echo "SKIP $1: $2"; }
 t(){ local n=$1; shift; local e; e=$("$@" 2>&1); [ $? -eq 0 ] && ok "$n" || bad "$n" "${e:0:120}"; }
 
 mkdir -p "$R/sub/deep" || bad mkdir "mkdir"
@@ -62,13 +76,18 @@ mkdir -p "$R/rmme/x" 2>/dev/null; printf 'q' > "$R/rmme/x/f" 2>/dev/null
 # rename dir
 ( mkdir -p "$R/d1" && printf 'z' > "$R/d1/f" && mv "$R/d1" "$R/d2" ) 2>/dev/null && [ "$(cat "$R/d2/f" 2>/dev/null)" = z ] && ok rename_dir || bad rename_dir "content"
 
-# sqlite
-( python3 - "$R/db.sqlite" <<'PY'
+# sqlite (skipped where python3 is absent, as in the slim runtime image)
+if command -v python3 >/dev/null 2>&1; then
+  ( python3 - "$R/db.sqlite" <<'PY'
 import sqlite3,sys
 c=sqlite3.connect(sys.argv[1]); c.execute("create table t(a)"); c.executemany("insert into t values(?)",[(i,) for i in range(50)]); c.commit(); c.close()
 PY
-) >/dev/null 2>&1 && ok sqlite || bad sqlite "python sqlite"
-[ "$(python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('select count(*) from t').fetchone()[0])" "$R/db.sqlite" 2>&1)" = 50 ] && ok sqlite_rows || bad sqlite_rows "count"
+  ) >/dev/null 2>&1 && ok sqlite || bad sqlite "python sqlite"
+  [ "$(python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('select count(*) from t').fetchone()[0])" "$R/db.sqlite" 2>&1)" = 50 ] && ok sqlite_rows || bad sqlite_rows "count"
+else
+  skip sqlite "python3 absent"
+  skip sqlite_rows "python3 absent"
+fi
 
 # large file + checksum
 ( dd if=/dev/zero of="$R/big.bin" bs=1M count=8 2>/dev/null ) && [ "$(stat -c %s "$R/big.bin")" = 8388608 ] && ok large_file || bad large_file "size"
@@ -83,8 +102,12 @@ mkdir -p "$R/many" 2>/dev/null
 # tar roundtrip
 ( tar -cf "$R/a.tar" -C "$R" a.txt 2>/dev/null && mkdir -p "$R/untar" && tar -xf "$R/a.tar" -C "$R/untar" ) 2>/dev/null && [ "$(cat "$R/untar/a.txt" 2>/dev/null)" = payload ] && ok tar || bad tar "roundtrip"
 
-# git
-( cd "$R" && git init -q . && git add -A >/dev/null 2>&1 && git -c user.name=a -c user.email=a@b commit -qm m >/dev/null 2>&1 ) && ok git_commit || bad git_commit "git"
+# git (skipped where git is absent, as in the slim runtime image)
+if command -v git >/dev/null 2>&1; then
+  ( cd "$R" && git init -q . && git add -A >/dev/null 2>&1 && git -c user.name=a -c user.email=a@b commit -qm m >/dev/null 2>&1 ) && ok git_commit || bad git_commit "git"
+else
+  skip git_commit "git absent"
+fi
 
 # readdir count vs stat
 N1=$(ls -la "$R" 2>/dev/null | wc -l); N2=$(find "$R" -maxdepth 1 2>/dev/null | wc -l)
