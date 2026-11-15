@@ -293,24 +293,20 @@ func (p *Plan) MountRoot() (*fuse.Server, error) {
 	// Wait until the mount actually answers. The launcher binds the source
 	// path immediately, and a freshly mounted FUSE root refuses requests for
 	// a moment while the server thread starts.
-	if err := waitReady(p.Mount, 5*time.Second); err != nil {
+	if err := waitReady(srv); err != nil {
 		srv.Unmount()
 		return nil, err
 	}
 	return srv, nil
 }
 
-// waitReady blocks until path can be listed, or the deadline passes.
-func waitReady(path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	var last error
-	for time.Now().Before(deadline) {
-		if _, last = os.ReadDir(path); last == nil {
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return fmt.Errorf("sandbox root %s did not become ready: %w", path, last)
+// waitReady waits until the mount answers. It asks the server object, which
+// knows when its serving loop is ready, rather than probing the filesystem:
+// this process is the server for that mount, so a filesystem call made before
+// the loop starts is answered by nobody and the kernel parks the caller in an
+// uninterruptible wait that no deadline can break.
+func waitReady(srv *fuse.Server) error {
+	return srv.WaitMount()
 }
 
 func durp(sec float64) *time.Duration {
