@@ -187,27 +187,21 @@ jobs:
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/sandbox /e2e/state/cache
-              cat > /e2e/state/config.toml <<CFG
-              [daemon]
-              transport = "unix"
-              socket = "/run/rsbx/daemon.sock"
-
-              [local]
-              allow = []
-              entry = "/bin/sh"
-
-              [sandbox]
-              mount = "/e2e/state/sandbox"
-              cache = "/e2e/state/cache"
-              # The privileged client container cannot configure loopback in a
-              # fresh network namespace (RTM_NEWADDR is refused), so the
-              # sandbox keeps the host one. Only the network is shared; mounts,
-              # pid, ipc and uts are still unshared.
-              share_network = true
-              # The outer runtime already created the user namespace, and
-              # GitHub refuses a nested uid map.
-              unshare_user = false
-              CFG
+              printf '%s\n' \
+                '[daemon]' \
+                'transport = "unix"' \
+                'socket = "/run/rsbx/daemon.sock"' \
+                '' \
+                '[local]' \
+                'allow = []' \
+                'entry = "/bin/sh"' \
+                '' \
+                '[sandbox]' \
+                'mount = "/e2e/state/sandbox"' \
+                'cache = "/e2e/state/cache"' \
+                'share_network = true' \
+                'unshare_user = false' \
+                > /e2e/state/config.toml
               cat /e2e/state/config.toml
               rsbx -no-mount -config /e2e/state/config.toml
               rsbx -config /e2e/state/config.toml -- /bin/sh -c "
@@ -316,21 +310,21 @@ jobs:
             -v "$PWD/testdata/probe/dual.sh:/probe/dual.sh:ro" \
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/cfg
-              cat > /e2e/state/cfg/base.toml <<CFG
-              [daemon]
-              transport = "unix"
-              socket = "/run/rsbx/daemon.sock"
-
-              [local]
-              allow = []
-              entry = "/bin/sh"
-
-              [sandbox]
-              mount = "#MOUNT#"
-              cache = "#CACHE#"
-              share_network = true
-              unshare_user = false
-              CFG
+              printf '%s\n' \
+                '[daemon]' \
+                'transport = "unix"' \
+                'socket = "/run/rsbx/daemon.sock"' \
+                '' \
+                '[local]' \
+                'allow = []' \
+                'entry = "/bin/sh"' \
+                '' \
+                '[sandbox]' \
+                'mount = "#MOUNT#"' \
+                'cache = "#CACHE#"' \
+                'share_network = true' \
+                'unshare_user = false' \
+                > /e2e/state/cfg/base.toml
               chmod 777 /e2e/state
               D=/e2e/state MNT=/e2e/state TREE=/proj \
                 F=$(command -v rsbx) CFG_BASE=/e2e/state/cfg/base.toml \
