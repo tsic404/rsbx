@@ -298,15 +298,24 @@ func mountDev(root string) error {
 	if err := unix.Mount("tmpfs", dev, "tmpfs", unix.MS_NOSUID|unix.MS_STRICTATIME, "size=65536k,mode=0755"); err != nil {
 		return fmt.Errorf("mount dev: %w", err)
 	}
+	// The targets are created and bound through a directory descriptor opened
+	// after the tmpfs was mounted. A path resolved before the mount can still
+	// name the old dentry, and under concurrent starts the bind then failed
+	// with ENOENT for a file created a moment earlier on a filesystem that
+	// plainly had it.
+	devfd, err := unix.Open(dev, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open dev dir: %w", err)
+	}
+	defer unix.Close(devfd)
 	for _, name := range []string{"null", "zero", "full", "random", "urandom", "tty"} {
-		target := filepath.Join(dev, name)
-		if err := touchFile(target); err != nil {
-			return err
+		if err := unix.Mknodat(devfd, name, unix.S_IFREG|0o600, 0); err != nil && err != unix.EEXIST {
+			return fmt.Errorf("create /dev/%s: %w", name, err)
 		}
-		if err := unix.Mount(filepath.Join("/dev", name), target, "", unix.MS_BIND, ""); err != nil {
+		if err := unix.Mount(filepath.Join("/dev", name), filepath.Join(dev, name), "", unix.MS_BIND, ""); err != nil {
 			return fmt.Errorf("bind /dev/%s: %w", name, err)
 		}
-		if err := remountReadOnly(target); err != nil {
+		if err := remountReadOnly(filepath.Join(dev, name)); err != nil {
 			return fmt.Errorf("read-only /dev/%s: %w", name, err)
 		}
 	}
@@ -611,20 +620,6 @@ func makeDir(p string) error {
 	if err := os.MkdirAll(p, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", p, err)
 	}
-	return nil
-}
-
-// touchFile creates an empty placeholder for a file bind target.
-func touchFile(p string) error {
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", p, err)
-	}
-	// The file exists at this point, which is the whole purpose of the call.
-	// A close that fails reports a descriptor problem, not a missing mount
-	// target, and failing the session over it strands the sandbox on an error
-	// that has nothing to do with what it was building.
-	_ = f.Close()
 	return nil
 }
 
