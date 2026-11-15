@@ -45,6 +45,10 @@ jobs:
       # which a normal runner does not provide. The unit tests cover the
       # policies and the protocol, so they run here; the sandbox test runs in
       # the docker job below, where the container can be given the devices.
+      # The mount-backed tests in internal/fusefs need /dev/fuse, which this
+      # runner does not have; they skip here and run for real in the docker job.
+      # The mount-backed tests in internal/fusefs need /dev/fuse, which this
+      # runner does not have; they skip here and run for real in the docker job.
       - name: go test
         run: go test -race ./...
 
@@ -110,6 +114,15 @@ jobs:
       - name: the image runs
         run: |
           docker run --rm rsbx:ci -version
+
+      # /dev/fuse exists here, so the mount-backed filesystem tests run for real
+      # instead of skipping. This is the only place CI exercises the FUSE write
+      # paths.
+      - name: filesystem tests with a real mount
+        run: |
+          docker build --target test -t rsbx-test-env .
+          docker run --rm --privileged --user 0 -v /dev/fuse:/dev/fuse \
+            rsbx-test-env test -v -run 'ThroughMount|ReachesHost' ./internal/fusefs
 
       # A sandbox needs /dev/fuse plus an unprivileged user namespace, so the
       # container runs privileged. This exercises the real path: a daemon

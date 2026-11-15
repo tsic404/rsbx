@@ -16,6 +16,15 @@ RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/rsbx 
  && go build -trimpath -ldflags="-s -w" -o /out/rsbx-tramp ./cmd/rsbx-tramp \
  && go build -trimpath -ldflags="-s -w" -o /out/rsbx-guard ./cmd/rsbx-guard
 
+# ---- test ----------------------------------------------------------------
+# The filesystem tests mount a real FUSE filesystem, so they need the fuse
+# helper at run time. Keeping this stage separate means the runtime image does
+# not carry a Go toolchain.
+FROM build AS test
+RUN apk add --no-cache fuse3
+ENTRYPOINT ["go"]
+CMD ["test", "./..."]
+
 # ---- runtime --------------------------------------------------------------
 # A sandbox needs bubblewrap (the view), fuse3 (the mount) and the agent
 # toolchain the configuration allows to run locally.
