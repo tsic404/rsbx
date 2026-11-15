@@ -289,6 +289,17 @@ With that configuration `multica` runs here, `git` runs on the daemon, and the
 code git fetches lands on the daemon's tree: the CLI drives remote work without
 being part of the sandbox. Nothing in this file names git.
 
+One consequence catches people out: a local program cannot create its own
+directories, because `mkdir` is a program and an unlisted program runs on the
+daemon — where the local tree does not exist. Give the agent its configuration
+directory, and list `mkdir` (or `mkdir -p`'s directory) in `local.allow` if the
+agent has to create subdirectories itself:
+
+```console
+$ rsbx -- omp config-write
+omp: cannot create /home/me/.omp/config.toml: Directory nonexistent
+```
+
 `testdata/mixed` measures exactly this, reading placement from `/proc/1` — the
 init of the machine a process really runs on.
 

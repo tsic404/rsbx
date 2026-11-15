@@ -406,6 +406,20 @@ jobs:
             echo "mixed-model checks failed:"; grep "^FAIL" mixed-out.txt; exit 1
           fi
           test "$(grep -c '^OK' mixed-out.txt)" -eq 10
+          # The same model under load: many sessions at once, each running the
+          # host programs and the daemon programs on one shared tree.
+          docker run --rm --privileged --user 0 --network mix-net \
+            -v "$PWD/testdata/mixed:/probe:ro" -v mix-run:/run/rsbx \
+            --entrypoint /bin/bash rsbx-mixed-client -c '
+              mkdir -p /state/sb /state/cache /work/agent/omp
+              chmod -R 777 /state /work
+              MNT=/state F=/usr/local/bin/rsbx SOCK=/run/rsbx/daemon.sock \
+                AGENT_HOME=/work/agent N=16 timeout 300 bash /probe/stress.sh
+            ' 2>&1 | tee mixed-stress.txt
+          if grep -q "^FAIL" mixed-stress.txt; then
+            echo "mixed-model stress checks failed:"; grep "^FAIL" mixed-stress.txt; exit 1
+          fi
+          test "$(grep -c '^OK' mixed-stress.txt)" -eq 4
 
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'

@@ -48,11 +48,15 @@ concurrent_commits(){
         git init -q . && printf 'work-$i\n' > f.txt
         git add f.txt
         git -c user.email=a@b -c user.name=n commit -qm c$i 2>/dev/null
-        git rev-list --count HEAD" ) &
+        git rev-list --count HEAD" >/dev/null 2>&1 ) &
     pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
-  [ $rc -eq 0 ] || { echo "a session failed"; return 1; }
+  [ $rc -eq 0 ] || {
+    local who; who=$(grep -l . "$MNT"/split.* 2>/dev/null | head -1)
+    echo "a session failed: $(tail -2 "$who" 2>/dev/null | tr '\n' ' ')"
+    return 1
+  }
   for i in $(seq 1 $N); do
     local n; n=$(run "cd /proj/c$i && git rev-list --count HEAD")
     [ "$n" = 1 ] || { echo "c$i count=$n"; return 1; }
@@ -77,7 +81,7 @@ agent_split(){
   local i pids=() pid rc=0
   for i in $(seq 1 $N); do
     ( runn $i "OMP_CONFIG=$AGENT_HOME/omp/cfg$i.toml omp config-write
-        omp work /proj/w$i" ) >/dev/null 2>&1 &
+        mkdir -p /proj/w$i && omp work /proj/w$i" > "$MNT/split.$i" 2>&1 ) &
     pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
