@@ -182,13 +182,18 @@ func isLoader(p string) bool {
 // execTarget returns the single file that backs an exec-policy member: either
 // the local binary or the trampoline. Every filesystem operation goes through
 // this decision so sizes and contents cannot disagree.
+// execTarget resolves an allowlisted name to the file that backs it here.
+//
+// A name with no local file is served by the trampoline, so the file to stat is
+// the trampoline itself. Only when the policy declines both — the name is local
+// and allowed — does this stat the real path.
 func (n *Node) execTarget(p string) (string, os.FileInfo, error) {
-	target := p
 	if trap, ok := n.trapFor(p); ok {
-		target = trap
+		fi, err := os.Stat(trap)
+		return trap, fi, err
 	}
-	fi, err := os.Stat(target)
-	return target, fi, err
+	fi, err := os.Stat(p)
+	return p, fi, err
 }
 
 // writable reports whether modifications under p are permitted.
@@ -261,6 +266,26 @@ func (n *Node) trapFor(p string) (string, bool) {
 	if !n.isExecDir(p) {
 		return "", false
 	}
+	if trap, ok := n.trapForExact(p); ok {
+		return trap, true
+	}
+	// A name inside an exec-policy directory that does not exist on this
+	// machine can still be a program on the daemon. The policy says which
+	// directory decides where programs run, not that every name in it is local;
+	// an ssh-style session has to be able to run a tool that was only ever
+	// installed on the other side. Without this the name resolves to ENOENT and
+	// the session cannot use the daemon's programs at all.
+	if !n.existsHere(p) {
+		if kind, ok := n.remoteKind(p); ok && kind != proto.SIFDIR {
+			return n.lay.Trampoline, true
+		}
+	}
+	return "", false
+}
+
+// trapForExact is the original decision: the name is a local file that the
+// policy declined to run here.
+func (n *Node) trapForExact(p string) (string, bool) {
 	host := p
 	fi, err := os.Lstat(host)
 	if err != nil || !fi.Mode().IsRegular() || fi.Mode()&0o111 == 0 {
@@ -270,6 +295,24 @@ func (n *Node) trapFor(p string) (string, bool) {
 		return "", false
 	}
 	return n.lay.Trampoline, true
+}
+
+// existsHere reports whether the host has this path at all.
+func (n *Node) existsHere(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+// remoteKind asks the daemon what this path is there. It is only consulted for
+// names the host does not have, so the common case costs no round trip. A
+// directory must stay a directory: turning one into a trampoline would make
+// every child of it unreachable.
+func (n *Node) remoteKind(p string) (uint32, bool) {
+	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
+	if err != nil || resp.Kind != proto.KStat {
+		return 0, false
+	}
+	return resp.Attr.Mode &^ 0o7777, true
 }
 
 // kind extracts the file type bits. Comparing whole words matters: a regular
@@ -399,6 +442,21 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (in 
 	if n.isExecDir(p) {
 		_, fi, err := n.execTarget(p)
 		if err != nil {
+			// No local file of that name. The daemon may still have it: a
+			// directory of programs that exists only on the other side is an
+			// ordinary thing for an ssh-style session to reach for.
+			if mode, ok := n.remoteKind(p); ok {
+				out.Attr = attrOf(mode, 0, ino(p))
+				if resp, rerr := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p}); rerr == nil && resp.Kind == proto.KStat {
+					out.Attr = attrOfRemote(resp.Attr, remoteIno(resp.Attr, p))
+				}
+				child := &Node{lay: n.lay, path: p}
+				fm := uint32(syscall.S_IFREG)
+				if mode == proto.SIFDIR {
+					fm = syscall.S_IFDIR
+				}
+				return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: fm, Ino: out.Attr.Ino}), 0
+			}
 			return nil, syscall.ENOENT
 		}
 		mode := uint32(proto.SIFREG) | uint32(fi.Mode().Perm())
