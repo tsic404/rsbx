@@ -344,7 +344,7 @@ jobs:
                 'unshare_user = false' \
                 > /e2e/state/cfg/base.toml
               chmod 777 /e2e/state
-              D=/e2e/state MNT=/e2e/state TREE=/proj/dual \
+              D=/e2e/state MNT=/e2e/state TREE=/proj/dual SOCK=/run/rsbx/daemon.sock \
                 F=$(command -v rsbx) CFG_BASE=/e2e/state/cfg/base.toml \
                 bash /probe/dual.sh
             ' | tee dual-out.txt
