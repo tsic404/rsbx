@@ -240,7 +240,8 @@ jobs:
             --entrypoint /bin/bash rsbx:ci \
             -c 'mkdir -p /seed/probe && cp /e2e/probes/* /seed/probe/ &&
                 cp /probes/*.sh /probes/*.c /seed/probe/ &&
-                chmod -R 777 /seed'
+                chmod -R 777 /seed &&
+                chmod 755 /seed/probe/*.sh'
           printf '%s\n' \
             '[daemon]' \
             'transport = "unix"' \
