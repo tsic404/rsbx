@@ -5,11 +5,10 @@
 # whichever machine the process really runs on. Here that is the client; a
 # process the daemon started sees rsbxd as its pid 1. Everything it reads from
 # /proj is daemon-only content either way, which is the point of the sandbox.
-# /proc/1 is the init of the machine this process really runs on, read with
-# the shell's own builtin: tr is a program, and an unlisted program runs on the
-# daemon, where /proc/1 would answer for the wrong machine.
-IFS= read -r p1 < /proc/1/cmdline 2>/dev/null || p1=""
-echo "MULTICA-PID1=${p1%%,*}"
+# read returns non-zero at end of file, so the value comes from the variable.
+p1=""
+IFS= read -r p1 < /proc/1/comm 2>/dev/null
+echo "MULTICA-INIT=$p1"
 echo "MULTICA-PWD=$(pwd)"
 case "$1" in
   # cat is a program, so it would run on the daemon; the read is done here with

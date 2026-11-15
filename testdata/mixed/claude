@@ -1,9 +1,8 @@
 #!/bin/sh
-# /proc/1 is the init of the machine this process really runs on, read with
-# the shell's own builtin: tr is a program, and an unlisted program runs on the
-# daemon, where /proc/1 would answer for the wrong machine.
-IFS= read -r p1 < /proc/1/cmdline 2>/dev/null || p1=""
-echo "CLAUDE-PID1=${p1%%,*}"
+# read returns non-zero at end of file, so the value comes from the variable.
+p1=""
+IFS= read -r p1 < /proc/1/comm 2>/dev/null
+echo "CLAUDE-INIT=$p1"
 [ "$1" = config-read ] && {
   f=/work/agent/claude/settings.json
   if [ -r "$f" ]; then IFS= read -r line < "$f"; echo "CLAUDE-CONFIG=[$line]";

@@ -382,8 +382,16 @@ jobs:
             -c 'mkdir -p /run/rsbx && chown 1000:1000 /run/rsbx'
           # A marker that exists only on the daemon: a session that reads it is
           # reading remote content, whatever the path is called.
+          # A bare repository for the check that drives git through the host
+          # CLI: the clone is written on the daemon, so the source is there too.
           docker run --rm --user 0 -v mix-proj:/seed --entrypoint /bin/sh rsbx-mixed-daemon \
-            -c 'printf "daemon-marker\n" > /seed/marker && chmod -R 777 /seed'
+            -c 'printf "daemon-marker\n" > /seed/marker
+                mkdir -p /seed/src && cd /seed/src && git init -q . &&
+                printf "lib code\n" > lib.c && git add lib.c &&
+                git -c user.email=a@b -c user.name=n commit -qm src &&
+                git init -q --bare /seed/origin.git &&
+                cd /seed/origin.git && git fetch -q /seed/src +refs/heads/*:refs/heads/* &&
+                rm -rf /seed/src && chmod -R 777 /seed'
           docker run -d --rm --name rsbx-mixed --network mix-net \
             -v mix-proj:/proj -v mix-run:/run/rsbx \
             --entrypoint rsbxd rsbx-mixed-daemon -socket /run/rsbx/daemon.sock
@@ -405,7 +413,7 @@ jobs:
           if grep -q "^FAIL" mixed-out.txt; then
             echo "mixed-model checks failed:"; grep "^FAIL" mixed-out.txt; exit 1
           fi
-          test "$(grep -c '^OK' mixed-out.txt)" -eq 10
+          test "$(grep -c '^OK' mixed-out.txt)" -eq 11
           # The same model under load: many sessions at once, each running the
           # host programs and the daemon programs on one shared tree.
           docker run --rm --privileged --user 0 --network mix-net \

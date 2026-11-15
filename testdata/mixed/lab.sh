@@ -18,15 +18,11 @@ bad(){ echo "FAIL $1: $2"; }
 
 run(){ timeout 120 "$F" -config "$MNT/lab.toml" -- /bin/sh -c "$1" 2>&1; }
 
-# Placement is read from /proc/1: it is the init of the machine the process
-# really runs on. A host program sees this container's init; a program the
-# daemon started sees rsbxd. The string is passed in from the runner.
-is_local_pid1(){
-  case "$1" in
-    *rsbxd*) return 1 ;;
-    "") return 1 ;;
-    *) return 0 ;;
-  esac
+# Placement is read from this process's own /proc: a program running here has
+# the sandbox proc and sees an init, a program the daemon started has none, so
+# the value is empty. Neither a hostname nor a pid number can show this.
+is_local_init(){
+  [ -n "$1" ]
 }
 
 mkcfg(){
@@ -58,8 +54,8 @@ CFG
 check_multica_local(){
   local out p
   out=$(run 'multica sees')
-  p=$(printf '%s\n' "$out" | sed -n 's/^MULTICA-PID1=//p')
-  is_local_pid1 "$p" || { echo "multica ran on the daemon (pid1 [$p]): $out"; return 1; }
+  p=$(printf '%s\n' "$out" | sed -n 's/^MULTICA-INIT=//p')
+  is_local_init "$p" || { echo "multica ran on the daemon (no init): $out"; return 1; }
 }
 
 # 2. the tree multica sees is the daemon's.
@@ -88,12 +84,11 @@ check_git_runs(){
 
 # 5. and it runs on the daemon, not here. A git alias reports its own pid.
 check_git_remote(){
-  out=$(run 'git -c alias.w="!tr \\0 \" \" < /proc/1/cmdline" w 2>/dev/null | head -c 40')
-  [ -n "$out" ] || { echo "no evidence from git"; return 1; }
-  case "$out" in
-    *rsbxd*) return 0 ;;
-  esac
-  echo "git ran here (pid1 [$out]): the redirect did not happen"; return 1
+  # A program the daemon started has no sandbox /proc, so this reads empty.
+  # Anything else means git ran here.
+  out=$(run 'git -c alias.w="!c=\"\"; IFS= read -r c < /proc/1/comm; printf %s \"$c\"" w 2>/dev/null | head -1')
+  [ -z "$out" ] && return 0
+  echo "git ran here (init [$out]): the redirect did not happen"; return 1
 }
 
 # 6. git's work lands on the daemon's tree and survives to the next session.
@@ -139,9 +134,22 @@ check_all_agents_local(){
   local a out p
   for a in omp codex claude; do
     out=$(run "$a config-read")
-    p=$(printf '%s\n' "$out" | sed -n 's/^[A-Z]*-PID1=//p')
-    is_local_pid1 "$p" || { echo "$a ran on the daemon (pid1 [$p]): $out"; return 1; }
+    p=$(printf '%s\n' "$out" | sed -n 's/^[A-Z]*-INIT=//p')
+    is_local_init "$p" || { echo "$a ran on the daemon (no init): $out"; return 1; }
   done
+}
+
+# A host CLI that shells out to git gets the daemon's git, and the code it
+# fetches is code the CLI itself can then read: one tree, two sides.
+check_cli_drives_git(){
+  local out
+  out=$(run 'multica run "git clone -q /proj/origin.git /proj/work && echo CLONED"')
+  printf '%s\n' "$out" | grep -q CLONED || { echo "clone: [$out]"; return 1; }
+  out=$(run 'multica run "cat /proj/work/lib.c"')
+  printf '%s\n' "$out" | grep -q "lib code" || { echo "multica cannot see the fetched file: [$out]"; return 1; }
+  # The clone must not exist on this machine: it was written on the daemon.
+  [ -e "$DAEMON_TREE/work" ] && { echo "the client root also holds the clone"; return 1; }
+  return 0
 }
 
 # 10. multica and git see one tree, not two.
@@ -158,7 +166,8 @@ mkcfg
 echo "=== client=$(hostname) ==="
 for t in check_multica_local check_multica_sees_remote check_git_absent_here \
          check_git_runs check_git_remote check_git_writes_remote \
-         check_agent_config_local check_agent_io_remote check_all_agents_local check_one_tree; do
+         check_agent_config_local check_agent_io_remote check_all_agents_local \
+         check_cli_drives_git check_one_tree; do
   e=$($t 2>&1)
   if [ $? -eq 0 ]; then ok "${t#check_}"; else bad "${t#check_}" "${e:0:240}"; fi
 done
