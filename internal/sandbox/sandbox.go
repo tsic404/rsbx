@@ -32,7 +32,21 @@ import (
 )
 
 // Synthetic mount points bwrap creates; the FUSE root must expose them.
-var synthetic = []string{"/proc", "/dev", "/tmp", "/run", TrampolineSockDir}
+// synthetic lists paths the sandbox itself provides as empty mount points.
+//
+// bwrap creates the destination of every bind, and doing that through the
+// filesystem is what keeps the daemon tree clean: without these entries a
+// --ro-bind of /etc would mkdir /etc in the *remote* tree on first run.
+var synthetic = []string{
+	"/proc", "/dev", "/tmp", "/run",
+	"/etc", "/sys", "/lib", "/lib64", "/bin", "/sbin", "/usr/lib", "/usr/lib64",
+	TrampolineSockDir,
+}
+
+// syntheticFiles are the bind-mount targets that are files rather than
+// directories. bwrap creates them too, and through the filesystem they would
+// otherwise be created in the daemon's tree.
+var syntheticFiles = []string{"/.rsbx-guard", "/.rsbx-tramp"}
 
 // TrampolineSockDir is the directory bound into the sandbox that holds the
 // daemon socket, and TrampolineSock is the socket's path inside it.
@@ -168,11 +182,26 @@ func splitCommand(s string) []string {
 func (p *Plan) Layout() *fusefs.Layout {
 	roots := p.Local.Roots()
 	hostDirs := map[string]bool{}
+	// Every ancestor of a local tree must exist in the view. bwrap creates the
+	// bind destination, and an intermediate directory created through the
+	// filesystem would be an empty placeholder that hides the tree; reserving
+	// them keeps bwrap's own creation from reaching the daemon.
 	for _, d := range roots {
 		hostDirs[d] = true
 		for q := d; q != "/" && q != "."; q = filepath.Dir(q) {
 			hostDirs[filepath.Dir(q)] = true
 		}
+	}
+	// Intermediate directories of the local trees are reserved as mount
+	// points, so creating them never writes into the daemon's tree.
+	allSynthetic := append([]string(nil), synthetic...)
+	for d := range hostDirs {
+		// The root of a local tree is served by the tree itself, not as a
+		// placeholder, and a path already listed keeps its meaning.
+		if d == "/" || p.Local.IsLocal(d) {
+			continue
+		}
+		allSynthetic = append(allSynthetic, d)
 	}
 	// Only trees that hold the allowlist need FUSE to arbitrate per name.
 	// Everything else that is local is bound straight from the host.
@@ -183,16 +212,17 @@ func (p *Plan) Layout() *fusefs.Layout {
 	}
 	sort.Strings(execDirs)
 	return &fusefs.Layout{
-		Remote:      p.Remote,
-		Local:       p.Local,
-		ExecDirs:    execDirs,
-		Trampoline:  p.Trampoline,
-		LocalExec:   p.Exec.IsLocal,
-		Cache:       p.Cache,
-		TTL:         2 * time.Second,
-		Synthetic:   synthetic,
-		HostDirs:    hostDirs,
-		SystemLinks: systemLinks(),
+		Remote:         p.Remote,
+		Local:          p.Local,
+		ExecDirs:       execDirs,
+		Trampoline:     p.Trampoline,
+		LocalExec:      p.Exec.IsLocal,
+		Cache:          p.Cache,
+		TTL:            2 * time.Second,
+		Synthetic:      dedupePaths(allSynthetic),
+		SyntheticFiles: syntheticFiles,
+		HostDirs:       hostDirs,
+		SystemLinks:    systemLinks(),
 	}
 }
 
@@ -254,33 +284,12 @@ func durp(sec float64) *time.Duration {
 func (p *Plan) BwrapArgs(argv []string) []string {
 	args := []string{"--bind", p.Mount, "/"}
 
-	policyDirs := p.PolicyDirs()
-	// Any bind whose destination lies inside a policy directory would have to
-	// create that directory in the FUSE view, and creating it shadows the FUSE
-	// entries underneath. So the whole policy subtree is left entirely to FUSE,
-	// and the daemon and FUSE together provide what is needed there.
-	policyRoots := make([]string, 0, len(policyDirs))
-	for d := range policyDirs {
-		policyRoots = append(policyRoots, d)
-	}
-	for _, d := range p.Local.Roots() {
-		if bindsThrough(d, policyRoots) {
-			continue
-		}
-		// /tmp is replaced by a tmpfs, so a tree living there cannot be
-		// bound; FUSE serves it instead, which also keeps writes coherent.
-		if d == "/tmp" || strings.HasPrefix(d, "/tmp/") {
-			continue
-		}
-		if fi, err := os.Lstat(d); err != nil || !fi.IsDir() {
-			continue
-		}
-		if p.Local.Writable(d) {
-			args = append(args, "--bind", d, d)
-		} else {
-			args = append(args, "--ro-bind", d, d)
-		}
-	}
+	// Local trees are deliberately NOT bound.
+	//
+	// Binding one makes bwrap create its intermediate directories, and those
+	// creations replace the FUSE entries at the same paths, so the tree appears
+	// empty. FUSE already serves local trees from the host, which keeps reads
+	// and writes governed by the policy instead of bypassing it.
 
 	// The trampoline must reach the daemon from inside the sandbox. A unix
 	// socket is bound in; an ssh transport carries the command instead,
@@ -357,44 +366,6 @@ func (p *Plan) BwrapArgs(argv []string) []string {
 	return append(args, argv...)
 }
 
-// bindsThrough reports whether binding p would disturb an exec-policy
-// directory.
-//
-// bwrap creates every intermediate directory of a bind destination. Binding
-// /usr/lib therefore creates /usr, which hides FUSE's /usr and every entry
-// below it — including the policy directory /usr/bin. So any bind that shares
-// an ancestor with a policy directory has to be left to FUSE instead.
-func bindsThrough(p string, roots []string) bool {
-	for _, r := range roots {
-		if p == r || strings.HasPrefix(p, r+"/") || strings.HasPrefix(r, p+"/") {
-			return true
-		}
-		if commonAncestor(p, r) != "/" {
-			return true
-		}
-	}
-	return false
-}
-
-// commonAncestor returns the deepest directory containing both paths.
-func commonAncestor(a, b string) string {
-	a, b = filepath.Clean(a), filepath.Clean(b)
-	da, db := strings.Split(a, "/"), strings.Split(b, "/")
-	out := ""
-	for i := 0; i < len(da) && i < len(db); i++ {
-		if da[i] != db[i] {
-			break
-		}
-		if da[i] != "" {
-			out += "/" + da[i]
-		}
-	}
-	if out == "" {
-		return "/"
-	}
-	return out
-}
-
 // systemLinks reproduces the merged-usr symlinks ( /lib -> usr/lib and
 // friends) inside the sandbox. The dynamic loader is reached through them, so
 // they have to exist even when the target directory is served by FUSE.
@@ -455,6 +426,12 @@ func (p *Plan) hasPath(path string) bool {
 	if p.Local.IsLocal(path) {
 		return true
 	}
+	// An ancestor of a local tree exists as a directory that holds it.
+	for _, root := range p.Local.Roots() {
+		if strings.HasPrefix(root, path+"/") {
+			return true
+		}
+	}
 	for _, s := range synthetic {
 		if path == s || strings.HasPrefix(path, s+"/") {
 			return true
@@ -463,6 +440,20 @@ func (p *Plan) hasPath(path string) bool {
 	// Anything else is a daemon path; asking the daemon would need a round
 	// trip before the mount exists, so assume it may not be there.
 	return false
+}
+
+// dedupePaths removes duplicates while keeping the longest path first, so a
+// nested mount point is matched before the tree that contains it.
+func dedupePaths(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // linkTargets returns the directories holding the merged-usr link targets and

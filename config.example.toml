@@ -6,46 +6,53 @@
 # "ssh"   : rsbxd is started by ssh and speaks over its stdio
 transport = "unix"
 socket    = "~/.rsbx/daemon.sock"
-# transport = "ssh"
-# command   = "ssh build@company-01 /home/tsic/rsbx-client/dist/rsbxd -stdio -root /home/tsic/remote-tree"
 
 [local]
 # -- which programs run HERE --
-# Anything not listed executes on the daemon, including static binaries.
+#
+# Anything not listed executes on the daemon. That includes ordinary tools, so
+# an agent that must inspect a local tree needs them listed: `ls`, `stat` and
+# `cat` run on the daemon by default, where a [local.paths] tree does not
+# exist, and the agent would see "no such file".
 allow = [
-  "/usr/bin/bash",
-  "/usr/bin/env",
-  "/usr/bin/git",
-  "/usr/bin/make",
-  "/usr/bin/ssh",
+  # shells and coreutils
+  "/usr/bin/bash", "/usr/bin/env", "/usr/bin/true",
+  "/usr/bin/ls", "/usr/bin/stat", "/usr/bin/cat", "/usr/bin/head",
+  "/usr/bin/tail", "/usr/bin/grep", "/usr/bin/find", "/usr/bin/wc",
+  "/usr/bin/sed", "/usr/bin/awk", "/usr/bin/sort", "/usr/bin/uniq",
+  "/usr/bin/cut", "/usr/bin/tr", "/usr/bin/xargs", "/usr/bin/tar",
+  "/usr/bin/mkdir", "/usr/bin/rm", "/usr/bin/cp", "/usr/bin/mv",
+  "/usr/bin/chmod", "/usr/bin/ln", "/usr/bin/readlink", "/usr/bin/dirname",
+  "/usr/bin/tee", "/usr/bin/which", "/usr/bin/id", "/usr/bin/date",
+  "/usr/bin/printenv", "/usr/bin/diff", "/usr/bin/touch",
+
+  # coding agents: they hold their own state, so they run locally.
+  # Also list the helpers a redirected command cannot provide: `timeout` and
+  # similar wrappers used inside scripts must run where the paths exist.
+  "/usr/local/bin/codex",
+  "/usr/local/bin/claude",
+  "/usr/bin/timeout",
 ]
-# The shell started when no command is given.
 entry = "/usr/bin/bash"
 
 # -- which files are LOCAL --
-# These trees are read and written on this machine: no round trip, and a
-# redirected program on the daemon cannot see them at all.
+# Trees read and written on this machine. A redirected program on the daemon
+# cannot see them at all.
 paths = [
-  "/home/me/work",
+  "/work",
+  "/home/me/.codex",
+  "/home/me/.claude",
+  "/home/me/.config",
 ]
-# Toolchain and device trees: served locally but read-only.
-read_only_paths = [
-  "/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc",
-]
+# Toolchain and device trees: served locally, read-only.
+read_only_paths = ["/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
 
-# There is no [remote] table: the daemon-side root is a property of the
-# daemon, not of the client. Pass it to rsbxd:
-#
-#   rsbxd -socket ~/.rsbx/daemon.sock -root /home/tsic/remote-tree
+# There is no [remote] table: the daemon-side root is a property of the daemon.
+#   rsbxd -socket ~/.rsbx/daemon.sock -root /srv/tree
 
 [sandbox]
 mount = "~/.rsbx/sandbox"
-# Disposable copies of remote files this machine has read. Deleting it only
-# costs bandwidth; it never holds anything that is not on the daemon.
+# Disposable copies of remote files read by this machine.
 cache = "~/.rsbx/cache"
-# Keep the host network namespace. Needed for the ssh transport (automatic),
-# and for containers that cannot create a network namespace.
+# Agents talk to their APIs, so they need the network.
 # share_network = false
-# Create a user namespace. Leave it on outside containers; some container
-# runtimes refuse a nested one.
-# unshare_user = true

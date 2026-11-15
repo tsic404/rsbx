@@ -117,24 +117,26 @@ jobs:
       # shell reads a file that only exists on the daemon side.
       - name: sandbox end to end
         run: |
-          mkdir -p e2e/tree e2e/home/localrw e2e/home/sandbox
+          mkdir -p e2e/tree e2e/localrw e2e/state/sandbox
           echo REMOTE-MARKER > e2e/tree/remote.txt
-          echo LOCAL-CONTENT > e2e/home/localrw/local.txt
+          echo LOCAL-CONTENT > e2e/localrw/local.txt
           chmod -R 777 e2e
           cat > e2e/config.toml <<'CFG'
           [daemon]
           transport = "unix"
-          socket = "/e2e/home/d.sock"
+          socket = "/e2e/state/d.sock"
 
           [local]
-          allow = ["/usr/bin/bash", "/usr/bin/env", "/usr/bin/true"]
-          paths = ["/e2e/home/localrw"]
-          read_only_paths = ["/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
+          allow = ["/usr/bin/bash", "/usr/bin/env", "/usr/bin/true",
+                   "/usr/bin/ls", "/usr/bin/stat", "/usr/bin/cat"]
+          paths = ["/e2e/localrw"]
+          # /usr/bin holds the allowlisted commands, so it has to be local too.
+          read_only_paths = ["/usr/bin", "/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
           entry = "/usr/bin/bash"
 
           [sandbox]
-          mount = "/e2e/home/sandbox"
-          cache = "/e2e/home/cache"
+          mount = "/e2e/state/sandbox"
+          cache = "/e2e/state/cache"
           # The runner's privileged container cannot configure loopback in a
           # fresh network namespace (RTM_NEWADDR is refused), so the sandbox
           # keeps the host one. Only the network is shared; mounts, pid, ipc
@@ -150,13 +152,15 @@ jobs:
           docker run --rm --privileged --user 0 \
             -v "$PWD/e2e:/e2e" -v /dev/fuse:/dev/fuse \
             --entrypoint /bin/bash rsbx:ci -c '
-              mkdir -p /e2e/home/sandbox
-              rsbxd -socket /e2e/home/d.sock -root /e2e/tree >/tmp/daemon.log 2>&1 &
+              mkdir -p /e2e/state/sandbox
+              rsbxd -socket /e2e/state/d.sock -root /e2e/tree >/tmp/daemon.log 2>&1 &
               sleep 2
               rsbx -config /e2e/config.toml -- /usr/bin/bash -c "
                 echo \"local shell: \$(readlink /proc/self/exe)\"
-                echo \"local tree:  \$(cat < /e2e/home/localrw/local.txt)\"
+                echo \"local tree:  \$(cat < /e2e/localrw/local.txt)\"
                 echo \"remote file: \$(/usr/bin/cat /remote.txt)\"
+                # a local stat of a local tree is what makes an agent work
+                echo \"local stat:  \$(/usr/bin/stat -c %s /e2e/localrw/local.txt)\"
                 test \"\$(/usr/bin/cat /remote.txt)\" = REMOTE-MARKER
               "
             ' | tee out.txt

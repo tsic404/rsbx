@@ -1,6 +1,10 @@
 package fusefs
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // The dynamic loader is executed by the kernel for every dynamically linked
 // program. Trapping it would make every local program unrunnable, which is
@@ -22,3 +26,37 @@ func TestLoaderIsNeverTrapped(t *testing.T) {
 		}
 	}
 }
+
+// Redirection belongs to the directories where the allowlist lives. A +x file
+// in a normal tree is data that happens to be executable, and replacing it with
+// the trampoline would hand an agent binary bytes where it expected a script.
+func TestTrapOnlyInsideExecDirs(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "script.sh")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lay := &Layout{
+		Local:      stubLocalForTrap{},
+		Trampoline: filepath.Join(dir, "tramp"),
+		LocalExec:  func(string) bool { return false }, // nothing is allowlisted
+	}
+	n := &Node{lay: lay, path: dir}
+
+	// No ExecDirs: the file is data and must pass through.
+	if _, ok := n.trapFor(exe); ok {
+		t.Fatal("data file outside an exec dir was redirected")
+	}
+	// Same file, now inside a policy directory: the policy decides, so it is
+	// redirected.
+	lay.ExecDirs = []string{dir}
+	if _, ok := n.trapFor(exe); !ok {
+		t.Fatal("executable in an exec dir was not redirected")
+	}
+}
+
+type stubLocalForTrap struct{}
+
+func (stubLocalForTrap) IsLocal(string) bool  { return true }
+func (stubLocalForTrap) Writable(string) bool { return true }
+func (stubLocalForTrap) Roots() []string      { return nil }

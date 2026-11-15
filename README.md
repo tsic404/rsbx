@@ -169,3 +169,55 @@ arguments) without starting anything.
   outside the FUSE root could still run locally.
 * **The daemon trusts the client.** It executes whatever argv it receives;
   it is a remote shell, not a multi-tenant service.
+
+## Running coding agents inside the sandbox
+
+An agent is an ordinary local program as far as the sandbox is concerned, with
+two consequences worth knowing before configuring one.
+
+**The agent must be on `local.allow`.** It keeps its own state, so it belongs on
+this machine. Anything else runs on the daemon, where `/work` does not exist.
+
+**The tools a redirected command needs must be local too.** This is the part
+that surprises people: `ls`, `stat` and `cat` are not special. If they are not
+allowed locally they run on the daemon, and a daemon-side `stat` of a local
+tree reports `No such file or directory`. Listing the coreutils you use is what
+makes an agent's own file inspection work:
+
+```toml
+[local]
+allow = ["/usr/bin/bash", "/usr/bin/ls", "/usr/bin/stat", "/usr/bin/cat",
+         "/usr/bin/grep", "/usr/bin/find", "/usr/bin/wc", "/usr/bin/mkdir",
+         "/usr/bin/timeout", "/usr/local/bin/codex", "/usr/local/bin/claude"]
+paths = ["/work", "/home/me/.codex", "/home/me/.claude"]
+```
+
+The same rule explains the small warning a static agent may print on start-up:
+a redirected helper fails, and the agent continues without it.
+
+Redirection is deliberately limited to the directories where the allowlist
+lives. A data file that merely has the execute bit set — a script in a project
+tree, a `chmod +x` text file — passes through untouched, so an agent reading its
+own files never receives the trampoline by accident.
+
+Verified in the container image, with the daemon serving a remote tree:
+
+```console
+=== agents reachable and local ===
+320186856 /e2e/agents/codex
+=== codex runs ===
+codex-cli 0.167.1
+=== agent sees the REMOTE project ===
+README.md calc.py
+=== agent writes to the remote tree ===
+written-by-agent
+```
+
+The agent binary is the host file (its real size), the project it edits is the
+daemon's, and the write lands in the daemon tree.
+
+An agent that is dynamically linked against a libc the image does not ship
+cannot start, whatever the sandbox does about it: the failure is
+`cannot execute: required file not found`, reported by the kernel when the ELF
+interpreter is missing. That is a packaging property of the agent, not a
+sandbox setting.

@@ -67,6 +67,8 @@ type Layout struct {
 	// Synthetic lists paths that exist only as mount points (bwrap needs to
 	// create them), e.g. "/proc", "/dev", "/tmp".
 	Synthetic []string
+	// SyntheticFiles are mount points that are files, e.g. the guard binary.
+	SyntheticFiles []string
 	// HostDirs is the closure of the local trees over parent directories, so a
 	// tree such as /usr/bin still implies a visible /usr.
 	HostDirs map[string]bool
@@ -188,6 +190,17 @@ func (n *Node) writable(p string) bool {
 	return n.lay.Local.Writable(p)
 }
 
+// isSyntheticFile reports whether p is a file the sandbox reserves as a bind
+// target. It must appear to exist without being created on the daemon.
+func (n *Node) isSyntheticFile(p string) bool {
+	for _, f := range n.lay.SyntheticFiles {
+		if p == f {
+			return true
+		}
+	}
+	return false
+}
+
 // isSyntheticDir reports whether p is exactly a sandbox-provided mount point.
 // Children of a synthetic directory are not automatic: only Create() may make
 // them, and only as placeholders for a bind mount.
@@ -230,15 +243,16 @@ func (n *Node) trapFor(p string) (string, bool) {
 	if isLoader(p) {
 		return "", false
 	}
-	host, ok := n.hostRoot(p)
-	if !ok {
-		if !n.isExecDir(p) {
-			return "", false
-		}
-		// A name inside an exec-policy directory lives at the same path on the
-		// host; that is what the policy is deciding about.
-		host = p
+	// Redirection applies only where the policy decides between names: an
+	// exec-policy directory. A data file that merely happens to be executable
+	// (a chmod 777 text file, a script inside a project tree) is not a program
+	// the policy spoke about, and must pass through untouched. Without this an
+	// agent reading a +x file from its own tree would silently receive the
+	// trampoline binary.
+	if !n.isExecDir(p) {
+		return "", false
 	}
+	host := p
 	fi, err := os.Lstat(host)
 	if err != nil || !fi.Mode().IsRegular() || fi.Mode()&0o111 == 0 {
 		return "", false
@@ -315,7 +329,13 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (in 
 		child := &Node{lay: n.lay, path: p}
 		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: fmode, Ino: ino(p)}), 0
 	}
-	// 3. exact mount point provided by the sandbox
+	// 3. a reserved file mount point (the guard and trampoline binaries)
+	if n.isSyntheticFile(p) {
+		out.Attr = attrOf(proto.SIFREG|0o600, 0, ino(p))
+		child := &Node{lay: n.lay, path: p}
+		return n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)}), 0
+	}
+	// 4. exact mount point provided by the sandbox
 	if n.isSyntheticDir(p) {
 		out.Attr = attrOf(proto.SIFDIR|0o755, 0, ino(p))
 		child := &Node{lay: n.lay, path: p}
@@ -442,6 +462,11 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 			push(path.Base(d), proto.SIFDIR|0o755)
 		}
 	}
+	for _, f := range n.lay.SyntheticFiles {
+		if path.Dir(f) == n.path {
+			push(path.Base(f), proto.SIFREG|0o600)
+		}
+	}
 	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
 	return fs.NewListDirStream(ents), 0
 }
@@ -499,6 +524,10 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 	}
 	if target, ok := n.lay.SystemLinks[n.path]; ok {
 		out.Attr = attrOf(proto.SIFLNK|0o777, uint64(len(target)), ino(n.path))
+		return 0
+	}
+	if n.isSyntheticFile(n.path) {
+		out.Attr = attrOf(proto.SIFREG|0o600, 0, ino(n.path))
 		return 0
 	}
 	if n.phantom {
@@ -785,6 +814,14 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 			return nil, nil, 0, syscall.EROFS
 		}
 		return n.createLocal(ctx, host, name, flags, mode, out)
+	}
+	// A reserved file mount point is created as a placeholder: bwrap replaces
+	// it with the real bind, and nothing may reach the daemon's tree.
+	if n.isSyntheticFile(p) {
+		out.Attr = attrOf(proto.SIFREG|0o600, 0, ino(p))
+		child := &Node{lay: n.lay, path: p, phantom: true}
+		inode := n.NewPersistentInode(ctx, child, fs.StableAttr{Mode: syscall.S_IFREG, Ino: ino(p)})
+		return inode, &handle{path: p, lay: n.lay}, 0, 0
 	}
 	// Mount points inside synthetic dirs are placeholders: bwrap replaces
 	// them with the real bind mount, so they must exist but hold no data.
