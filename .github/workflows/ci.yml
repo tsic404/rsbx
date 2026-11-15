@@ -190,7 +190,7 @@ jobs:
               cat > /e2e/state/config.toml <<CFG
               [daemon]
               transport = "unix"
-              socket = "/.rsbx-rpc/daemon.sock"
+              socket = "/run/rsbx/daemon.sock"
 
               [local]
               allow = []
@@ -241,7 +241,7 @@ jobs:
           cat > e2e/probe.toml <<'CFG'
           [daemon]
           transport = "unix"
-          socket = "/.rsbx-rpc/daemon.sock"
+          socket = "/run/rsbx/daemon.sock"
 
           [local]
           # The workload drives ordinary shell utilities; each has to run where
@@ -317,7 +317,7 @@ jobs:
               cat > /e2e/state/cfg/base.toml <<CFG
               [daemon]
               transport = "unix"
-              socket = "/.rsbx-rpc/daemon.sock"
+              socket = "/run/rsbx/daemon.sock"
 
               [local]
               allow = []
