@@ -98,6 +98,8 @@ var _ = (fs.NodeUnlinker)((*Node)(nil))
 var _ = (fs.NodeRenamer)((*Node)(nil))
 var _ = (fs.NodeSetattrer)((*Node)(nil))
 var _ = (fs.FileFlusher)((*handle)(nil))
+var _ = (fs.FileFsyncer)((*handle)(nil))
+var _ = (fs.NodeFsyncer)((*Node)(nil))
 
 // NewRoot builds the root node.
 func NewRoot(l *Layout) *Node {
@@ -602,6 +604,39 @@ func (h *handle) Flush(ctx context.Context) syscall.Errno {
 	return 0
 }
 
+// Fsync is the node-level form, which go-fuse dispatches when a handler
+// implements NodeFsyncer. Both forms exist because the kernel does not
+// distinguish them and go-fuse prefers the file handle.
+func (n *Node) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
+	if h, ok := f.(*handle); ok {
+		return h.Fsync(ctx, flags)
+	}
+	return 0
+}
+
+// Fsync answers the durability request programs actually make. SQLite and
+// every editor that writes a file then fsyncs rely on it; without an
+// implementation the kernel answers ENOTSUP, which agents report as
+// "EIO: i/o error, write" and retry forever.
+func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	if h.f == nil {
+		return 0
+	}
+	if h.remote != "" {
+		// A remote write is already applied on the daemon side, one operation
+		// per write; there is no local buffer left to flush.
+		return 0
+	}
+	if err := h.f.Sync(); err != nil {
+		switch {
+		case errors.Is(err, syscall.EINVAL), errors.Is(err, syscall.ENOTSUP):
+			return 0
+		}
+		return errnoOf(err.Error())
+	}
+	return 0
+}
+
 // Release flushes a modified remote file back to the daemon.
 //
 // Two processes can hold the same path at once: a local one going through this
@@ -646,17 +681,18 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if writes && !n.writable(n.path) {
 			return nil, 0, syscall.EROFS
 		}
-		var f *os.File
-		var err error
 		openFlags := flags
 		if !writes {
 			openFlags = uint32(os.O_RDONLY)
 		}
-		f, err = os.OpenFile(host, int(openFlags), 0)
+		f, err := os.OpenFile(host, int(openFlags), 0)
 		if err != nil {
 			return nil, 0, errnoOf(err.Error())
 		}
-		return &handle{f: f, path: n.path, lay: n.lay}, 0, 0
+		return &handle{
+			f: f, path: n.path, lay: n.lay,
+			appendOnly: flags&uint32(os.O_APPEND) != 0,
+		}, 0, 0
 	}
 	// A member of an exec-policy directory is served from the host, and the
 	// policy decides which file that is: the local binary, or the trampoline.
@@ -690,7 +726,10 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if err != nil {
 			return nil, 0, errnoOf(err.Error())
 		}
-		return &handle{f: f, path: n.path, lay: n.lay}, 0, 0
+		return &handle{
+			f: f, path: n.path, lay: n.lay,
+			appendOnly: flags&uint32(os.O_APPEND) != 0,
+		}, 0, 0
 	}
 	// Every O_APPEND open, create or not, streams appends to the daemon: the
 	// kernel may reuse an inode and skip CREATE entirely for the second
@@ -778,6 +817,9 @@ func (n *Node) Write(ctx context.Context, f fs.FileHandle, data []byte, off int6
 	if !ok {
 		return 0, syscall.EBADF
 	}
+	if h.f == nil && h.remote == "" {
+		return 0, syscall.EIO
+	}
 	// Remote files are never written locally. Two writers can hold the same
 	// path, and a local copy would replay stale bytes over the daemon's disk.
 	if h.remote != "" {
@@ -787,14 +829,21 @@ func (n *Node) Write(ctx context.Context, f fs.FileHandle, data []byte, off int6
 			req.Arg = itoa(uint64(off))
 		}
 		if _, err := h.lay.Remote.Do(req); err != nil {
-			if os.Getenv("RSBX_FUSE_DEBUG") != "" {
-				log.Printf("rsbx: write %s failed: %v", h.path, err)
-			}
 			return 0, syscall.EIO
 		}
 		return uint32(len(data)), 0
 	}
-	cnt, err := h.f.WriteAt(data, off)
+	// A file opened with O_APPEND rejects WriteAt outright; its writes must go
+	// through Write, which the kernel positions at the end. Agents open their
+	// own logs and transcripts that way, so this is the common case, not an
+	// edge one.
+	var cnt int
+	var err error
+	if h.appendOnly {
+		cnt, err = h.f.Write(data)
+	} else {
+		cnt, err = h.f.WriteAt(data, off)
+	}
 	if err != nil {
 		return 0, errnoOf(err.Error())
 	}
@@ -951,6 +1000,15 @@ func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		}
 		if err := os.Rename(from, to); err != nil {
 			return errnoOf(err.Error())
+		}
+		// The inode for the moved file keeps the old path, and an open that
+		// still references it would resolve against a name that no longer
+		// exists. Repoint it at the destination: an atomic write (create temp,
+		// rename, reopen) otherwise fails on the reopen with ENOENT.
+		if child := n.GetChild(name); child != nil {
+			if moved, ok := child.Operations().(*Node); ok {
+				moved.path = to
+			}
 		}
 		return 0
 	}
