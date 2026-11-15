@@ -172,12 +172,14 @@ jobs:
       - name: persistence probes
         if: always()
         run: |
+          # A previous run may have left root-owned files from the container.
+          sudo rm -rf e2e || true
           mkdir -p e2e/probes e2e/state e2e/tree
           # Built on the runner: the image carries no compiler, and the probes
           # are static so they can run inside it either way.
           gcc -static -O1 -o e2e/probes/atomic_write testdata/probe/atomic_write.c
           gcc -static -O1 -o e2e/probes/durable_write testdata/probe/durable_write.c
-          chmod -R 777 e2e
+          chmod 777 e2e e2e/probes e2e/state e2e/tree
           cat > e2e/probe.toml <<'CFG'
           [daemon]
           transport = "unix"
@@ -185,7 +187,7 @@ jobs:
 
           [local]
           allow = ["/usr/bin/bash", "/e2e/probes"]
-          paths = ["/e2e/state"]
+          paths = ["/e2e/state", "/e2e/probes"]
           read_only_paths = ["/usr/bin", "/usr/lib", "/usr/share", "/etc", "/sys", "/dev", "/proc"]
           entry = "/usr/bin/bash"
 
