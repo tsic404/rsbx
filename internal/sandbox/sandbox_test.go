@@ -239,7 +239,7 @@ func TestLandlockLoaderListCoversEveryLayout(t *testing.T) {
 	for _, want := range []string{
 		"/usr/lib/ld-musl-x86_64.so.1", // alpine's only real musl loader
 		"/usr/lib/ld-musl-aarch64.so.1",
-		"/lib/ld-musl-x86_64.so.1",  // the link Debian-style images use
+		"/lib/ld-musl-x86_64.so.1", // the link Debian-style images use
 		"/lib64/ld-linux-x86-64.so.2",
 		"/usr/lib/ld-linux-x86-64.so.2",
 	} {
