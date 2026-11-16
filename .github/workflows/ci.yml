@@ -206,7 +206,13 @@ jobs:
             --entrypoint /bin/bash rsbx:ci -c '
               cp /cfg/config.toml /e2e/state/config.toml
               mkdir -p /e2e/state/sandbox /e2e/state/cache
-              rsbx -config /e2e/state/config.toml -- /bin/sh -c "true"
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                if rsbx -config /e2e/state/config.toml -- /bin/sh -c "cat /proj/remote.txt" >/dev/null 2>&1; then
+                  echo "run $i ok"
+                else
+                  echo "run $i FAILED"
+                fi
+              done
               rsbx -config /e2e/state/config.toml -- /bin/sh -c "
                 echo \"remote file: \$(cat /proj/remote.txt)\"
                 test \"\$(cat /proj/remote.txt)\" = REMOTE-MARKER
