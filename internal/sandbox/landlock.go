@@ -25,10 +25,19 @@ func LandlockRuleset(paths []string) (int, error) {
 		return 0, fmt.Errorf("landlock_create_ruleset: %w", errno)
 	}
 	ruleset := int(fd)
-	for _, p := range append(append([]string(nil), paths...), loaderPaths()...) {
+	all := append(append([]string(nil), paths...), loaderPaths()...)
+	granted := 0
+	for _, p := range all {
 		if err := addPathBeneath(ruleset, p); err != nil {
 			unix.Close(ruleset)
 			return 0, err
+		}
+		granted++
+	}
+	if os.Getenv("RSBX_LANDLOCK_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "rsbx-diag: ruleset installed: %d paths granted of %d tried\n", granted, len(all))
+		for _, p := range paths {
+			fmt.Fprintf(os.Stderr, "rsbx-diag:   policy path: %s\n", p)
 		}
 	}
 	return ruleset, nil
