@@ -202,17 +202,10 @@ jobs:
           docker run --rm --privileged --user 0 --network rsbx-e2e \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             -v "$PWD/e2e/client-state:/cfg:ro" \
-            -e RSBX_LANDLOCK_TRACE=1 \
             --entrypoint /bin/bash rsbx:ci -c '
               cp /cfg/config.toml /e2e/state/config.toml
               mkdir -p /e2e/state/sandbox /e2e/state/cache
-              echo "=== the config under test:"; cat /e2e/state/config.toml
-              echo "=== what the loader paths look like here:"
-              for p in /lib/ld-linux-x86-64.so.2 /lib/ld-musl-x86_64.so.1 /bin/sh /usr/bin/dash; do
-                printf "%s -> " "$p"; readlink -f "$p" 2>/dev/null || echo absent
-              done
-              echo "=== start a shell with no work:"
-              rsbx -config /e2e/state/config.toml -- /bin/sh -c "echo START_OK" || echo "START_FAILED rc=$?"
+              rsbx -config /e2e/state/config.toml -- /bin/sh -c "true"
               rsbx -config /e2e/state/config.toml -- /bin/sh -c "
                 echo \"remote file: \$(cat /proj/remote.txt)\"
                 test \"\$(cat /proj/remote.txt)\" = REMOTE-MARKER
@@ -273,13 +266,12 @@ jobs:
           docker run --rm --privileged --user 0 --network rsbx-e2e \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             -v "$PWD/e2e/probe.toml:/e2e/probe.toml:ro" \
-            -e RSBX_LANDLOCK_TRACE=1 \
             --entrypoint /bin/bash rsbx:ci -c '
               mkdir -p /e2e/state/sandbox /e2e/state/cache
-              echo "=== landlock grants for this config:"
-              cat /e2e/probe.toml
-              echo "=== can the session start at all:"
-              rsbx -config /e2e/probe.toml -- /bin/sh -c "echo START_OK" || echo "START_FAILED rc=$?"
+              # The sandbox has to start before any check means anything: a
+              # failed entry would otherwise be read as one of the probes
+              # failing.
+              rsbx -config /e2e/probe.toml -- /bin/sh -c "true"
 
               rsbx -config /e2e/probe.toml -- /bin/sh -c "
                 echo \"=== atomic write (create, rename, reopen) ===\"

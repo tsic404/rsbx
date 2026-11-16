@@ -78,6 +78,13 @@ func loaderPaths() []string {
 		"/lib/ld-musl-aarch64.so.1",
 		"/usr/lib/ld-linux-x86-64.so.2",
 		"/usr/lib64/ld-linux-x86-64.so.2",
+		// Alpine keeps /lib and /lib64 as symlinks into /usr/lib, so the
+		// loader's only real path is the one below. With just the link,
+		// opening it in the sandbox view answers ENOENT and the grant is
+		// dropped, which then refuses the entry with EACCES.
+		"/usr/lib/ld-musl-x86_64.so.1",
+		"/usr/lib/ld-musl-aarch64.so.1",
+		"/usr/lib64/ld-linux-x86-64.so.2",
 	}
 	// Debian and Ubuntu keep the loader under a multiarch directory, which
 	// cannot be enumerated without knowing the triplet.

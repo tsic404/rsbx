@@ -222,3 +222,30 @@ func TestPathDirsAreArbitrated(t *testing.T) {
 		}
 	}
 }
+
+// The loader the kernel runs on behalf of every dynamically linked program has
+// to be granted by the path it really has. Alpine keeps /lib and /lib64 as
+// symlinks into /usr/lib, so /lib/ld-musl-x86_64.so.1 is only a link: opening
+// it in the sandbox view answers ENOENT, the grant is dropped, and the entry is
+// then refused with "exec /bin/sh: permission denied" — which named neither the
+// loader nor the grant. A list of links alone passed on Debian and failed on
+// the alpine-based image.
+func TestLandlockLoaderListCoversEveryLayout(t *testing.T) {
+	list := loaderPaths()
+	have := map[string]bool{}
+	for _, p := range list {
+		have[p] = true
+	}
+	for _, want := range []string{
+		"/usr/lib/ld-musl-x86_64.so.1", // alpine's only real musl loader
+		"/usr/lib/ld-musl-aarch64.so.1",
+		"/lib/ld-musl-x86_64.so.1",  // the link Debian-style images use
+		"/lib64/ld-linux-x86-64.so.2",
+		"/usr/lib/ld-linux-x86-64.so.2",
+	} {
+		if !have[want] {
+			t.Errorf("loader path %s is not granted: a program linked against it "+
+				"would be refused with EACCES that names nothing", want)
+		}
+	}
+}
