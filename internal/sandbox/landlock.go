@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -43,6 +44,9 @@ func addPathBeneath(ruleset int, path string) error {
 		// allowlist, and the entry program was then refused by the kernel with
 		// EACCES that pointed at nothing.
 		if err == unix.ENOENT || err == unix.ENOTDIR {
+			if os.Getenv("RSBX_LANDLOCK_TRACE") != "" {
+				fmt.Fprintf(os.Stderr, "rsbx-diag: grant dropped path=%s err=%v\n", path, err)
+			}
 			return nil
 		}
 		return fmt.Errorf("landlock grant %s: %w", path, err)
