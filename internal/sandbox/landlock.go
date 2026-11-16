@@ -119,11 +119,15 @@ var _ = strings.HasPrefix
 // is believed.
 func openForRule(path string) (int, error) {
 	var err error
-	for attempt := 0; attempt < 12; attempt++ {
+	deadline := time.Now().Add(5 * time.Second)
+	for attempt := 0; ; attempt++ {
 		var fd int
 		fd, err = unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
 		if err == nil {
 			return fd, nil
+		}
+		if time.Now().After(deadline) {
+			break
 		}
 		// ENOENT is retried like any other error. The path is read through the
 		// sandbox filesystem, which answers "no such file" for a moment while a
@@ -134,7 +138,11 @@ func openForRule(path string) (int, error) {
 		//
 		// The delay grows, because the window is a directory being built rather
 		// than a lost race: the second attempt is what most sessions need.
-		time.Sleep(time.Duration(attempt+1) * 4 * time.Millisecond)
+		d := time.Duration(attempt+1) * 4 * time.Millisecond
+		if d > 100*time.Millisecond {
+			d = 100 * time.Millisecond
+		}
+		time.Sleep(d)
 	}
 	return -1, err
 }
