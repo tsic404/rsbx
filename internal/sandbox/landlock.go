@@ -2,7 +2,6 @@ package sandbox
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,18 +25,10 @@ func LandlockRuleset(paths []string) (int, error) {
 	}
 	ruleset := int(fd)
 	all := append(append([]string(nil), paths...), loaderPaths()...)
-	granted := 0
 	for _, p := range all {
 		if err := addPathBeneath(ruleset, p); err != nil {
 			unix.Close(ruleset)
 			return 0, err
-		}
-		granted++
-	}
-	if os.Getenv("RSBX_LANDLOCK_TRACE") != "" {
-		fmt.Fprintf(os.Stderr, "rsbx-diag: ruleset installed: %d paths granted of %d tried\n", granted, len(all))
-		for _, p := range paths {
-			fmt.Fprintf(os.Stderr, "rsbx-diag:   policy path: %s\n", p)
 		}
 	}
 	return ruleset, nil
@@ -53,9 +44,6 @@ func addPathBeneath(ruleset int, path string) error {
 		// allowlist, and the entry program was then refused by the kernel with
 		// EACCES that pointed at nothing.
 		if err == unix.ENOENT || err == unix.ENOTDIR {
-			if os.Getenv("RSBX_LANDLOCK_TRACE") != "" {
-				fmt.Fprintf(os.Stderr, "rsbx-diag: grant dropped path=%s err=%v\n", path, err)
-			}
 			return nil
 		}
 		return fmt.Errorf("landlock grant %s: %w", path, err)
