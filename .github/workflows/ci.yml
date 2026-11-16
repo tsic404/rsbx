@@ -202,17 +202,22 @@ jobs:
           docker run --rm --privileged --user 0 --network rsbx-e2e \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             -v "$PWD/e2e/client-state:/cfg:ro" \
-            -e RSBX_LANDLOCK_TRACE=1 \
             --entrypoint /bin/bash rsbx:ci -c '
               cp /cfg/config.toml /e2e/state/config.toml
               mkdir -p /e2e/state/sandbox /e2e/state/cache
+              # Starting a session has to work every time, not most of the
+              # time: a refusal here is the whole sandbox failing to open, and
+              # one flaky start is not something a caller can work around.
+              started=0
               for i in 1 2 3 4 5 6 7 8 9 10; do
                 if rsbx -config /e2e/state/config.toml -- /bin/sh -c "cat /proj/remote.txt" >/dev/null 2>&1; then
-                  echo "run $i ok"
+                  started=$((started+1))
                 else
-                  echo "run $i FAILED"
+                  echo "start $i refused"
                 fi
               done
+              echo "sessions started: $started/10"
+              test "$started" -eq 10
               rsbx -config /e2e/state/config.toml -- /bin/sh -c "
                 echo \"remote file: \$(cat /proj/remote.txt)\"
                 test \"\$(cat /proj/remote.txt)\" = REMOTE-MARKER
