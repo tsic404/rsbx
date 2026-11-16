@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -41,7 +42,11 @@ func LandlockRuleset(paths []string) (int, error) {
 }
 
 func addPathBeneath(ruleset int, path string, deadline time.Time) error {
+	start := time.Now()
 	fd, err := openForRule(path, deadline)
+	if os.Getenv("RSBX_LANDLOCK_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "rsbx-diag: grant path=%s took=%v err=%v\n", path, time.Since(start).Round(time.Millisecond), err)
+	}
 	if err != nil {
 		// A path that is genuinely absent cannot be executed either, so
 		// skipping it keeps one missing entry from disabling the whole sandbox.
