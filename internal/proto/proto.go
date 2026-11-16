@@ -235,8 +235,10 @@ func (d *Dec) Raw(n int) []byte {
 	return b
 }
 
-// ExecReq asks the daemon to run argv.
+// ExecReq asks the daemon to execute Target with an independently supplied argv.
+// Target is not inferred from argv[0]: exec callers may choose that string.
 type ExecReq struct {
+	Target     string
 	Argv       []string
 	Env        []string
 	Dir        string
@@ -246,7 +248,7 @@ type ExecReq struct {
 
 func (r *ExecReq) Encode() []byte {
 	var e Enc
-	e.U8(1)
+	e.U8(2)
 	if r.TTY {
 		e.U8(1)
 	} else {
@@ -255,6 +257,7 @@ func (r *ExecReq) Encode() []byte {
 	e.U16(r.Rows)
 	e.U16(r.Cols)
 	e.Str(r.Dir)
+	e.Str(r.Target)
 	e.U32(uint32(len(r.Argv)))
 	for _, a := range r.Argv {
 		e.Str(a)
@@ -268,10 +271,13 @@ func (r *ExecReq) Encode() []byte {
 
 func DecodeExecReq(p []byte) (*ExecReq, error) {
 	d := &Dec{B: p}
-	_ = d.U8()
+	if version := d.U8(); version != 2 {
+		return nil, fmt.Errorf("unsupported exec protocol version %d", version)
+	}
 	r := &ExecReq{TTY: d.U8()&1 != 0}
 	r.Rows, r.Cols = d.U16(), d.U16()
 	r.Dir = d.Str()
+	r.Target = d.Str()
 	n := int(d.U32())
 	for i := 0; i < n && d.Err == nil; i++ {
 		r.Argv = append(r.Argv, d.Str())
@@ -282,6 +288,12 @@ func DecodeExecReq(p []byte) (*ExecReq, error) {
 	}
 	if d.Err != nil {
 		return nil, d.Err
+	}
+	if r.Target == "" || len(r.Argv) == 0 {
+		return nil, fmt.Errorf("exec request requires an executable target and argv")
+	}
+	if d.Off != len(p) {
+		return nil, fmt.Errorf("exec request contains trailing payload bytes")
 	}
 	return r, nil
 }

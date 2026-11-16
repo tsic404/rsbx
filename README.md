@@ -21,14 +21,15 @@ $ rsbx                       # drop into the sandbox shell
 **Where does it run?** Decided by `local.allow`, on the absolute path of the
 executable. The default is empty: only `local.entry` (`/bin/sh`) runs locally.
 Every other command — including `ls`, `cat` and a coding agent you did not
-list — executes on the daemon. Nothing about `/usr/bin` or a library tree is
-implicitly local.
+list — executes on the daemon. A directory or glob allow entry is expanded
+once into an exact startup snapshot of the executables that exist then; it is
+not a prefix grant for code created later.
 
 **Whose files does it see?** Decided by `local.paths` and
 `local.read_only_paths`, on the absolute path being opened. Both default to
-empty: outside an explicit local tree, the client's ordinary filesystem
-answers come from the daemon, and the only host bytes that may be read are the
-allowed executable itself.
+empty: outside an explicit local tree, ordinary filesystem answers come from
+the daemon. Exact selected programs and their verified runtime dependencies
+are read-only host exceptions.
 
 The two lists are independent, and that is the point: a local program reads
 both the local trees and (through the sandbox filesystem) the daemon tree,
@@ -48,50 +49,54 @@ while a program running on the daemon only ever sees the native remote tree.
 ```mermaid
 flowchart TB
   subgraph client["your machine"]
-    shell["shell (local entry)"]
-    fuse["FUSE root<br/>daemon tree + explicit local trees<br/>+ trampolines"]
-    launch["self-reexec launcher<br/>namespaces, root switch,<br/>capabilities, Landlock"]
-    tramp["rsbx-tramp<br/>static, served as every<br/>non-allowlisted name"]
-    broker["transport broker<br/>relay socket, outside the root"]
-    shell -- "open /proj/x.c" --> fuse
-    shell -- "exec ls" --> tramp
-    fuse -. "pivot into the view" .- launch
-    launch --> shell
-    broker --- fuse
+    controller["rsbx controller<br/>session ownership, cancellation,<br/>daemon preflight"]
+    worker["filesystem worker<br/>daemon tree + exact native assets<br/>+ explicit local trees"]
+    init["PID 1 launcher<br/>namespaces, exec tracing,<br/>descendant cleanup"]
+    entry["local entry / multica / agent"]
+    gateway["native rsbx-tramp gateway<br/>one immutable request"]
+    broker["private command relay"]
+    controller --> worker
+    controller --> init
+    init --> entry
+    entry -- "file IO" --> worker
+    entry -- "execve/execveat" --> init
+    init -- "allowed" --> entry
+    init -- "not allowed: route" --> gateway
+    gateway --> broker
   end
   subgraph remote["daemon host"]
-    d["rsbxd<br/>executes argv on its own /"]
-    tree[("the daemon's filesystem<br/>no jail, no root prefix")]
+    d["rsbxd<br/>file and command RPC"]
+    tree[("daemon's native filesystem<br/>no jail, no root prefix")]
     d --> tree
   end
-  fuse == "fs frames" ==> d
-  tramp == "exec session" ==> d
+  worker == "fs frames" ==> d
+  broker == "exec session" ==> d
 ```
 
-Four mechanisms, each independently sufficient for its own job:
+Six mechanisms, each with one owner:
 
-1. **Native daemon view.** `rsbxd` runs commands directly on the machine it
-   runs on. There is no `-root`, no alternate root, no mount jail: the daemon's
-   working directory, `/proc`, `/dev` and the project tree are its own. That is
-   why no path translation exists anywhere in the system.
-2. **Trampolines.** The sandbox's `/usr/bin/ls` *is* a small static binary, not
-   the host `ls`. Executing it asks the daemon to run `ls`. Because the host
-   file is not reachable under that name at all, this works for statically
-   linked programs and for execs that bypass libc.
-3. **Union filesystem.** The sandbox root is a FUSE mount: paths not claimed by
-   an explicit local tree are answered over the wire by the daemon, and
-   executable names are resolved through the policy.
-4. **Landlock (backstop).** The launcher installs an exec allowlist inside the
-   sandbox, so an exec that somehow skips the trampoline is refused by the
-   kernel rather than silently running a host binary.
-
-The client enters its own fixed layout without an external helper: it
-re-executes itself before ordinary CLI parsing, asks the kernel for new IPC,
-UTS and (when configured) network and user namespaces, takes a private mount
-namespace, mounts the FUSE root, provides its own `/proc` and a minimal
-`/dev`, pivots, detaches the old root, clears capabilities, sets
-`no_new_privs`, installs Landlock and runs the entry as a reaped child. Setup
-fails closed: a kernel that refuses a step is an error, never a weaker sandbox.
+1. **Native daemon view.** `rsbxd` runs commands on its own machine. There is
+   no root rewrite or mount jail: its `/proj` is the project tree.
+2. **Immutable file sources.** A FUSE inode's source is chosen when it is
+   resolved: daemon bytes, one exact native executable/runtime asset, or an
+   explicit local tree. Project executables and project `.so` files stay
+   remote bytes; reading them never substitutes a helper.
+3. **Exec supervision.** The namespace's PID 1 traces `execve`/`execveat` for
+   every descendant, including PATH, absolute, relative and project paths.
+   An exact compiled local asset runs here; every other named executable is
+   handed to a native gateway. Landlock refuses any remaining direct path.
+4. **Verified local runtime.** A locally selected program runs from a
+   controller-pinned immutable snapshot with the interpreter and library
+   dependencies compiled for it. Runtime paths are dependencies, never a
+   separate command allowlist.
+5. **Private command gateway.** An intercepted remote exec carries target,
+   argv, cwd, environment, TTY, signals and exit status to the daemon. The
+   supervisor authenticates the gateway process; argv[0] cannot replace the
+   executable target.
+6. **Owned lifecycle.** Every invocation owns its mount, cache, broker,
+   connections and process tree. Cancellation closes those resources first;
+   PID 1 kills and reaps traced descendants, including children that changed
+   process groups.
 
 ### The local runtime, and what is *not* local
 
@@ -103,22 +108,25 @@ that does not come over the wire.
 Everything else is explicit:
 
 * no private `/tmp`: `/tmp` is whatever the daemon says it is;
-* no implicit `/etc`, `/usr/lib`, `/lib`, `/lib64` or merged-`/usr` host
-  symlinks;
+* no implicit host directory tree: only exact runtime assets and their
+  structural aliases are compiled for the selected local programs;
 * no host `$HOME/.ssh` and no automatic SSH binary: the SSH client and the
   credentials used by the `ssh` transport stay outside the sandbox, and only a
   private relay socket is bound at the reserved `/.rsbx-rpc`.
 
-A local program's own shared objects are mapped at exec time through the
-sandbox, because the loader runs then; that is the executable bytes the policy
-allows, not arbitrary host data that merely sits next to it.
+ELF interpreters, shared libraries and shebang interpreter chains are resolved
+before startup. Unresolvable assets fail explicitly. Extra package data and
+dynamic plugins require explicit read-only resource paths; runtime dependencies
+do not authorize independent interpreter invocations.
 
 ## Requirements
 
-* Linux ≥ 5.13 for Landlock (older kernels degrade to trampoline-only).
-* `fusermount3` and unprivileged user namespaces.
-* No external sandbox helper: bubblewrap is not used and not needed.
-* Go ≥ 1.24 to build.
+* Linux ≥ 5.13 for Landlock and the architecture's ptrace exec tracing on
+  amd64/arm64. There is no silent weaker execution mode.
+* `fusermount3` and the required mount/PID namespaces; nested user namespaces
+  can be disabled explicitly inside an existing container user namespace.
+* Go ≥ 1.24. Build client, daemon and helpers together: execution wire version
+  2 separates the executable target from argv[0] and rejects old records.
 
 ## Build
 
@@ -158,32 +166,37 @@ CI below.
 |---|---|
 | `test` | gofmt, `go vet`, `go build`, `go test -race ./...` |
 | `binaries` | all four build statically and report a version |
-| `docker` | the image builds, a real FUSE mount passes the filesystem tests, and a client drives a daemon in a **separate disposable container** whose `/proj` is a mounted test volume |
+| `docker` | the image builds, a real FUSE mount passes the filesystem tests, a client drives a daemon in a **separate disposable container** whose `/proj` is a mounted test volume, and the mixed-placement stand-ins pass: 11 lab checks, 4 stress checks at N concurrent sessions on one shared configuration |
 
-The last job is the only place the sandbox is actually exercised end to end.
-It starts `rsbxd` in its own disposable container with a test volume mounted
-at `/proj` and a socket volume shared with the client, waits for the socket,
-then runs the client in a second container: privileged for `/dev/fuse` and the
-user namespace, with no bind of the project tree — the client's only view of
+The `docker` job is the only place the sandbox is exercised end to end. It
+starts `rsbxd` in its own disposable container with a test volume mounted at
+`/proj` and a socket volume shared with the client, waits for the socket, then
+runs the client in a second container: privileged for `/dev/fuse` and the user
+namespace, with no bind of the project tree — the client's only view of
 `/proj` is the one the daemon serves.
+
+The mixed-placement scripts in `testdata/mixed` drive shell stand-ins for the
+agent CLIs. That gate measures placement and file-source policy; it is not a
+real-agent compatibility test. The real installed binaries are exercised
+separately by `testdata/mixed/real.sh`, which is run where those binaries and
+the sandbox host exist (see its header and `testdata/mixed/README.md`).
 
 On `main` the image is pushed to `ghcr.io/<owner>/rsbx`.
 
 ## Configuration notes
 
-Three things that used to be configuration and no longer are:
-
-* **The daemon root is not a client setting and not a daemon flag.** `rsbxd`
-  runs on its own host; its filesystem is the remote tree. A `[remote]` table
-  is rejected with an error that says so, because there is no root to pass.
-* **No implicit local tree.** `local.allow` defaults to empty (the entry shell
-  is local by definition), and `local.paths` / `local.read_only_paths` default
-  to empty. Listing `/usr/bin`, `/lib` or `/etc` is a deliberate choice, never
-  a default.
-* **`sandbox.cache` is disposable runtime scratch.** The client and its helpers
-  stage transient data there. It is not a snapshot of remote files and nothing
-  is ever served from it: deleting the directory costs the client re-staging,
-  never correctness.
+* **session directories are control resources.** `sandbox.mount` and
+  `sandbox.cache` allocate a unique directory per invocation. Configuring them
+  inside a local content tree is rejected, because that would expose private
+  sockets and mount ownership.
+* **`sandbox.cache` holds disposable per-session scratch plus verified
+  read-only native snapshots.** Local executables are cached by content
+  digest under `exec-assets`; a replacement invalidates the snapshot instead
+  of keeping a stale inode. No remote project file is ever copied there.
+* **`share_network` is explicit-only.** No transport implies it. The `ssh`
+  transport runs outside the sandbox and reaches the daemon through the
+  private broker, so it needs no host networking; agents that call their APIs
+  do.
 
 ## Tests
 
@@ -191,11 +204,10 @@ Three things that used to be configuration and no longer are:
 go test ./...
 ```
 
-The suite pins the decisions that are easy to get silently wrong: which paths
-are local, that the default allowlist is only the entry shell, that a script in
-a project tree is never turned into a trampoline, that a descriptor keeps its
-inode across rename and unlink, and that daemon paths are native absolute
-paths.
+The suite pins the decisions that are easy to get silently wrong: immutable
+file source identity, exact executable/runtime snapshot compilation, private
+session resource ownership, transport cancellation, PID1 descendant cleanup,
+execveat and argv[0]/target identity.
 
 ## Run
 
@@ -207,119 +219,119 @@ rsbx -config ~/.rsbx/config.toml       # on your machine
 Use `rsbx -no-mount` to print the resolved plan (allowlist, mount arguments,
 namespace plan) without starting anything.
 
+### Interactive terminals
+
+An interactive session is a real terminal session, not a pipe dressed up as
+one. The entry shell is given the controlling terminal, and the launcher makes
+its process group the foreground group before the shell reads anything.
+Observed against a live client/daemon pair:
+
+* typed input reaches the local interactive shell and is consumed there;
+* a foreground command and the session's foreground-group handoff both work
+  (a `sleep 30` started in the foreground holds the terminal until it ends);
+* raw-mode `0x03` (Ctrl-C) is delivered as a signal, not as a literal byte, so
+  a shell reports the interrupted child rather than reading `^C`;
+* the shell's previous-status variable reflects that interruption (`130`);
+* the session exits with the entry's own status (a shell that exits `23` makes
+  `rsbx` exit `23`), not with a generic success;
+* the record of this session's terminal settings — termios flags, the `c_cc`
+  control characters and the input/output speeds — is restored exactly on
+  exit, so the caller's terminal is unchanged.
+
+Those runs left no session mount or directory behind. Terminal handling is
+about the session's own descriptors; it is not evidence about any agent or
+credential flow.
+
 ## Limits worth knowing
 
-* **Metadata is cached briefly.** Lookups are answered by the daemon with a
-  short TTL; a file changed on the daemon may stay stale for that window. Data
-  is never cached: opens get real daemon descriptors.
-* **Execution redirection covers policy directories.** A name inside an
-  allowlisted directory that the policy keeps remote resolves to the
-  trampoline, so the daemon runs it. A program in a *plain* path with no allow
-  entry at all is refused by Landlock rather than redirected, because Landlock
-  grants paths and not a syscall hook. Listing the directory in `local.allow`
-  is what makes such a name executable.
-* **Landlock needs a recent kernel.** On older kernels the trampoline is the
-  only guard, and a program that calls `execve` by raw syscall on a host path
-  could still run locally.
-* **Capability dropping depends on the outer runtime.** Inside a privileged
-  rootless container the runtime refuses to narrow the bounding set; the
-  launcher reports the capabilities it could not drop instead of claiming a
-  state the kernel does not have.
-* **The daemon trusts the client.** It executes whatever argv it receives;
-  it is a remote shell, not a multi-tenant service.
+* **File metadata and data follow the daemon.** Entry and attribute caching
+  are disabled (zero timeouts), so a lookup or `stat` is a daemon answer each
+  time; there is no page cache whose reads can outlive a daemon-side
+  replacement. Handles keep their original inode identity across
+  rename/unlink.
+* **Anonymous executable descriptors have no remote pathname.** `execveat`
+  with `AT_EMPTY_PATH` on a deleted or unreachable descriptor fails explicitly;
+  uploading unknown local bytes into a command would violate the boundary
+  instead of proving remote placement. Named descriptors, which resolve to a
+  stable daemon path, route remotely like any other named executable.
+* **The daemon trusts the client.** It executes the authenticated sandbox's
+  gateway requests; it is not a multi-tenant service.
 
 ## Running coding agents inside the sandbox
 
 An agent is an ordinary local program as far as the sandbox is concerned, with
 a few consequences worth knowing before configuring one.
 
-**The agent must be listed in `local.allow`.** It keeps its own state, so it
-belongs on this machine. Anything else runs on the daemon, under the daemon's
-own filesystem.
-
-**A tool belongs on the list only if it must read local content.** The default
-is remote execution, and that is the cheaper path. A tool that runs on the
-daemon cannot see a `local.paths` tree, since the two sides have different
-filesystem views. When such a command fails, the sandbox names the cause
-rather than leaving a bare `ENOENT`:
-
-```
-rsbx: stat ran on the daemon and cannot see the local tree /work/a.txt;
-      add /usr/bin/stat to local.allow to run it here instead
-```
-
-A minimal agent setup lists the agent, the helpers it needs locally, and the
-directories it reads:
+**A tool belongs on the list only if it must read local configuration.** All
+other commands — including bare `git`, a project-local script and a host PATH
+tool — are executed by the daemon. A local agent writes its configuration into
+its explicit tree; no remote command receives that tree.
 
 ```toml
 [local]
-allow = ["/usr/local/bin/codex", "/usr/local/bin/claude"]
-paths = ["/opt/agents",          # where it lives
-         "/home/me/.codex",      # and what it reads
-         "/home/me/.claude"]
-entry = "/bin/sh"
+allow = ["/opt/real/multica", "/opt/real/omp",
+         "/opt/real/codex", "/opt/real/claude"]
+paths = ["/work/agent"]              # configuration/state stays local
+entry = "/bin/sh"                    # trusted entry; remote commands still route
 ```
 
-Everything else — `/usr`, the project tree, the rest of the host — is answered
-by the daemon. The project path itself is the daemon's absolute path: an agent
-told to work in `/proj` opens `/proj` on the daemon, not a translated copy.
+The configured names are startup executable identities, not directory prefixes.
+Their runtime dependencies are resolved and verified with them. `multica` can
+drive remote `git` without naming git in the configuration.
 
-Redirection happens in the directories where programs are looked up, never in a
-project tree. A data file that merely has the execute bit set — a script in a
-project tree, a `chmod +x` text file — passes through untouched, so an agent
-reading its own files never receives the trampoline by accident.
+### What is verified, and where
 
-A name is decided in the directory it is looked up in. The PATH directories —
-`/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/usr/local/bin`, `/usr/local/sbin`
-— are arbitrated per name: a name the allowlist holds runs here, and every other
-name in them runs on the daemon. That is what makes the rule above hold without
-listing anything extra, so a host CLI that shells out to a tool you never
-mention gets the daemon's copy of it.
+`testdata/mixed/lab.sh` and `stress.sh` drive shell stand-ins, not real CLIs.
+They prove placement, file-source and lifecycle policy: lab reports its 11
+checks, stress its 4 checks at N concurrent sessions sharing one
+configuration. They are not evidence of agent compatibility.
 
-```toml
-[local]
-allow = ["/usr/local/bin/multica",   # the host CLI: runs here
-         "/usr/local/bin/omp",       # the agent: runs here
-         "/bin/sh"]
-entry = "/bin/sh"
-paths = ["/work/agent"]              # the agent's own state stays local
-```
+`testdata/mixed/real.sh` is the real-CLI gate. It names seven checks and
+reports one `OK` line each; all seven must pass for the exit status to be
+zero. Run where the installed Multica, OMP, Codex and Claude binaries and a
+live daemon exist, it checks that each binary starts from its
+controller-compiled native snapshot; that the real Multica binary writes and
+reads its own config file (`multica config set/get`, no authentication) inside
+the local tree, with that tree never visible to a remote command; and, through
+a separately named native substrate fixture (`native-proof.c`, built at
+invocation), that project executable bytes are preserved, a custom `argv[0]`
+still routes by target, a named `execveat` descriptor runs remotely, a deleted
+descriptor is refused, a remote `git` clone is visible through the local view,
+and a detached local child and a canceled session are cleaned up.
 
-With that configuration `multica` runs here, `git` runs on the daemon, and the
-code git fetches lands on the daemon's tree: the CLI drives remote work without
-being part of the sandbox. Nothing in this file names git.
+Observed on a Linux amd64 client against a live daemon (client and daemon in
+separate disposable containers), all gates clean with no leftover mount or
+session directory:
 
-One consequence catches people out: a local program cannot create its own
-directories, because `mkdir` is a program and an unlisted program runs on the
-daemon — where the local tree does not exist. Give the agent its configuration
-directory, and list `mkdir` (or `mkdir -p`'s directory) in `local.allow` if the
-agent has to create subdirectories itself:
+* **Real-CLI gate: 7/7.** The four `--version` startups; the real `multica
+  config set/get` round trip, with the proof URL present in the client-side
+  JSON under an isolated local `HOME` and that same path absent from the
+  daemon's view; local-versus-remote split; placement, including a custom
+  `argv[0]` (the daemon's own init answers and the caller's name does not
+  replace the target), a named `execveat` descriptor routed remotely, and a
+  deleted descriptor refused with `EPERM` (no upload, no local fallback);
+  exact project executable and `.so` byte preservation; the remote `git`
+  clone visible through the local view; detached-child cleanup; and
+  canceled-session cleanup.
+* **Mixed-placement stand-ins: lab 11/11, and stress 4/4 at N=16 sessions
+  sharing one configuration file.**
+* **Interactive PTY:** typed input consumed by the local shell, Ctrl-C
+  (`0x03`) as a signal, the shell reporting `130`, `rsbx` exiting with the
+  entry's own status `23`, and termios flags, `c_cc` and speeds restored
+  exactly.
+* **Crash teardown:** `SIGKILL` of the controller after shell boot closed the
+  worker, the terminal reported `EIO`, this session's own mount and cache
+  directories were removed, and a fresh session on the same configuration
+  read the daemon's marker.
+* **Build and unit gates:** the full Go suite with `go vet`, a native Linux
+  amd64 build, and an arm64 cross build.
 
-```console
-$ rsbx -- omp config-write
-omp: cannot create /home/me/.omp/config.toml: Directory nonexistent
-```
+None of this proves authenticated model workflows or plugin loading: no model
+call is made and no existing host credential is touched.
 
-`testdata/mixed` measures exactly this, reading placement from `/proc/1` — the
-init of the machine a process really runs on.
-
-Verified with a separate daemon container serving its own `/proj` — the agent
-binary is local, everything it does to the project is a daemon-side write:
-
-```console
-=== agent reachable and local ===
-320186856 /e2e/agents/codex
-=== codex runs ===
-codex-cli 0.167.1
-=== agent sees the REMOTE project ===
-README.md calc.py
-=== agent writes to the remote tree ===
-written-by-agent
-```
-
-The agent binary is the host file (its real size), the project it edits is the
-daemon's `/proj`, and the write lands on the daemon's disk — checked through a
-session, since the client container never mounted the project.
+Placement in both harnesses is read from `/proc/1/comm` — the init of the
+machine a process really runs on — and compared to the deployment's
+`CLIENT_INIT`/`DAEMON_INIT`, so the kernel's answer is what the check reports.
 
 The sandbox does not paper over a packaging problem: an agent that is
 dynamically linked against a libc neither side ships cannot start, and the

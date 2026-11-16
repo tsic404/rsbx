@@ -1,43 +1,58 @@
 package policy
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
-func TestIsLocal(t *testing.T) {
-	p, err := New([]string{"/usr/bin/bash", "/opt/tools"})
+func TestIsLocalUsesExactExecutableNames(t *testing.T) {
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "tool")
+	if err := os.WriteFile(tool, []byte("program"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New([]string{tool})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cases := []struct {
-		path string
-		want bool
-	}{
-		{"/usr/bin/bash", true},
-		{"/usr/bin/bashful", false}, // prefix must end at a path separator
-		{"/opt/tools/git", true},
-		{"/opt/tools-extra/git", false},
-		{"/usr/bin/ls", false},
-		{"relative/path", false},
+	for _, filename := range []string{tool + "ful", filepath.Join(tool, "child"), dir, "relative/path"} {
+		if p.IsLocal(filename) {
+			t.Errorf("non-exact path %q may execute locally", filename)
+		}
 	}
-	for _, c := range cases {
-		if got := p.IsLocal(c.path); got != c.want {
-			t.Errorf("IsLocal(%q) = %v, want %v", c.path, got, c.want)
+	if !p.IsLocal(tool) {
+		t.Fatal("configured executable is not local")
+	}
+}
+
+func TestGlobExpandsExistingExecutableFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"tool-one", "tool-two"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("program"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, err := New([]string{filepath.Join(dir, "tool-*")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Local) != 2 {
+		t.Fatalf("glob snapshot = %v", p.Local)
+	}
+	for _, filename := range p.ExecPaths() {
+		if !filepath.IsAbs(filename) {
+			t.Errorf("entry is not absolute: %q", filename)
 		}
 	}
 }
 
-func TestGlobExpandsToExistingFiles(t *testing.T) {
-	p, err := New([]string{"/usr/bin/bash*"})
-	if err != nil {
+func TestMissingDependencyFailsPolicyConstruction(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "script")
+	if err := os.WriteFile(file, []byte("#!/nonexistent-rsbx-interpreter\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Local) == 0 {
-		t.Skip("no /usr/bin/bash* on this host")
-	}
-	for _, e := range p.Local {
-		if !IsAbs(e) {
-			t.Errorf("entry is not absolute: %q", e)
-		}
+	if _, err := New([]string{file}); err == nil {
+		t.Fatal("missing shebang interpreter was silently accepted")
 	}
 }
-
-func IsAbs(p string) bool { return len(p) > 0 && p[0] == '/' }

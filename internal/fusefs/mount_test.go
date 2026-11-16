@@ -69,20 +69,26 @@ func mounted(t *testing.T) (mnt, tree string) {
 		// The tree is addressed by its own path inside the sandbox, and the
 		// mount is a separate directory on the host. That is the production
 		// arrangement: the mount point must never sit inside the tree it serves.
-		Local:      viewLocal{prefix: mnt, tree: tree},
-		Trampoline: filepath.Join(base, "tramp"),
-		HostDirs:   hostDirs,
+		Local:    viewLocal{prefix: mnt, tree: tree},
+		HostDirs: hostDirs,
+	}
+	rootNode := NewRoot(lay)
+	if err := rootNode.Err(); err != nil {
+		rootNode.Close()
+		t.Fatal(err)
 	}
 	one := time.Second
-	srv, err := fs.Mount(mnt, NewRoot(lay), &fs.Options{
-		MountOptions: fuse.MountOptions{FsName: "rsbx-test", DisableSplice: true},
-		EntryTimeout: &one,
-		AttrTimeout:  &one,
+	srv, err := fs.Mount(mnt, rootNode, &fs.Options{
+		NullPermissions: true,
+		MountOptions:    fuse.MountOptions{FsName: "rsbx-test", DisableSplice: true},
+		EntryTimeout:    &one,
+		AttrTimeout:     &one,
 	})
 	if err != nil {
+		rootNode.Close()
 		t.Skipf("cannot mount FUSE here: %v", err)
 	}
-	t.Cleanup(func() { srv.Unmount() })
+	t.Cleanup(func() { srv.Unmount(); rootNode.Close() })
 	return mnt, tree
 }
 

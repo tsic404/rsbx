@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"context"
 	"io"
 	"net"
 	"os"
@@ -11,7 +12,7 @@ import (
 )
 
 // broker is a private unix listener that relays every accepted connection to
-// the daemon via rpc.Target.Dial.
+// the daemon via rpc.Target.DialContext.
 //
 // It lives outside the sandbox root. Only its directory is bound in, at
 // BrokerDir, so the trampoline inside reaches the daemon without the host
@@ -21,10 +22,15 @@ import (
 type broker struct {
 	listener net.Listener
 	dir      string
-	target   rpc.Target
+	dial     func(context.Context) (net.Conn, error)
+	ctx      context.Context
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+	closed   bool
+	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
 	once     sync.Once
-	done     chan struct{}
+	closeErr error
 }
 
 // newBroker creates the private relay directory and starts accepting.
@@ -45,7 +51,8 @@ func newBroker(target rpc.Target, dir string) (*broker, error) {
 		ln.Close()
 		return nil, err
 	}
-	b := &broker{listener: ln, dir: dir, target: target, done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	b := &broker{listener: ln, dir: dir, dial: target.DialContext, ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{})}
 	b.wg.Add(1)
 	go b.accept()
 	return b, nil
@@ -64,59 +71,104 @@ func (b *broker) accept() {
 		conn, err := b.listener.Accept()
 		if err != nil {
 			select {
-			case <-b.done:
+			case <-b.ctx.Done():
 				return
 			default:
 				continue
 			}
 		}
-		b.wg.Add(1)
-		go func() {
-			defer b.wg.Done()
-			b.relay(conn)
-		}()
+		b.startRelay(conn)
 	}
 }
 
-// relay pipes one sandbox connection to a fresh daemon connection.
+// startRelay takes ownership before starting the goroutine. Its Add and the
+// closed check share a lock, so Close cannot miss a just-accepted connection.
+func (b *broker) startRelay(client net.Conn) {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		client.Close()
+		return
+	}
+	b.conns[client] = struct{}{}
+	b.wg.Add(1)
+	b.mu.Unlock()
+	go func() {
+		defer b.wg.Done()
+		b.relay(client)
+	}()
+}
+
+func (b *broker) track(conn net.Conn) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return false
+	}
+	b.conns[conn] = struct{}{}
+	return true
+}
+
+func (b *broker) release(conn net.Conn) {
+	conn.Close()
+	b.mu.Lock()
+	delete(b.conns, conn)
+	b.mu.Unlock()
+}
+
+// relay pipes one sandbox connection to its own daemon connection. Normal EOF
+// half-closes the destination; an error closes both streams before joining.
 func (b *broker) relay(client net.Conn) {
-	defer client.Close()
-	upstream, err := b.target.Dial()
+	defer b.release(client)
+	upstream, err := b.dial(b.ctx)
 	if err != nil {
 		return
 	}
-	defer upstream.Close()
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(upstream, client)
-		// Half-close so the daemon sees end-of-request even when the
-		// transport is a command's stdio rather than a real socket.
-		if c, ok := upstream.(interface{ CloseWrite() error }); ok {
-			c.CloseWrite()
+	if !b.track(upstream) {
+		upstream.Close()
+		return
+	}
+	defer b.release(upstream)
+	results := make(chan error, 2)
+	copyStream := func(dst, src net.Conn) {
+		_, err := io.Copy(dst, src)
+		if err == nil {
+			if c, ok := dst.(interface{ CloseWrite() error }); ok {
+				err = c.CloseWrite()
+			}
 		}
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(client, upstream)
-		if c, ok := client.(interface{ CloseWrite() error }); ok {
-			c.CloseWrite()
-		}
-	}()
-	wg.Wait()
+		results <- err
+	}
+	go copyStream(upstream, client)
+	go copyStream(client, upstream)
+	if err := <-results; err != nil || b.ctx.Err() != nil {
+		client.Close()
+		upstream.Close()
+	}
+	<-results
 }
 
-// Stop closes the listener, waits for live relays and removes the directory.
-func (b *broker) Stop() {
-	b.once.Do(func() { close(b.done) })
-	b.listener.Close()
-	b.wg.Wait()
-	os.RemoveAll(b.dir)
-}
+// Stop is the no-result shutdown used by callers that do not need cleanup errors.
+func (b *broker) Stop() { b.Close() }
 
-// Close stops the broker (alias for Stop, used by Plan.Run defer).
-func (b *broker) Close() error { b.Stop(); return nil }
+// Close cancels dialing and closes every stream before waiting for relays.
+func (b *broker) Close() error {
+	b.once.Do(func() {
+		b.mu.Lock()
+		b.closed = true
+		b.cancel()
+		conns := b.conns
+		b.conns = nil
+		b.mu.Unlock()
+		b.listener.Close()
+		for conn := range conns {
+			conn.Close()
+		}
+		b.wg.Wait()
+		b.closeErr = os.RemoveAll(b.dir)
+	})
+	return b.closeErr
+}
 
 // HostSockPath returns the host-side socket path for the bind mount source.
 func (b *broker) HostSockPath() string { return filepath.Join(b.dir, "daemon.sock") }

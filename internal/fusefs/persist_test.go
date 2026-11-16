@@ -13,9 +13,7 @@ import (
 func newLocalLayout(t *testing.T, dir string) *Layout {
 	t.Helper()
 	return &Layout{
-		Local:      fixedLocal(dir),
-		Cache:      filepath.Join(dir, "cache"),
-		Trampoline: filepath.Join(dir, "tramp"),
+		Local: fixedLocal(dir),
 	}
 }
 

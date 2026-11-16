@@ -1,29 +1,42 @@
 #!/bin/bash
-# Verifies the mixed-execution model:
-#   * multica and the agent CLIs are host programs (they run here),
+# Verifies the mixed-execution model with the fixture programs installed in
+# the two purpose-built images:
+#   * the stand-in CLIs are host programs (they run here),
 #   * everything they see is the daemon's tree,
 #   * a program that is not allowlisted (git) runs on the daemon,
 #   * the agent's configuration tree is local content.
 #
-# Placement is measured, never assumed. A program that runs here reports its
-# pid from this container's pid namespace; a program the daemon started reports
-# one from the daemon's own sequence.
+# These programs are shell stand-ins for the real CLIs; this script proves
+# placement and file-source policy, not agent compatibility. The real
+# installed binaries are checked separately by real.sh.
+#
+# Placement is measured, never assumed: /proc/1/comm is the init of the
+# machine the process really runs on. A local program sees this session's
+# rsbx PID 1; a program the daemon started sees the daemon's own init. Both
+# names come from the deployment (CLIENT_INIT/DAEMON_INIT), so a different
+# PID 1 name is a visibly different fact, not silently accepted.
 set -u
 MNT=${MNT:?}; F=${F:?}; SOCK=${SOCK:?}
 DAEMON_TREE=${DAEMON_TREE:-/proj}
 AGENT_HOME=${AGENT_HOME:?}
+CLIENT_INIT=${CLIENT_INIT:-rsbx}
+DAEMON_INIT=${DAEMON_INIT:-rsbxd}
 
 ok(){ echo "OK $1"; }
 bad(){ echo "FAIL $1: $2"; }
 
 run(){ timeout 120 "$F" -config "$MNT/lab.toml" -- /bin/sh -c "$1" 2>&1; }
 
-# Placement is read from this process's own /proc: a program running here has
-# the sandbox proc and sees an init, a program the daemon started has none, so
-# the value is empty. Neither a hostname nor a pid number can show this.
+# The session has its own PID namespace and rsbx init. A native daemon command
+# sees the daemon's init; nonempty alone does not prove placement.
 is_local_init(){
-  [ -n "$1" ]
+  [ "$1" = "$CLIENT_INIT" ]
 }
+
+is_daemon_init(){
+  [ "$1" = "$DAEMON_INIT" ]
+}
+
 
 mkcfg(){
   cat > "$MNT/lab.toml" <<CFG
@@ -32,9 +45,8 @@ transport = "unix"
 socket = "$SOCK"
 
 [local]
-# The host programs, named one by one, and the shell. Nothing else: every
-# other name a session runs comes from a PATH directory, which the policy
-# arbitrates per name, so it runs on the daemon.
+# Only the listed programs and explicit entry run locally. Every other exec
+# from the sandbox is routed independently of its PATH directory.
 allow = ["/usr/local/bin/multica", "/usr/local/bin/omp", "/usr/local/bin/codex", "/usr/local/bin/claude", "/bin/sh"]
 entry = "/bin/sh"
 # The agent's configuration tree is local: the program must read and write it
@@ -82,13 +94,20 @@ check_git_runs(){
   printf '%s\n' "$out" | grep -q "^git version " || { echo "got [$out]"; return 1; }
 }
 
-# 5. and it runs on the daemon, not here. A git alias reports its own pid.
+# 5. and it runs on the daemon, not here. A git alias reads the init of the
+#    machine it really runs on.
 check_git_remote(){
-  # A program the daemon started has no sandbox /proc, so this reads empty.
-  # Anything else means git ran here.
-  out=$(run 'git -c alias.w="!c=\"\"; IFS= read -r c < /proc/1/comm; printf %s \"$c\"" w 2>/dev/null | head -1')
-  [ -z "$out" ] && return 0
-  echo "git ran here (init [$out]): the redirect did not happen"; return 1
+  local out rc
+  # The alias body must reach the daemon's git unchanged: it is single-quoted
+  # at the local shell, so nothing here expands it. `cat /proc/1/comm` is the
+  # daemon's own native procfs, which is what makes the placement observable.
+  # stderr is kept: a missing alias or a failed remote exec has to be visible
+  # in the failure message instead of becoming an empty string.
+  out=$(run "git -c 'alias.w=!cat /proc/1/comm' w")
+  rc=$?
+  [ $rc -eq 0 ] || { echo "git alias probe failed (rc=$rc): $out"; return 1; }
+  is_daemon_init "$out" || { echo "git init [$out] is not the daemon init $DAEMON_INIT"; return 1; }
+  return 0
 }
 
 # 6. git's work lands on the daemon's tree and survives to the next session.
@@ -164,10 +183,16 @@ check_one_tree(){
 
 mkcfg
 echo "=== client=$(hostname) ==="
+failed=0
 for t in check_multica_local check_multica_sees_remote check_git_absent_here \
          check_git_runs check_git_remote check_git_writes_remote \
          check_agent_config_local check_agent_io_remote check_all_agents_local \
          check_cli_drives_git check_one_tree; do
-  e=$($t 2>&1)
-  if [ $? -eq 0 ]; then ok "${t#check_}"; else bad "${t#check_}" "${e:0:240}"; fi
+  if e=$($t 2>&1); then
+    ok "${t#check_}"
+  else
+    bad "${t#check_}" "${e:0:240}"
+    failed=1
+  fi
 done
+exit "$failed"

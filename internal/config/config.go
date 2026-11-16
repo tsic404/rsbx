@@ -60,9 +60,11 @@ type Sandbox struct {
 	// only costs the client re-staging what it needs.
 	Cache string `json:"cache"`
 	// ShareNetwork keeps the host network namespace inside the sandbox
-	// instead of creating a private one. Set it when the daemon is reached
-	// over the network (the ssh transport does this automatically), or when
-	// the host cannot create a network namespace, as some containers cannot.
+	// instead of creating a private one. It is explicit-only: no transport
+	// implies it. The ssh transport runs outside the sandbox and reaches the
+	// daemon through the broker, so it needs no host networking; agents that
+	// talk to their APIs do. A host that cannot create a network namespace
+	// is also a reason to set it.
 	ShareNetwork bool `json:"share_network"`
 	// UnshareUser creates a user namespace for the sandbox. Outside a
 	// container that is what allows it to run unprivileged. Inside one the

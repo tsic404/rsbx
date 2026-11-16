@@ -1,25 +1,27 @@
 #!/bin/bash
 # Stress the mixed model: many concurrent sessions, each running the host
 # programs and the daemon programs on one shared tree.
+#
+# The programs are the shell stand-ins from the two purpose-built images, so
+# this measures the sandbox's placement, file-source and lifecycle behavior
+# under contention. It does not measure real agent compatibility; the real
+# installed binaries are exercised separately by real.sh.
+#
+# Every session reads the same single configuration file. The sandbox, not the
+# caller, allocates a unique mount/cache/broker per invocation, which is the
+# property this script holds under load.
+#
+# Placement assertions are against the init names the deployment actually has
+# (CLIENT_INIT/DAEMON_INIT), read from the kernel's /proc/1/comm.
 set -u
 MNT=${MNT:?}; F=${F:?}; SOCK=${SOCK:?}; AGENT_HOME=${AGENT_HOME:?}
 N=${N:-8}
+CLIENT_INIT=${CLIENT_INIT:-rsbx}
+DAEMON_INIT=${DAEMON_INIT:-rsbxd}
 ok(){ echo "OK $1"; }
 bad(){ echo "FAIL $1: $2"; }
 run(){ timeout 180 "$F" -config "$MNT/lab.toml" -- /bin/sh -c "$1" 2>&1; }
-# A config describes one sandbox: its own mount point, its own cache. Concurrent
-# sessions therefore each need their own config file, or they contend for the
-# same mount and the same broker socket.
-runn(){
-  local n=$1; shift
-  timeout 180 "$F" -config "$MNT/cfg$n.toml" -- /bin/sh -c "$1" 2>&1
-}
-mkcfg_n(){
-  local n=$1
-  sed -e "s|mount = .*|mount = \"$MNT/sb$n\"|" \
-      -e "s|cache = .*|cache = \"$MNT/c$n\"|" "$MNT/lab.toml" > "$MNT/cfg$n.toml"
-  mkdir -p "$MNT/sb$n" "$MNT/c$n"
-}
+# All concurrent invocations deliberately share the same configuration file.
 mkcfg(){
   cat > "$MNT/lab.toml" <<CFG
 [daemon]
@@ -38,16 +40,15 @@ unshare_user = false
 CFG
 }
 mkcfg
-for i in $(seq 1 $N); do mkcfg_n $i; done
 
 # 1. N concurrent sessions each committing to their own subtree on the daemon.
 concurrent_commits(){
   local i pids=() pid rc=0
   for i in $(seq 1 $N); do
-    ( runn $i "rm -rf /proj/c$i; mkdir -p /proj/c$i; cd /proj/c$i
-        git init -q . && printf 'work-$i\n' > f.txt
-        git add f.txt
-        git -c user.email=a@b -c user.name=n commit -qm c$i 2>/dev/null
+    ( run "rm -rf /proj/c$i; mkdir -p /proj/c$i; cd /proj/c$i && \
+        git init -q . && printf 'work-$i\n' > f.txt && \
+        git add f.txt && \
+        git -c user.email=a@b -c user.name=n commit -qm c$i && \
         git rev-list --count HEAD" > "$MNT/commit.$i" 2>&1 ) &
     pids+=($!)
   done
@@ -74,23 +75,45 @@ concurrent_commits(){
 }
 
 # 2. host program and daemon program interleaved in one session, many times.
+#    Each round reads /proc/1/comm from the machine the command really ran on,
+#    so both sides of the routing decision are measured rather than inferred
+#    from a command merely succeeding.
+#
+#    The alias body is quote-free and the whole probe is single-quoted at the
+#    local shell, so no `$` in it can be expanded here before the daemon's git
+#    sees it. stderr is kept and each side's exit status is checked: a failed
+#    probe must not be counted as a successful round.
 interleaved(){
   local out
-  out=$(run 'i=0; lok=0; rok=0
-    while [ $i -lt 20 ]; do
-      if multica ver 2>/dev/null | grep -qv rsbxd; then lok=$((lok+1)); fi
-      if git --version >/dev/null 2>&1; then rok=$((rok+1)); fi
-      i=$((i+1))
+  # The stand-in has no subcommands: invoked with no arguments it prints its
+  # own MULTICA-INIT marker (read from the kernel's /proc/1/comm) and exits 0.
+  # Asking it for a name it does not implement would make /bin/sh report
+  # "not found" and turn a placement probe into a fixture-capability probe.
+  out=$(run "i=0; lok=0; rok=0; bad=0
+    while [ \$i -lt 20 ]; do
+      m=\$(multica)
+      if [ \$? -eq 0 ] && printf '%s' \"\$m\" | grep -q 'MULTICA-INIT=$CLIENT_INIT'; then
+        lok=\$((lok+1))
+      else
+        bad=\$((bad+1)); printf 'round %d local probe: [%s]\\n' \"\$i\" \"\$m\" >&2
+      fi
+      g=\$(git -c 'alias.w=!cat /proc/1/comm' w)
+      if [ \$? -eq 0 ] && [ \"\$g\" = '$DAEMON_INIT' ]; then
+        rok=\$((rok+1))
+      else
+        bad=\$((bad+1)); printf 'round %d remote probe: [%s]\\n' \"\$i\" \"\$g\" >&2
+      fi
+      i=\$((i+1))
     done
-    echo "local=$lok remote=$rok"')
-  printf '%s\n' "$out" | grep -q "local=20 remote=20" || { echo "got [$out]"; return 1; }
+    echo \"local=\$lok remote=\$rok bad=\$bad\"")
+  printf '%s\n' "$out" | grep -qx "local=20 remote=20 bad=0" || { echo "got [$out]"; return 1; }
 }
 
 # 3. agent config stays local while work product stays remote, concurrently.
 agent_split(){
   local i pids=() pid rc=0
   for i in $(seq 1 $N); do
-    ( runn $i "OMP_CONFIG=$AGENT_HOME/omp/cfg$i.toml omp config-write
+    ( run "OMP_CONFIG=$AGENT_HOME/omp/cfg$i.toml omp config-write
         mkdir -p /proj/w$i && omp work /proj/w$i" > "$MNT/split.$i" 2>&1 ) &
     pids+=($!)
   done
@@ -128,7 +151,13 @@ cross_view(){
 }
 
 echo "=== stress: N=$N ==="
+failed=0
 for t in concurrent_commits interleaved agent_split cross_view; do
-  e=$($t 2>&1)
-  if [ $? -eq 0 ]; then ok "$t"; else bad "$t" "${e:0:240}"; fi
+  if e=$($t 2>&1); then
+    ok "$t"
+  else
+    bad "$t" "${e:0:240}"
+    failed=1
+  fi
 done
+exit "$failed"

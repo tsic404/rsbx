@@ -113,10 +113,11 @@ func TestLaunchSpecCarriesNoDaemonTransport(t *testing.T) {
 	}
 }
 
-// A working directory the sandbox cannot have must not be carried into the
-// launcher: /tmp stays the daemon's directory, so starting there means the
-// entry starts at / instead.
-func TestHiddenCwdFallsBackToRoot(t *testing.T) {
+// A working directory the sandbox replaces must not be carried into the
+// launcher: the reserved mount points are synthetic, so a cwd inside one has
+// no meaning in the view and the entry starts at / instead. /tmp is daemon
+// content rather than a reserved path, so a cwd there remains valid.
+func TestReservedCwdIsNotCarried(t *testing.T) {
 	dir := tempDirOutsideTmp(t)
 	plan := planFor(t, dir, []string{"/bin/sh"}, []string{dir})
 	b, err := newBroker(plan.Target, filepath.Join(dir, "broker"))
@@ -126,15 +127,24 @@ func TestHiddenCwdFallsBackToRoot(t *testing.T) {
 	defer b.Stop()
 	// /tmp is the daemon's directory, so it is reachable through the view;
 	// it must never be treated as a host tree the launcher replaces.
-	if !plan.hasPath("/tmp") {
+	if !plan.hasPath("/tmp") || !plan.hasPath("/tmp/anything") {
 		t.Error("daemon /tmp must stay visible in the view")
 	}
 	if plan.Local.IsLocal("/tmp") || plan.Local.IsLocal("/tmp/anything") {
 		t.Error("/tmp must not be served as a local tree")
 	}
+	// Each reserved target is replaced by the launcher, so a cwd below it has
+	// no meaning in the view and must be dropped to the root fallback.
+	for _, hidden := range []string{BrokerDir, BrokerDir + "/session", HelperDir, OldRootPath, "/proc", "/proc/self", "/dev"} {
+		if plan.hasPath(hidden) {
+			t.Errorf("reserved path %s kept its host meaning", hidden)
+		}
+	}
+	// Whatever the checkout happens to be, the spec never carries a cwd the
+	// view cannot reach.
 	spec := plan.launchSpec([]string{"/bin/sh"}, b)
-	if spec.Cwd == "/tmp" || filepath.HasPrefix(spec.Cwd, "/tmp/") {
-		t.Errorf("cwd %q cannot exist in the sandbox view", spec.Cwd)
+	if spec.Cwd != "" && !plan.hasPath(spec.Cwd) {
+		t.Errorf("cwd %q is unreachable in the sandbox view", spec.Cwd)
 	}
 }
 

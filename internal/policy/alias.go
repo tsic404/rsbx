@@ -1,62 +1,60 @@
 package policy
 
-import (
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
-)
+import "path/filepath"
 
-// ExecPaths returns every absolute path that may execute here, with the real
-// target of each alias included: a distribution that keeps /bin/sh as a
-// symlink to dash must grant the file the kernel actually loads, or the
-// allowlisted name could not start at all.
-//
-// Only the executable itself is granted. The directories holding these paths
-// stay on the daemon: their other content is not part of the grant.
+// ExecPaths returns the compiled exact executable names and every resolved
+// alias needed to reach them. Holding directories are not execution grants.
 func (p *Policy) ExecPaths() []string {
-	out := make([]string, 0, len(p.Local))
-	seen := map[string]bool{}
-	add := func(path string) {
-		if path == "" || !filepath.IsAbs(path) {
-			return
-		}
-		clean := filepath.Clean(path)
-		if !seen[clean] {
-			seen[clean] = true
-			out = append(out, clean)
-		}
+	if p == nil {
+		return nil
 	}
-	for _, e := range p.Local {
-		add(e)
-		// A symlinked executable resolves to its real file, following every
-		// link in the chain. A directory entry is a prefix rule and has no
-		// single target.
-		if fi, err := os.Lstat(e); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			if resolved, err := filepath.EvalSymlinks(e); err == nil {
-				if fi, err := os.Stat(resolved); err == nil && !fi.IsDir() {
-					add(resolved)
-				}
-			}
-		}
-	}
-	sort.Strings(out)
-	return out
+	return append([]string(nil), p.execPaths...)
 }
 
-// IsAliasTarget reports whether path is the real file behind an allowlisted
-// alias, even though path itself is not allowlisted.
-func (p *Policy) IsAliasTarget(path string) bool {
-	clean := filepath.Clean(path)
-	if p.IsLocal(clean) {
-		return true
-	}
-	for _, e := range p.ExecPaths() {
-		if e == clean {
-			return true
-		}
-	}
-	return false
+// IsAliasTarget also recognises the concrete target of an allowlisted alias.
+// Runtime-only interpreters and ELF loaders deliberately do not match.
+func (p *Policy) IsAliasTarget(filename string) bool {
+	return p != nil && filepath.IsAbs(filename) && p.execSet[filepath.Clean(filename)]
 }
 
-var _ = strings.HasPrefix
+// RuntimePaths returns concrete read-only interpreter, loader and library
+// assets. They are data dependencies, not permission for arbitrary invocations.
+func (p *Policy) RuntimePaths() []string {
+	if p == nil {
+		return nil
+	}
+	return append([]string(nil), p.runtimePaths...)
+}
+
+// InterpreterFor returns the immediate canonical shebang interpreter and the
+// kernel's single optional argument for any compiled executable/runtime script.
+// Runtime script metadata does not grant arbitrary local invocations.
+func (p *Policy) InterpreterFor(filename string) (string, []string, bool) {
+	if p == nil || !filepath.IsAbs(filename) {
+		return "", nil, false
+	}
+	interpreter, ok := p.interpreters[p.aliases[filepath.Clean(filename)]]
+	return interpreter.path, append([]string(nil), interpreter.args...), ok
+}
+
+// EnvInterpreterFor reports the command a compiled env shebang will exec.
+// args is the exact command argv prefix, including argv[0] as env spells it;
+// the script pathname and user arguments are appended by the execution router.
+// Runtime-only scripts remain non-local despite their queryable metadata.
+func (p *Policy) EnvInterpreterFor(filename string) (string, []string, bool) {
+	if p == nil || !filepath.IsAbs(filename) {
+		return "", nil, false
+	}
+	interpreter, ok := p.envInterpreters[p.aliases[filepath.Clean(filename)]]
+	return interpreter.path, append([]string(nil), interpreter.args...), ok
+}
+
+// InterpreterSpellingFor returns the literal immediate shebang interpreter
+// spelling, needed when constructing the kernel argv of nested scripts.
+func (p *Policy) InterpreterSpellingFor(filename string) (string, bool) {
+	if p == nil || !filepath.IsAbs(filename) {
+		return "", false
+	}
+	interpreter, ok := p.interpreters[p.aliases[filepath.Clean(filename)]]
+	return interpreter.spelling, ok
+}

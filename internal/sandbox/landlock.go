@@ -1,29 +1,35 @@
+//go:build linux
+
 package sandbox
 
+// Landlock restricts execution to exactly the paths the controller computed:
+// the allowlisted local programs with their aliases resolved, the runtime
+// assets the policy recorded (the dynamic loader and interpreter files those
+// programs need), and the two native helpers. Every path in the list is
+// required: the controller resolved them all before launch, so a path that
+// cannot be opened or granted here is a mounting or policy failure and aborts
+// the session rather than silently narrowing the sandbox.
+//
+// There is no unsupported-kernel fallback. A kernel without Landlock refuses
+// the first syscall, the launcher reports it, and the entry never starts:
+// running with only redirection in place would be a weaker sandbox than the
+// configuration asked for.
 import (
 	"fmt"
-	"os"
 	"path/filepath"
-	"strings"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// LandlockRuleset builds a ruleset that permits execve only for the listed
-// paths plus the dynamic loaders.
-//
-// The paths are interpreted inside the sandbox, after the launcher has built
-// the view, which is why they are sandbox-absolute ("/usr/bin/bash") rather
-// than host paths: the guard runs where the kernel resolves them that way.
-// grantDeadline is how long a path the policy named may take to resolve. Every
-// one of those must exist, so a slow answer is worth waiting for: the sandbox
-// filesystem builds its view on demand, and the first look at a path costs a
-// round trip to the daemon.
-const grantDeadline = 3 * time.Second
-
+// LandlockRuleset builds a ruleset permitting execve only for the listed
+// paths. The paths are sandbox-absolute: they are opened after the launcher
+// pivoted into the final view, where the kernel resolves them that way.
+// Every entry must resolve and accept the rule; any failure is returned.
 func LandlockRuleset(paths []string) (int, error) {
+	if len(paths) == 0 {
+		return 0, fmt.Errorf("Landlock execution paths are empty")
+	}
 	attr := unix.LandlockRulesetAttr{Access_fs: unix.LANDLOCK_ACCESS_FS_EXECUTE}
 	fd, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
 		uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
@@ -31,22 +37,8 @@ func LandlockRuleset(paths []string) (int, error) {
 		return 0, fmt.Errorf("landlock_create_ruleset: %w", errno)
 	}
 	ruleset := int(fd)
-	// The paths the policy named come first and get the whole window: every one
-	// of them must resolve, and a missing one is a real failure to report. The
-	// loader candidates follow with no retry at all, because most of that list
-	// does not exist on any given image and waiting on each absent name starved
-	// the ones that were real. Measured on the runner:
-	// /lib/ld-linux-x86-64.so.2 is absent on Debian 13 and spent two seconds of
-	// a two-second budget before the real loader under /usr/lib/x86_64-linux-gnu
-	// was even tried.
 	for _, p := range paths {
-		if err := addPathBeneath(ruleset, p, time.Now().Add(grantDeadline)); err != nil {
-			unix.Close(ruleset)
-			return 0, err
-		}
-	}
-	for _, p := range loaderPaths() {
-		if err := addPathBeneath(ruleset, p, time.Time{}); err != nil {
+		if err := addPathBeneath(ruleset, p); err != nil {
 			unix.Close(ruleset)
 			return 0, err
 		}
@@ -54,25 +46,22 @@ func LandlockRuleset(paths []string) (int, error) {
 	return ruleset, nil
 }
 
-func addPathBeneath(ruleset int, path string, deadline time.Time) error {
-	start := time.Now()
-	fd, err := openForRule(path, deadline)
-	if os.Getenv("RSBX_LANDLOCK_TRACE") != "" {
-		fmt.Fprintf(os.Stderr, "rsbx-diag: grant path=%s took=%v err=%v\n", path, time.Since(start).Round(time.Millisecond), err)
+func addPathBeneath(ruleset int, path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("Landlock execution grant is not absolute: %q", path)
 	}
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
-		// A path that is genuinely absent cannot be executed either, so
-		// skipping it keeps one missing entry from disabling the whole sandbox.
-		// Anything else is a real failure and must be reported: dropping a rule
-		// because the filesystem was momentarily busy silently narrowed the
-		// allowlist, and the entry program was then refused by the kernel with
-		// EACCES that pointed at nothing.
-		if err == unix.ENOENT || err == unix.ENOTDIR {
-			return nil
-		}
 		return fmt.Errorf("landlock grant %s: %w", path, err)
 	}
 	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("stat Landlock grant %s: %w", path, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("Landlock execution grant %s is not an exact regular file", path)
+	}
 	attr := unix.LandlockPathBeneathAttr{
 		Allowed_access: unix.LANDLOCK_ACCESS_FS_EXECUTE,
 		Parent_fd:      int32(fd),
@@ -85,90 +74,17 @@ func addPathBeneath(ruleset int, path string, deadline time.Time) error {
 	return nil
 }
 
-// loaderPaths lists the dynamic loaders relative to the sandbox root. Every
-// dynamically linked ELF is executed through one, so denying it would deny the
-// allowlist too. The list is the set of interpreters, not a grant for the
-// library trees around them.
-func loaderPaths() []string {
-	paths := []string{
-		"/lib64/ld-linux-x86-64.so.2",
-		"/lib/ld-linux-x86-64.so.2",
-		"/lib/ld-linux-aarch64.so.1",
-		"/lib64/ld-linux-aarch64.so.1",
-		"/lib/ld-musl-x86_64.so.1",
-		"/lib/ld-musl-aarch64.so.1",
-		"/usr/lib/ld-linux-x86-64.so.2",
-		"/usr/lib64/ld-linux-x86-64.so.2",
-		// Alpine keeps /lib and /lib64 as symlinks into /usr/lib, so the
-		// loader's only real path is the one below. With just the link,
-		// opening it in the sandbox view answers ENOENT and the grant is
-		// dropped, which then refuses the entry with EACCES.
-		"/usr/lib/ld-musl-x86_64.so.1",
-		"/usr/lib/ld-musl-aarch64.so.1",
-		"/usr/lib64/ld-linux-x86-64.so.2",
-	}
-	// Debian and Ubuntu keep the loader under a multiarch directory, which
-	// cannot be enumerated without knowing the triplet.
-	for _, triplet := range []string{"x86_64-linux-gnu", "aarch64-linux-gnu", "i386-linux-gnu", "riscv64-linux-gnu"} {
-		paths = append(paths,
-			"/usr/lib/"+triplet+"/ld-linux-x86-64.so.2",
-			"/usr/lib/"+triplet+"/ld-linux-aarch64.so.1")
-	}
-	return paths
-}
-
-// ApplyLandlock installs the ruleset on the calling process, so every child
-// inherits it. no_new_privs prevents the process from lifting it again.
+// ApplyLandlock installs the ruleset on the calling thread. The pinned guard
+// sets no_new_privs and drops all privilege before this call; its subsequent
+// exec and every descendant inherit this exact-inode ruleset.
 func ApplyLandlock(paths []string) error {
 	ruleset, err := LandlockRuleset(paths)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(ruleset)
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return fmt.Errorf("no_new_privs: %w", err)
-	}
 	if _, _, errno := unix.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(ruleset), 0, 0); errno != 0 {
 		return fmt.Errorf("landlock_restrict_self: %w", errno)
 	}
 	return nil
-}
-
-var _ = filepath.Join
-var _ = strings.HasPrefix
-
-// openForRule resolves a path for a Landlock rule. The path is read through the
-// sandbox's own filesystem, which under load can answer a transient error for a
-// file that is plainly there, so a failure is retried on a short delay before it
-// is believed.
-func openForRule(path string, deadline time.Time) (int, error) {
-	var err error
-	for attempt := 0; ; attempt++ {
-		var fd int
-		fd, err = unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
-		if err == nil {
-			return fd, nil
-		}
-		// A zero deadline is one attempt. The loader candidates use that: they
-		// are a guess at what the image might have, not paths the policy
-		// promised, and waiting on each absent one starves the real loader.
-		if deadline.IsZero() || !time.Now().Before(deadline) {
-			break
-		}
-		// ENOENT is retried like any other error. The path is read through the
-		// sandbox filesystem, which answers "no such file" for a moment while a
-		// dentry is being resolved; believing it dropped the rule, and the
-		// loader then had no execute grant at all. Every session that lost
-		// /lib/ld-linux-x86-64.so.2 this way failed the entry with
-		// "exec /bin/sh: permission denied", which points at nothing.
-		//
-		// The delay grows, because the window is a directory being built rather
-		// than a lost race: the second attempt is what most sessions need.
-		d := time.Duration(attempt+1) * 4 * time.Millisecond
-		if d > 100*time.Millisecond {
-			d = 100 * time.Millisecond
-		}
-		time.Sleep(d)
-	}
-	return -1, err
 }

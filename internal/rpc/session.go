@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,66 +12,95 @@ import (
 	"sync"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"rsbx/internal/proto"
 	"rsbx/internal/pty"
 )
 
 // RunSession executes req on the daemon and bridges the caller's stdio.
-// It returns the remote exit status.
+// It returns the remote exit status and owns a background session context.
+// req must carry the non-argv Target plus a nonempty command vector.
 //
 // Signals and terminal resizes are forwarded to the remote process group
 // while the session lives, so Ctrl-C and a window resize act on the command
 // that actually runs. The local process does not terminate on those signals:
 // the daemon reports the real status, and that is what the caller exits with.
 func RunSession(t Target, req *proto.ExecReq, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
-	conn, err := t.Dial()
+	return RunSessionContext(context.Background(), t, req, stdin, stdout, stderr)
+}
+
+// RunSessionContext is RunSession with caller-owned cancellation. Canceling ctx
+// closes the connection and terminates and reaps any stdio transport process.
+func RunSessionContext(ctx context.Context, t Target, req *proto.ExecReq, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	return runSession(ctx, t.DialContext, req, stdin, stdout, stderr)
+}
+
+func runSession(ctx context.Context, dial func(context.Context) (net.Conn, error), req *proto.ExecReq, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	if req == nil || req.Target == "" || len(req.Argv) == 0 {
+		return 127, errors.New("rsbx: exec request requires a target and command")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	conn, err := dial(ctx)
 	if err != nil {
 		return 127, fmt.Errorf("connect to daemon: %w", err)
 	}
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 	defer conn.Close()
 	if err := proto.WriteFrame(conn, proto.TExec, req.Encode()); err != nil {
+		if ctx.Err() != nil {
+			return 127, ctx.Err()
+		}
 		return 127, err
 	}
 
 	var wmu sync.Mutex
 	send := func(typ byte, p []byte) error {
 		wmu.Lock()
-		defer wmu.Unlock()
-		return proto.WriteFrame(conn, typ, p)
+		err := proto.WriteFrame(conn, typ, p)
+		wmu.Unlock()
+		if err != nil {
+			conn.Close()
+		}
+		return err
 	}
 
-	// done ends every helper goroutine. It is closed once when the read loop
-	// returns, so nothing lingers and blocks.
+	// done prevents further session I/O after teardown. An arbitrary io.Reader
+	// cannot be canceled, so only the owned stdin reader is joined.
 	done := make(chan struct{})
-	// stdin worker: joined only when stdin is cancellable, abandoned otherwise
-	// (an un-interruptible Read would block teardown forever).
 	var stdinWg sync.WaitGroup
-	// signal worker: always joined, it selects on done.
 	var signalWg sync.WaitGroup
 
-	// local stdin -> daemon. EOF is forwarded as a zero-length stdin frame so
-	// the remote child sees end of input.
-	//
-	// A plain io.Reader can block in Read forever, so cancellation needs real
-	// ownership. When stdin is an *os.File we read from a dup and close the dup
-	// on cancel: the duplicate's close interrupts a parked Read without ever
-	// touching the caller's descriptor. For any other reader there is no safe
-	// way to interrupt Read, so that worker is not joined on teardown — it
-	// carries no session state and cannot block the session from finishing.
-	src, cancelRead, joinable := cancellableReader(stdin, done)
+	// File-backed stdin is duplicated and polled together with a wake pipe.
+	// Cancellation never closes or changes the caller's descriptor.
+	src, cancelRead, releaseRead, joinable, err := cancellableReader(stdin)
+	if err != nil {
+		return 127, fmt.Errorf("rsbx: prepare stdin: %w", err)
+	}
 	stdinWg.Add(1)
 	go func() {
 		defer stdinWg.Done()
-		defer cancelRead()
+		defer releaseRead()
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := src.Read(buf)
+			select {
+			case <-done:
+				return
+			default:
+			}
 			if n > 0 {
 				if send(proto.TStdin, buf[:n]) != nil {
 					return
 				}
 			}
 			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					conn.Close()
+					return
+				}
 				send(proto.TStdin, nil)
 				return
 			}
@@ -125,31 +155,30 @@ func RunSession(t Target, req *proto.ExecReq, stdin io.Reader, stdout, stderr io
 	finish := func() {
 		close(done)
 		signal.Stop(sigc)
-		// The signal worker always selects on done, so it is joined. The stdin
-		// worker is joined only when its reader is interruptible; otherwise it
-		// is abandoned (it owns no connection state) instead of blocking the
-		// session on a Read that can never be interrupted.
+		cancelRead()
+		cancel()
+		// Workers may be parked in send, so close the transport before joining.
+		conn.Close()
 		signalWg.Wait()
 		if joinable {
 			stdinWg.Wait()
 		}
 	}
+	defer finish()
 
 	ttyOut := req.TTY
 	for {
 		f, err := proto.ReadFrame(conn)
 		if err != nil {
-			finish()
-			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed) {
-				return 127, nil
+			if ctx.Err() != nil {
+				return 127, ctx.Err()
 			}
-			return 127, err
+			return 127, fmt.Errorf("rsbx: daemon disconnected before exit: %w", err)
 		}
 		switch f.Type {
 		case proto.TReady:
 		case proto.TStdout:
 			if _, err := stdout.Write(f.Payload); err != nil {
-				finish()
 				return 127, err
 			}
 		case proto.TStderr:
@@ -158,63 +187,117 @@ func RunSession(t Target, req *proto.ExecReq, stdin io.Reader, stdout, stderr io
 				w = stdout
 			}
 			if _, err := w.Write(f.Payload); err != nil {
-				finish()
 				return 127, err
 			}
 		case proto.TTty:
 			if _, err := stdout.Write(f.Payload); err != nil {
-				finish()
 				return 127, err
 			}
 		case proto.TErr:
-			fmt.Fprintf(stderr, "%s\n", f.Payload)
+			if _, err := fmt.Fprintf(stderr, "%s\n", f.Payload); err != nil {
+				return 127, err
+			}
 		case proto.TExit:
-			finish()
 			return proto.ParseExit(f.Payload), nil
 		}
 	}
 }
 
-// cancellableReader returns the reader RunSession reads stdin from, a close
-// function to release any duplicate descriptor, and whether the reader can be
-// unblocked on cancel (and therefore joined safely).
-//
-// A *os.File is dup'd so closing the duplicate interrupts a pending Read
-// without closing the caller's FD. Every other reader has no interruptible
-// Read, so it is returned as-is and reported unjoinable: the worker is
-// abandoned rather than waited on, which prevents a permanent block.
-func cancellableReader(r io.Reader, done <-chan struct{}) (io.Reader, func(), bool) {
+// cancellableReader gives file-backed stdin an owned duplicate and a wake pipe.
+// Polling avoids a blocking Read on a duplicate that Close cannot interrupt on
+// Linux. cancel wakes the reader; release closes descriptors after Read returns.
+// An arbitrary reader remains caller-owned and cannot safely be canceled.
+func cancellableReader(r io.Reader) (reader io.Reader, cancel, release func(), joinable bool, err error) {
 	f, ok := r.(*os.File)
 	if !ok {
-		return r, func() {}, false
+		return r, func() {}, func() {}, false, nil
 	}
 	rc, err := f.SyscallConn()
 	if err != nil {
-		return r, func() {}, false
+		return nil, nil, nil, false, err
 	}
+	dupFD := -1
 	var dupErr error
-	var dup *os.File
-	if ctlErr := rc.Control(func(fd uintptr) {
-		nfd, err := syscall.Dup(int(fd))
-		if err != nil {
-			dupErr = err
-			return
+	ctlErr := rc.Control(func(fd uintptr) {
+		dupFD, dupErr = unix.Dup(int(fd))
+		if dupErr == nil {
+			syscall.CloseOnExec(dupFD)
 		}
-		syscall.CloseOnExec(nfd)
-		dup = os.NewFile(uintptr(nfd), "rsbx-stdin-dup")
-	}); ctlErr != nil || dupErr != nil || dup == nil {
-		if dup != nil {
-			dup.Close()
+	})
+	if ctlErr != nil || dupErr != nil || dupFD < 0 {
+		if dupFD >= 0 {
+			syscall.Close(dupFD)
 		}
-		return r, func() {}, false
+		if ctlErr != nil {
+			return nil, nil, nil, false, ctlErr
+		}
+		if dupErr != nil {
+			return nil, nil, nil, false, dupErr
+		}
+		return nil, nil, nil, false, syscall.EBADF
 	}
-	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-done:
-		case <-stop:
+	wakeR, wakeW, err := os.Pipe()
+	if err != nil {
+		syscall.Close(dupFD)
+		return nil, nil, nil, false, err
+	}
+	p := &pollStdin{fd: dupFD, wakeFD: int(wakeR.Fd()), wakeR: wakeR, wakeW: wakeW}
+	return p, p.cancel, p.release, true, nil
+}
+
+type pollStdin struct {
+	fd          int
+	wakeFD      int
+	wakeR       *os.File
+	wakeW       *os.File
+	cancelOnce  sync.Once
+	releaseOnce sync.Once
+}
+
+func (p *pollStdin) Read(buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	fds := [2]unix.PollFd{
+		{Fd: int32(p.fd), Events: unix.POLLIN},
+		{Fd: int32(p.wakeFD), Events: unix.POLLIN},
+	}
+	for {
+		_, err := unix.Poll(fds[:], -1)
+		if err == syscall.EINTR {
+			continue
 		}
-		dup.Close()
-	}()
-	return dup, func() { close(stop) }, true
+		if err != nil {
+			return 0, err
+		}
+		if fds[1].Revents != 0 || fds[0].Revents&unix.POLLNVAL != 0 {
+			return 0, os.ErrClosed
+		}
+		if fds[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) == 0 {
+			continue
+		}
+		n, err := syscall.Read(p.fd, buf)
+		if err == syscall.EINTR || err == syscall.EAGAIN {
+			continue
+		}
+		if n < 0 {
+			n = 0
+		}
+		if n == 0 && err == nil {
+			err = io.EOF
+		}
+		return n, err
+	}
+}
+
+func (p *pollStdin) cancel() {
+	p.cancelOnce.Do(func() { p.wakeW.Close() })
+}
+
+func (p *pollStdin) release() {
+	p.releaseOnce.Do(func() {
+		p.cancel()
+		syscall.Close(p.fd)
+		p.wakeR.Close()
+	})
 }

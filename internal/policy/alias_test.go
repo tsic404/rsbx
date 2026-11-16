@@ -47,25 +47,31 @@ func TestExecPathsResolveAliases(t *testing.T) {
 	}
 }
 
-// A directory entry is a prefix rule: it grants everything under it and has
-// no single real target to resolve.
-func TestExecPathsKeepDirectoryRules(t *testing.T) {
+// Directory rules enumerate only concrete executable files at construction.
+func TestExecPathsSnapshotDirectoryRules(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+	executable := filepath.Join(dir, "tool")
+	if err := os.WriteFile(executable, []byte("program"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	p, err := New([]string{dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
-	for _, e := range p.ExecPaths() {
-		if e == dir {
-			found = true
-		}
+	if !p.IsLocal(executable) || p.IsLocal(dir) {
+		t.Fatalf("directory did not compile to its exact executable: %v", p.ExecPaths())
 	}
-	if !found {
-		t.Errorf("directory rule %s lost: %v", dir, p.ExecPaths())
+	later := filepath.Join(dir, "created-later")
+	if err := os.WriteFile(later, []byte("program"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if p.IsLocal(later) || p.IsAliasTarget(later) {
+		t.Fatal("a file created after construction inherited directory execute permission")
+	}
+	for _, filename := range p.ExecPaths() {
+		if filename == dir || filename == later {
+			t.Fatalf("directory grant or late file in snapshot: %v", p.ExecPaths())
+		}
 	}
 }
 

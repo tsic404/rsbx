@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -87,7 +88,8 @@ func sigFrame(sig syscall.Signal) []byte {
 // waited on the child, so /bin/true returned 127.
 func TestExecPipesReportsRealStatus(t *testing.T) {
 	frames, err := runClient(t, &proto.ExecReq{
-		Argv: []string{"/bin/sh", "-c", "exit 42"},
+		Target: "/bin/sh",
+		Argv:   []string{"/bin/sh", "-c", "exit 42"},
 	}, nil)
 	if err != nil {
 		t.Fatalf("session error: %v", err)
@@ -95,6 +97,83 @@ func TestExecPipesReportsRealStatus(t *testing.T) {
 	code, ok := exitStatus(frames)
 	if !ok || code != 42 {
 		t.Fatalf("exit status = %d (found=%v), want 42", code, ok)
+	}
+}
+
+// The daemon must forward the environment byte-exact, including empty: a
+// request with zero env entries means the child really runs with no
+// environment at all, never "inherit the daemon's". exec.Cmd treats a nil Env
+// as inheritance, so an earlier build passed the decoded nil through and the
+// child silently saw the daemon's variables. The child is a real program that
+// prints exactly what it received; with the bug, RSBX_TEST_ENV_MARKER (set via
+// the isolated t.Setenv marker) would appear in its output.
+func TestExecEmptyEnvIsExactlyEmpty(t *testing.T) {
+	t.Setenv("RSBX_TEST_ENV_MARKER", "leaked-from-daemon")
+	envBin, err := exec.LookPath("env")
+	if err != nil {
+		t.Fatalf("env program unavailable, cannot verify environment boundary: %v", err)
+	}
+	frames, err := runClient(t, &proto.ExecReq{
+		Target: envBin,
+		Argv:   []string{envBin},
+		Env:    []string{},
+	}, nil)
+	if err != nil {
+		t.Fatalf("session error: %v", err)
+	}
+	var output strings.Builder
+	for _, frame := range frames {
+		if frame.Type == proto.TStdout {
+			output.Write(frame.Payload)
+		}
+	}
+	if got := output.String(); got != "" {
+		t.Fatalf("child saw environment entries, want exactly empty: %q", got)
+	}
+	code, ok := exitStatus(frames)
+	if !ok || code != 0 {
+		t.Fatalf("env exit status = %d (found=%v), want 0", code, ok)
+	}
+	// The complement: provided entries are forwarded exactly, nothing added.
+	frames, err = runClient(t, &proto.ExecReq{
+		Target: envBin,
+		Argv:   []string{envBin},
+		Env:    []string{"RSBX_TEST_ENV_MARKER=explicit-value"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("session error: %v", err)
+	}
+	output.Reset()
+	for _, frame := range frames {
+		if frame.Type == proto.TStdout {
+			output.Write(frame.Payload)
+		}
+	}
+	if got := output.String(); got != "RSBX_TEST_ENV_MARKER=explicit-value\n" {
+		t.Fatalf("child environment = %q, want exactly the one provided entry", got)
+	}
+	if code, ok := exitStatus(frames); !ok || code != 0 {
+		t.Fatalf("env exit status = %d (found=%v), want 0", code, ok)
+	}
+}
+
+func TestExecTargetDoesNotReplaceCallerArgvZero(t *testing.T) {
+	frames, err := runClient(t, &proto.ExecReq{
+		Target: "/bin/sh",
+		Argv:   []string{"custom-shell-name", "-c", "printf '%s' \"$0\""},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	for _, frame := range frames {
+		if frame.Type == proto.TStdout {
+			output.Write(frame.Payload)
+		}
+	}
+	code, ok := exitStatus(frames)
+	if !ok || code != 0 || output.String() != "custom-shell-name" {
+		t.Fatalf("target/argv[0] conflated: exit=%d found=%v stdout=%q", code, ok, output.String())
 	}
 }
 
@@ -107,7 +186,8 @@ func TestSignalForwardedToProcessGroup(t *testing.T) {
 	ready := filepath.Join(t.TempDir(), "ready")
 	script := "trap 'exit 7' TERM; : > " + ready + "; while :; do :; done"
 	frames, err := runClient(t, &proto.ExecReq{
-		Argv: []string{"/bin/sh", "-c", script},
+		Target: "/bin/sh",
+		Argv:   []string{"/bin/sh", "-c", script},
 	}, func(d net.Conn) {
 		deadline := time.Now().Add(5 * time.Second)
 		for {
@@ -138,7 +218,8 @@ func TestDisconnectKillsChild(t *testing.T) {
 	go func() {
 		defer c.Close()
 		req := &proto.ExecReq{
-			Argv: []string{"/bin/sh", "-c", "echo $$ > " + pidFile + "; sleep 60"},
+			Target: "/bin/sh",
+			Argv:   []string{"/bin/sh", "-c", "echo $$ > " + pidFile + "; sleep 60"},
 		}
 		proto.WriteFrame(d, proto.TExec, req.Encode())
 		// Wait for TReady, then the child has written its pid soon after.
@@ -189,8 +270,9 @@ func TestDisconnectKillsChild(t *testing.T) {
 // to a guessed directory.
 func TestCwdValidationNoFallback(t *testing.T) {
 	frames, err := runClient(t, &proto.ExecReq{
-		Argv: []string{"/bin/true"},
-		Dir:  filepath.Join(t.TempDir(), "does-not-exist"),
+		Target: "/bin/true",
+		Argv:   []string{"/bin/true"},
+		Dir:    filepath.Join(t.TempDir(), "does-not-exist"),
 	}, nil)
 	if err != nil {
 		t.Fatalf("session error: %v", err)
@@ -208,10 +290,11 @@ func TestCwdValidationNoFallback(t *testing.T) {
 // on the open pty.
 func TestTTYNaturalExit(t *testing.T) {
 	frames, err := runClient(t, &proto.ExecReq{
-		Argv: []string{"/bin/sh", "-c", "exit 5"},
-		TTY:  true,
-		Rows: 24,
-		Cols: 80,
+		Target: "/bin/sh",
+		Argv:   []string{"/bin/sh", "-c", "exit 5"},
+		TTY:    true,
+		Rows:   24,
+		Cols:   80,
 	}, nil)
 	if err != nil {
 		t.Fatalf("session error: %v", err)
@@ -229,6 +312,7 @@ func TestTTYNaturalExit(t *testing.T) {
 func TestOutputTailNotLost(t *testing.T) {
 	const n = 2000
 	frames, err := runClient(t, &proto.ExecReq{
+		Target: "/bin/sh",
 		Argv: []string{"/bin/sh", "-c",
 			"i=0; while [ $i -lt " + strconv.Itoa(n) + " ]; do echo out$i; echo err$i >&2; i=$((i+1)); done"},
 	}, nil)

@@ -32,17 +32,18 @@ func TestOversizeWriteFrameRejected(t *testing.T) {
 
 func TestExecReqRoundTrip(t *testing.T) {
 	in := &ExecReq{
-		Argv: []string{"/bin/ls", "-l", "/"},
-		Env:  []string{"A=1", "B=2"},
-		Dir:  "/proj",
-		TTY:  true,
-		Rows: 40, Cols: 120,
+		Target: "/bin/ls",
+		Argv:   []string{"/bin/ls", "-l", "/"},
+		Env:    []string{"A=1", "B=2"},
+		Dir:    "/proj",
+		TTY:    true,
+		Rows:   40, Cols: 120,
 	}
 	got, err := DecodeExecReq(in.Encode())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Dir != in.Dir || got.Rows != 40 || !got.TTY || len(got.Argv) != 3 || got.Argv[2] != "/" {
+	if got.Target != in.Target || got.Dir != in.Dir || got.Rows != 40 || !got.TTY || len(got.Argv) != 3 || got.Argv[2] != "/" {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }

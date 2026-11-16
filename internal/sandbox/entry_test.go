@@ -22,7 +22,7 @@ func TestEntryProgramIsAllowedImplicitly(t *testing.T) {
 	}
 
 	cfg := testCfg()
-	cfg.Local.Allow = []string{filepath.Join(dir, "some-agent")}
+	cfg.Local.Allow = []string{}
 	cfg.Local.Entry = entry
 	cfg.Local.Paths = []string{dir}
 	cfg.Sandbox.Mount = filepath.Join(dir, "mnt")

@@ -3,25 +3,26 @@
 package fusefs
 
 import (
+	"golang.org/x/sys/unix"
 	"os"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
-// setFileTimes is the portable fallback. The FUSE server runs on Linux, where
-// UTIME_OMIT is available; this build only exists so the package still
-// compiles on a development host.
-func setFileTimes(host string, in *fuse.SetAttrIn) error {
-	fi, err := os.Lstat(host)
-	if err != nil {
+// Production uses UTIME_OMIT on Linux. The development-host implementation
+// keeps inode identity by using the opened descriptor, never File.Name().
+func setFileTimes(f *os.File, in *fuse.SetAttrIn) error {
+	var ts [2]unix.Timespec
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
 		return err
 	}
-	atime, mtime := fi.ModTime(), fi.ModTime()
+	ts[0], ts[1] = st.Atimespec, st.Mtimespec
 	if v, ok := in.GetATime(); ok {
-		atime = v
+		ts[0] = unix.NsecToTimespec(v.UnixNano())
 	}
 	if v, ok := in.GetMTime(); ok {
-		mtime = v
+		ts[1] = unix.NsecToTimespec(v.UnixNano())
 	}
-	return os.Chtimes(host, atime, mtime)
+	return unix.Futimes(int(f.Fd()), []unix.Timeval{unix.NsecToTimeval(ts[0].Nano()), unix.NsecToTimeval(ts[1].Nano())})
 }

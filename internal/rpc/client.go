@@ -4,6 +4,7 @@
 package rpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,106 +26,172 @@ type Target struct {
 	Command []string
 }
 
-// Dial opens a raw connection to the daemon.
-func (t Target) Dial() (net.Conn, error) {
-	if len(t.Command) == 0 {
-		return net.Dial("unix", t.Socket)
+// DialContext connects to the daemon. For a command transport, ctx owns the
+// subprocess for the lifetime of the connection, not just while it starts.
+func (t Target) DialContext(ctx context.Context) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	cmd := exec.Command(t.Command[0], t.Command[1:]...)
-	stdin, err := cmd.StdinPipe()
+	if len(t.Command) == 0 {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", t.Socket)
+	}
+	cmd := exec.CommandContext(ctx, t.Command[0], t.Command[1:]...)
+	childIn, stdin, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	stdout, childOut, err := os.Pipe()
 	if err != nil {
+		childIn.Close()
 		stdin.Close()
 		return nil, err
 	}
-	cmd.Stderr = os.Stderr
-
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = childIn, childOut, os.Stderr
+	s := &stdioConn{r: stdout, w: stdin, cmd: cmd, done: make(chan struct{})}
+	cmd.Cancel = s.stop
 	if err := cmd.Start(); err != nil {
+		childIn.Close()
 		stdin.Close()
 		stdout.Close()
+		childOut.Close()
 		return nil, err
 	}
-	s := &stdioConn{r: stdout, w: stdin, cmd: cmd, done: make(chan struct{})}
+	childIn.Close()
+	childOut.Close()
+	// Own the pipes instead of using Cmd.StdoutPipe: Wait must not close
+	// stdout before a normal EOF has drained the daemon's final response.
 	go func() {
 		cmd.Wait()
 		close(s.done)
 	}()
+	if err := ctx.Err(); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
 // stdioConn exposes a pair of pipes as a net.Conn.
 type stdioConn struct {
-	r    io.ReadCloser
-	w    io.WriteCloser
-	cmd  *exec.Cmd
-	done chan struct{}
+	r       io.ReadCloser
+	w       io.WriteCloser
+	cmd     *exec.Cmd
+	done    chan struct{}
+	once    sync.Once
+	stopErr error
 }
 
 func (s *stdioConn) Read(p []byte) (int, error)  { return s.r.Read(p) }
 func (s *stdioConn) Write(p []byte) (int, error) { return s.w.Write(p) }
+
+// stop is also Cmd.Cancel, so cancellation unblocks both pipes before reaping
+// the transport process. It deliberately does not wait: Cmd.Wait calls Cancel.
+func (s *stdioConn) stop() error {
+	s.once.Do(func() {
+		s.w.Close()
+		s.r.Close()
+		s.stopErr = s.cmd.Process.Kill()
+	})
+	return s.stopErr
+}
+
 func (s *stdioConn) Close() error {
-	s.w.Close()
-	s.r.Close()
-	if s.cmd.Process != nil {
-		s.cmd.Process.Kill()
-	}
-	// Wait for the child to be reaped; the process is gone once its pipes
-	// close, so this never outlives the connection.
+	err := s.stop()
 	<-s.done
-	return nil
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	return err
 }
-func (s *stdioConn) LocalAddr() net.Addr              { return nil }
-func (s *stdioConn) RemoteAddr() net.Addr             { return nil }
-func (s *stdioConn) SetDeadline(time.Time) error      { return nil }
-func (s *stdioConn) SetReadDeadline(time.Time) error  { return nil }
-func (s *stdioConn) SetWriteDeadline(time.Time) error { return nil }
 
-// FS is a multiplexed filesystem client.
+// CloseWrite sends EOF without discarding the daemon's remaining output.
+func (s *stdioConn) CloseWrite() error    { return s.w.Close() }
+func (s *stdioConn) CloseRead() error     { return s.r.Close() }
+func (s *stdioConn) LocalAddr() net.Addr  { return nil }
+func (s *stdioConn) RemoteAddr() net.Addr { return nil }
+
+func (s *stdioConn) SetDeadline(t time.Time) error {
+	return errors.Join(s.SetReadDeadline(t), s.SetWriteDeadline(t))
+}
+
+func (s *stdioConn) SetReadDeadline(t time.Time) error {
+	if r, ok := s.r.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return r.SetReadDeadline(t)
+	}
+	return errors.ErrUnsupported
+}
+
+func (s *stdioConn) SetWriteDeadline(t time.Time) error {
+	if w, ok := s.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return w.SetWriteDeadline(t)
+	}
+	return errors.ErrUnsupported
+}
+
+// FS is a multiplexed filesystem client whose lifetime ends permanently at Close.
 type FS struct {
-	target  Target
-	mu      sync.Mutex
-	conn    net.Conn
-	gen     uint64 // connection generation; bumped whenever conn changes
-	wmu     sync.Mutex
-	next    atomic.Uint32
-	pending map[uint32]chan *proto.FxResp
+	dial      func(context.Context) (net.Conn, error)
+	ctx       context.Context
+	cancel    context.CancelFunc
+	connectMu sync.Mutex // serializes lazy dialing without blocking Close
+	mu        sync.Mutex
+	conn      net.Conn
+	gen       uint64 // connection generation; bumped whenever conn changes
+	closed    bool
+	wmu       sync.Mutex
+	next      uint32
+	pending   map[uint32]chan *proto.FxResp
+	closeOnce sync.Once
+	closeErr  error
 }
 
-// NewFS returns a client that connects lazily.
+// NewFS returns a session client that connects lazily until Close is called.
 func NewFS(t Target) *FS {
-	return &FS{target: t, pending: make(map[uint32]chan *proto.FxResp)}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &FS{dial: t.DialContext, ctx: ctx, cancel: cancel, pending: make(map[uint32]chan *proto.FxResp)}
 }
 
 // Do performs one filesystem request.
 func (c *FS) Do(req *proto.FxReq) (*proto.FxResp, error) {
-	ch, id, conn, err := c.register()
+	ch, id, conn, gen, err := c.register()
 	if err != nil {
 		return nil, err
 	}
 	req.ID = id
 	c.wmu.Lock()
+	if c.ctx.Err() != nil {
+		c.wmu.Unlock()
+		return nil, net.ErrClosed
+	}
 	werr := proto.WriteFrame(conn, proto.TFxReq, req.Encode())
 	c.wmu.Unlock()
 	if werr != nil {
-		c.fail(id)
-		c.dropConn(conn)
+		c.dropConn(conn, gen)
+		if c.ctx.Err() != nil {
+			return nil, net.ErrClosed
+		}
 		return nil, werr
 	}
-	resp, ok := <-ch
-	if !ok {
-		return nil, errors.New("rsbx: filesystem connection lost")
-	}
-	if resp.Kind == proto.KErr || resp.Errno != 0 {
-		errno := syscall.Errno(resp.Errno)
-		if errno == 0 {
-			errno = errnoOf(resp.Err)
+	select {
+	case <-c.ctx.Done():
+		return nil, net.ErrClosed
+	case resp, ok := <-ch:
+		if !ok {
+			if c.ctx.Err() != nil {
+				return nil, net.ErrClosed
+			}
+			return nil, errors.New("rsbx: filesystem connection lost")
 		}
-		return resp, errno
+		if resp.Kind == proto.KErr || resp.Errno != 0 {
+			errno := syscall.Errno(resp.Errno)
+			if errno == 0 {
+				errno = errnoOf(resp.Err)
+			}
+			return resp, errno
+		}
+		return resp, nil
 	}
-	return resp, nil
 }
 
 // errnoOf maps a daemon error string onto a syscall.Errno.
@@ -143,22 +209,57 @@ func errnoOf(s string) syscall.Errno {
 	return syscall.EIO
 }
 
-func (c *FS) register() (chan *proto.FxResp, uint32, net.Conn, error) {
+func (c *FS) register() (chan *proto.FxResp, uint32, net.Conn, uint64, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, 0, nil, 0, net.ErrClosed
+	}
+	if c.conn != nil {
+		ch, id, conn, gen := c.registerLocked()
+		c.mu.Unlock()
+		return ch, id, conn, gen, nil
+	}
+	c.mu.Unlock()
+
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, 0, nil, 0, net.ErrClosed
+	}
 	if c.conn == nil {
-		conn, err := c.target.Dial()
+		c.mu.Unlock()
+		conn, err := c.dial(c.ctx)
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			if conn != nil {
+				conn.Close()
+			}
+			return nil, 0, nil, 0, net.ErrClosed
+		}
 		if err != nil {
-			return nil, 0, nil, fmt.Errorf("rsbx: connect to daemon: %w", err)
+			c.mu.Unlock()
+			return nil, 0, nil, 0, fmt.Errorf("rsbx: connect to daemon: %w", err)
 		}
 		c.conn = conn
 		c.gen++
 		go c.readLoop(conn, c.gen)
 	}
-	id := c.next.Add(1)
+	ch, id, conn, gen := c.registerLocked()
+	c.mu.Unlock()
+	return ch, id, conn, gen, nil
+}
+
+// registerLocked records the waiter atomically with selecting its connection.
+func (c *FS) registerLocked() (chan *proto.FxResp, uint32, net.Conn, uint64) {
+	c.next++
+	id := c.next
 	ch := make(chan *proto.FxResp, 1)
 	c.pending[id] = ch
-	return ch, id, c.conn, nil
+	return ch, id, c.conn, c.gen
 }
 
 func (c *FS) readLoop(conn net.Conn, gen uint64) {
@@ -168,7 +269,7 @@ func (c *FS) readLoop(conn net.Conn, gen uint64) {
 			// Only the reader of the current generation may reset the
 			// connection; a stale reader from a replaced connection must not
 			// fail requests that belong to the newer one.
-			c.dropConnGen(conn, gen)
+			c.dropConn(conn, gen)
 			return
 		}
 		if f.Type != proto.TFxResp {
@@ -179,6 +280,10 @@ func (c *FS) readLoop(conn net.Conn, gen uint64) {
 			continue
 		}
 		c.mu.Lock()
+		if c.conn != conn || c.gen != gen {
+			c.mu.Unlock()
+			return
+		}
 		ch := c.pending[resp.ID]
 		delete(c.pending, resp.ID)
 		c.mu.Unlock()
@@ -188,37 +293,10 @@ func (c *FS) readLoop(conn net.Conn, gen uint64) {
 	}
 }
 
-func (c *FS) fail(id uint32) {
-	c.mu.Lock()
-	ch := c.pending[id]
-	delete(c.pending, id)
-	c.mu.Unlock()
-	if ch != nil {
-		close(ch)
-	}
-}
-
-// dropConn closes conn and fails all pending requests, but only if conn is
-// still the current connection. A write failure or reader EOF from an already
-// replaced connection is a no-op.
-func (c *FS) dropConn(conn net.Conn) {
-	c.mu.Lock()
-	if c.conn != conn {
-		c.mu.Unlock()
-		return
-	}
-	c.conn = nil
-	c.gen++
-	pending := c.pending
-	c.pending = make(map[uint32]chan *proto.FxResp)
-	c.mu.Unlock()
-	conn.Close()
-	for _, ch := range pending {
-		close(ch)
-	}
-}
-
-func (c *FS) dropConnGen(conn net.Conn, gen uint64) {
+// dropConn fails requests from this connection only. A stale reader or writer
+// must not tear down a replacement connection. A later Do may reconnect, but
+// the failed request itself is never retried.
+func (c *FS) dropConn(conn net.Conn, gen uint64) {
 	c.mu.Lock()
 	if c.conn != conn || c.gen != gen {
 		c.mu.Unlock()
@@ -226,32 +304,35 @@ func (c *FS) dropConnGen(conn net.Conn, gen uint64) {
 	}
 	c.conn = nil
 	c.gen++
-	pending := c.pending
-	c.pending = make(map[uint32]chan *proto.FxResp)
+	for id, ch := range c.pending {
+		delete(c.pending, id)
+		close(ch)
+	}
 	c.mu.Unlock()
 	conn.Close()
-	for _, ch := range pending {
-		close(ch)
-	}
 }
 
-// Close shuts the shared connection down and fails every waiting request.
+// Close permanently shuts the session down. It cancels dialing and fails all
+// requests before closing the connection to interrupt blocked reads and writes.
 func (c *FS) Close() error {
-	c.mu.Lock()
-	conn := c.conn
-	c.conn = nil
-	c.gen++
-	pending := c.pending
-	c.pending = make(map[uint32]chan *proto.FxResp)
-	c.mu.Unlock()
-	var err error
-	if conn != nil {
-		err = conn.Close()
-	}
-	for _, ch := range pending {
-		close(ch)
-	}
-	return err
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		c.cancel()
+		conn := c.conn
+		c.conn = nil
+		c.gen++
+		pending := c.pending
+		c.pending = nil
+		c.mu.Unlock()
+		for _, ch := range pending {
+			close(ch)
+		}
+		if conn != nil {
+			c.closeErr = conn.Close()
+		}
+	})
+	return c.closeErr
 }
 
 // ReadFile fetches a whole remote file body via handle open/read/close.

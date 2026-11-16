@@ -49,7 +49,7 @@ func (s *Server) ServeConn(c net.Conn) {
 
 func (s *Server) serveExec(c net.Conn, payload []byte) {
 	req, err := proto.DecodeExecReq(payload)
-	if err != nil || len(req.Argv) == 0 {
+	if err != nil {
 		proto.WriteFrame(c, proto.TErr, []byte("rsbxd: bad exec request"))
 		proto.WriteFrame(c, proto.TExit, proto.ExitPayload(127))
 		return
@@ -79,14 +79,21 @@ func (s *Server) resolveCwd(c net.Conn, dir string) (string, bool) {
 }
 
 // build constructs the child command from the request verbatim. Argv, cwd and
-// env are used exactly as sent; an empty env is left nil so the child inherits
-// the daemon's environment. The child runs in its own process group so a
-// signal reaches the whole tree and a disconnect can take every descendant
-// with it.
+// env are used exactly as sent. An empty env is a genuinely empty environment,
+// never an inheritance request: Env is always non-nil, because exec.Cmd treats
+// nil as "inherit the daemon's environment". The child runs in its own process
+// group so a signal reaches the whole tree and a disconnect can take every
+// descendant with it.
 func (s *Server) build(req *proto.ExecReq, dir string) *exec.Cmd {
-	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
+	cmd := exec.Command(req.Target, req.Argv[1:]...)
+	cmd.Args = append([]string(nil), req.Argv...)
 	cmd.Dir = dir
 	cmd.Env = req.Env
+	if cmd.Env == nil {
+		// exec.Cmd reads nil Env as "inherit the daemon's environment"; the
+		// wire's zero-entry env is genuinely empty, so force a non-nil slice.
+		cmd.Env = []string{}
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return cmd
 }
@@ -132,7 +139,7 @@ func (s *Server) execPipes(c net.Conn, req *proto.ExecReq) {
 		outW.Close()
 		errR.Close()
 		errW.Close()
-		proto.WriteFrame(c, proto.TErr, []byte(fmt.Sprintf("rsbxd: exec %s: %v", req.Argv[0], err)))
+		proto.WriteFrame(c, proto.TErr, []byte(fmt.Sprintf("rsbxd: exec %s: %v", req.Target, err)))
 		proto.WriteFrame(c, proto.TExit, proto.ExitPayload(127))
 		return
 	}
@@ -259,7 +266,7 @@ func (s *Server) execTTY(c net.Conn, req *proto.ExecReq) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	if err := cmd.Start(); err != nil {
 		slave.Close()
-		proto.WriteFrame(c, proto.TErr, []byte(fmt.Sprintf("rsbxd: exec %s: %v", req.Argv[0], err)))
+		proto.WriteFrame(c, proto.TErr, []byte(fmt.Sprintf("rsbxd: exec %s: %v", req.Target, err)))
 		proto.WriteFrame(c, proto.TExit, proto.ExitPayload(127))
 		return
 	}

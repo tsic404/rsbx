@@ -1,23 +1,15 @@
 // Package sandbox assembles the sandbox the caller sees.
 //
-// Composition, outside in:
-//
-//	FUSE root   union of the daemon tree, the explicit local trees, and
-//	            trampolines for every executable the policy keeps remote
-//	broker      a private unix relay, the only host directory bound in, so
-//	            ssh and its credentials never enter the sandbox
-//	launcher    rsbx reexecuted into new mount/user/pid/ipc/uts namespaces;
-//	            it binds the FUSE root as /, provides private /proc and a
-//	            minimal /dev, switches root, detaches the old one and runs
-//	            the entry as a reaped, signal-forwarded child
-//	guard       Landlock exec allowlist, installed once the root is final
-//
-// Nothing here shells out: the launcher is this same binary. Every setup
-// step fails closed, so a kernel that refuses a namespace or a mount is an
-// error rather than a quietly weaker sandbox.
+// A controller owns one session: a separate worker serves the remote FUSE
+// view, a private broker relays daemon commands, and a fixed-thread launcher
+// creates namespaces and remains PID 1. Execution is mediated independently
+// from file contents; exact local programs and their read-only runtime assets
+// are the only implicit content exceptions. Explicit local trees hold user
+// configuration. No component knows any particular agent CLI.
 package sandbox
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,7 +64,8 @@ type Plan struct {
 	// Trampoline and Guard are the local helper binaries.
 	Trampoline string
 	Guard      string
-	// Remote is the multiplexed filesystem client the FUSE server serves from.
+	// Remote is the controller's independent preflight/metadata connection.
+	// The filesystem worker constructs and owns its own session connection.
 	Remote *rpc.FS
 	// Target is how the broker reaches the daemon: a unix socket or a stdio
 	// command such as ssh. It is only ever dialled outside the sandbox root.
@@ -81,22 +74,31 @@ type Plan struct {
 	Local *paths.Set
 	// Exec is the executable policy.
 	Exec *policy.Policy
+	// filesystem owns the only mount server for this session. It never pivots.
+	filesystem *filesystemWorker
+	root       *fusefs.Node
+	sessionID  string
+	sessionDir string
+	mountDir   string
 }
 
-// Prepare validates the configuration and prepares directories.
+// Prepare validates and compiles a session plan without creating a mount or
+// allocating shared runtime paths. StartFilesystem allocates owned resources.
 func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 	pol, err := policy.New(cfg.Local.Allow)
 	if err != nil {
 		return nil, err
 	}
-	// The entry program is what the session starts, so it runs locally by
-	// definition. Requiring it in local.allow as well would only ever produce
-	// "execvp: No such file or directory" at start-up.
+	// local.entry explicitly selects another local program. It has the same
+	// compiled dependency and immutable-asset requirements as local.allow.
 	if entry := cfg.Local.Entry; entry != "" {
 		if !strings.HasPrefix(entry, "/") {
 			return nil, fmt.Errorf("local.entry must be an absolute path: %q", entry)
 		}
-		pol = pol.WithExtra(entry)
+		pol, err = pol.WithExtra(entry)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(pol.Local) == 0 {
 		return nil, fmt.Errorf("local.allow selects no executable and local.entry is empty: nothing could run locally")
@@ -134,11 +136,6 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 		Exec:       pol,
 	}
 	p.Remote = rpc.NewFS(p.Target)
-	for _, d := range []string{p.Mount, p.Cache} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			return nil, err
-		}
-	}
 	return p, nil
 }
 
@@ -155,27 +152,9 @@ func mergePaths(writable, readOnly *paths.Set) *paths.Set {
 
 func targetOf(cfg *config.Config) rpc.Target {
 	if cfg.Daemon.Transport == "ssh" {
-		return rpc.Target{Command: transportCommand(cfg.Daemon.Command)}
+		return rpc.Target{Command: splitCommand(cfg.Daemon.Command)}
 	}
 	return rpc.Target{Socket: cfg.Daemon.Socket}
-}
-
-// transportCommand prepares the daemon command. For ssh it turns on connection
-// multiplexing, which matters because the broker opens one connection per
-// redirected command and a fresh handshake per exec would dominate.
-func transportCommand(spec string) []string {
-	argv := splitCommand(spec)
-	if len(argv) == 0 || filepath.Base(argv[0]) != "ssh" {
-		return argv
-	}
-	for _, a := range argv {
-		if strings.HasPrefix(a, "-o") && strings.Contains(a, "ControlMaster") {
-			return argv
-		}
-	}
-	ctl := filepath.Join(os.TempDir(), "rsbx-ssh-%C")
-	out := []string{argv[0], "-o", "ControlMaster=auto", "-o", "ControlPath=" + ctl, "-o", "ControlPersist=60"}
-	return append(out, argv[1:]...)
 }
 
 // splitCommand splits a command line into argv, honouring double quotes so a
@@ -217,52 +196,32 @@ func splitCommand(s string) []string {
 func (p *Plan) Layout() *fusefs.Layout {
 	roots := p.Local.Roots()
 	hostDirs := map[string]bool{}
-	// Every ancestor of a local tree must exist in the view. The launcher
-	// creates its mount targets itself, so reserving the ancestors keeps any
-	// placeholder out of the daemon tree.
+	// Local ancestors provide union directories, not synthetic subtrees: their
+	// unrelated descendants still belong to the daemon.
 	for _, d := range roots {
 		hostDirs[d] = true
 		for q := d; q != "/" && q != "."; q = filepath.Dir(q) {
 			hostDirs[filepath.Dir(q)] = true
 		}
 	}
-	allSynthetic := append([]string(nil), synthetic...)
-	for d := range hostDirs {
-		// The root of a local tree is served by the tree itself, not as a
-		// placeholder, and a path already listed keeps its meaning.
-		if d == "/" || p.Local.IsLocal(d) {
-			continue
-		}
-		allSynthetic = append(allSynthetic, d)
-	}
-	// Only trees that hold the allowlist need FUSE to arbitrate per name.
-	// Everything else that is local is served from the host directly.
-	policyDirs := p.PolicyDirs()
-	execDirs := make([]string, 0, len(policyDirs))
-	for d := range policyDirs {
-		execDirs = append(execDirs, d)
-	}
-	sort.Strings(execDirs)
 	return &fusefs.Layout{
-		Remote:     p.Remote,
-		Local:      p.Local,
-		ExecDirs:   execDirs,
-		Trampoline: p.Trampoline,
-		LocalExec:  p.Exec.IsAliasTarget,
-		Cache:      p.Cache,
-		TTL:        2 * time.Second,
+		Remote:       p.Remote,
+		Local:        p.Local,
+		LocalExec:    p.Exec.IsAliasTarget,
+		ExecPaths:    p.Exec.ExecPaths(),
+		RuntimePaths: p.Exec.RuntimePaths(),
 		// No SystemLinks: the merged-usr symlinks belong to the daemon's
 		// tree, and inventing them here would hand the sandbox a host /lib
 		// that the policy never granted.
-		Synthetic:      dedupePaths(allSynthetic),
+		Synthetic:      append([]string(nil), synthetic...),
 		SyntheticFiles: append([]string(nil), syntheticFiles...),
 		HostDirs:       hostDirs,
 	}
 }
 
-// MountRoot mounts the sandbox root and returns the server so the caller can
-// wait for it.
-func (p *Plan) MountRoot() (*fuse.Server, error) {
+// mountRoot is private to the filesystem worker. The controller receives a
+// readiness result, not a server that it can accidentally serve or pivot into.
+func (p *Plan) mountRoot(layout *fusefs.Layout) (*fuse.Server, error) {
 	opts := &fs.Options{
 		MountOptions: fuse.MountOptions{
 			AllowOther:        false,
@@ -284,29 +243,23 @@ func (p *Plan) MountRoot() (*fuse.Server, error) {
 		// already have replaced, and a rename the kernel has not invalidated
 		// reads back as the old bytes. Every lookup costs one round trip on a
 		// tree that is remote either way.
-		AttrTimeout: durp(0),
+		AttrTimeout:     durp(0),
+		NullPermissions: true,
 	}
-	srv, err := fs.Mount(p.Mount, fusefs.NewRoot(p.Layout()), opts)
+	root := fusefs.NewRoot(layout)
+	if err := root.Err(); err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	srv, err := fs.Mount(p.Mount, root, opts)
 	if err != nil {
+		_ = root.Close()
 		return nil, err
 	}
-	// Wait until the mount actually answers. The launcher binds the source
-	// path immediately, and a freshly mounted FUSE root refuses requests for
-	// a moment while the server thread starts.
-	if err := waitReady(srv); err != nil {
-		srv.Unmount()
-		return nil, err
-	}
+	p.root = root
+	// fs.Mount already completes INIT and WaitMount. A second probe adds no
+	// readiness guarantee; only this filesystem worker serves the mount.
 	return srv, nil
-}
-
-// waitReady waits until the mount answers. It asks the server object, which
-// knows when its serving loop is ready, rather than probing the filesystem:
-// this process is the server for that mount, so a filesystem call made before
-// the loop starts is answered by nobody and the kernel parks the caller in an
-// uninterruptible wait that no deadline can break.
-func waitReady(srv *fuse.Server) error {
-	return srv.WaitMount()
 }
 
 func durp(sec float64) *time.Duration {
@@ -314,25 +267,9 @@ func durp(sec float64) *time.Duration {
 	return &d
 }
 
-// SandboxExecPaths lists, in sandbox coordinates, every path Landlock must
-// keep executable.
-//
-// Two grants, for two different jobs:
-//
-//   - The allowlist files, expanded with the real target of every alias so a
-//     distribution symlink such as /bin/sh -> dash also grants the file the
-//     kernel actually loads.
-//   - The directories the policy arbitrates, because Landlock grants an inode
-//     and a redirected name is not the inode of the file behind it. FUSE serves
-//     the trampoline for that name, so the kernel resolves the exec against a
-//     different inode than the allowlist named; without the directory grant the
-//     kernel refused the trampoline itself, which is the opposite of running
-//     the program on the daemon.
-//
-// The directory grant does not widen the policy: inside a policy directory
-// FUSE has already decided every name, serving host bytes only for the
-// allowlist and the trampoline for anything else. Landlock still refuses a name
-// FUSE never presented as a program.
+// SandboxExecPaths contains concrete program/runtime assets and native helpers.
+// Data directories are never execute grants; the exec supervisor routes remote
+// programs without replacing their file content or broadening this ruleset.
 func (p *Plan) SandboxExecPaths() []string {
 	out := []string{GuardPath, TrampolinePath}
 	if p.Exec == nil {
@@ -348,8 +285,8 @@ func (p *Plan) SandboxExecPaths() []string {
 	for _, e := range p.Exec.ExecPaths() {
 		add(e)
 	}
-	for d := range p.PolicyDirs() {
-		add(d)
+	for _, asset := range p.Exec.RuntimePaths() {
+		add(asset)
 	}
 
 	sort.Strings(out)
@@ -357,8 +294,12 @@ func (p *Plan) SandboxExecPaths() []string {
 }
 
 // usesHostNetwork reports whether the sandbox keeps the host network namespace.
+// The daemon transport never decides this: the broker dials the daemon from its
+// own host process, outside the sandbox root and mount namespace, so an ssh
+// transport works with a private network namespace. Only the explicit
+// sandbox.share_network setting asks for host networking.
 func (p *Plan) usesHostNetwork() bool {
-	return p.Cfg.Daemon.Transport == "ssh" || p.Cfg.Sandbox.ShareNetwork
+	return p.Cfg.Sandbox.ShareNetwork
 }
 
 // hasPath reports whether a host path keeps its meaning inside the sandbox:
@@ -399,50 +340,13 @@ func dedupePaths(in []string) []string {
 	return out
 }
 
-// pathDirs are the directories a command is looked up in. A program on PATH is
-// decided per name: the policy says which of those names run here, so the
-// others run on the daemon. Without this, a name the configuration never
-// mentions would be served as this machine's file and executed here — the
-// opposite of the documented rule that anything not allowlisted runs remotely.
-var pathDirs = []string{"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"}
-
-// PolicyDirs are the directories where the policy must decide per name: the
-// directories the allowlist names, plus the PATH directories themselves.
-func (p *Plan) PolicyDirs() map[string]bool {
-	out := map[string]bool{}
-	if p.Exec == nil {
-		return out
-	}
-	for _, e := range p.Exec.Local {
-		fi, err := os.Stat(e)
-		if err == nil && fi.IsDir() {
-			out[e] = true
-			continue
-		}
-		out[filepath.Dir(e)] = true
-	}
-	// A PATH directory is where programs are looked up, so it is where the
-	// policy has to answer per name. Only directories that exist here are
-	// added: a path this machine does not have is served by the daemon whole.
-	for _, d := range pathDirs {
-		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
-			out[d] = true
-		}
-	}
-	return out
-}
-
-// Run starts the entry program inside the sandbox.
-//
-// The FUSE server and the broker stay in this process, outside the namespaces.
-// The launcher is this same binary reexecuted with an internal flag; it owns
-// namespace setup, root switching, capability removal, signal forwarding and
-// reaping. This method only supervises it.
-func (p *Plan) Run(argv []string) (int, error) {
+// Run supervises the namespace launcher while a separate worker serves FUSE.
+// Cancellation terminates the local process tree and closes command relays.
+func (p *Plan) Run(ctx context.Context, argv []string) (int, error) {
 	b, err := newBroker(p.Target, filepath.Join(p.Cache, "broker"))
 	if err != nil {
 		return 127, fmt.Errorf("sandbox broker: %w", err)
 	}
 	defer b.Close()
-	return p.launch(p.launchSpec(argv, b))
+	return p.launch(ctx, p.launchSpec(argv, b))
 }

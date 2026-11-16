@@ -1,15 +1,18 @@
-# rsbx layout
+# rsbx boundaries
 
-The sandbox is assembled from four independent mechanisms, each of which can
-be tested on its own:
+The sandbox is assembled from independently testable owners. Nothing in these
+boundaries knows a particular agent CLI.
 
-| layer | file | responsibility |
+| owner | file | responsibility |
 |---|---|---|
-| policy | `internal/policy` | absolute-path allowlist, pure function |
-| filesystem | `internal/fusefs` | union of daemon tree, host toolchain, trampolines |
-| transport | `internal/rpc`, `internal/proto` | frames over a unix socket or ssh stdio |
-| daemon | `internal/daemon`, `internal/fsremote` | executes commands, owns the remote tree |
+| policy | `internal/policy` | compile configured local executables plus their verified runtime assets; no hidden PATH grants |
+| filesystem | `internal/fusefs` | one immutable file source per inode: daemon bytes, exact native asset, or explicit local tree |
+| transport | `internal/rpc`, `internal/proto` | session-owned file and command connections with permanent close semantics |
+| daemon | `internal/daemon`, `internal/fsremote` | run commands and own the remote tree, with no jail or path rewrite |
+| controller | `cmd/rsbx`, `internal/sandbox/filesystem.go` | allocate one session, own cancellation, report teardown failures |
+| launcher | `internal/sandbox/launch.go`, `exectrap_linux.go` | create real namespaces, remain PID 1, mediate every descendant exec |
+| guard/gateway | `cmd/rsbx-guard`, `cmd/rsbx-tramp` | trusted exec restriction entry and remote command gateway |
 
-The trampoline (`cmd/rsbx-tramp`) is what makes redirection hold for every
-program, including statically linked ones: the name in the sandbox simply *is*
-the trampoline, so there is no host binary left to run by accident.
+Execution routing is not file substitution. A remote executable read through
+FUSE remains the daemon's bytes; PID 1's exec supervisor decides whether an
+execve/execveat is an exact local program or a remote daemon command.

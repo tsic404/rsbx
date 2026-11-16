@@ -76,10 +76,16 @@ func remoteMount(t *testing.T) (mnt, root string, lay *Layout) {
 	lay = &Layout{
 		Remote: fsRemote{s: srv},
 		Local:  noLocal{},
-		Cache:  filepath.Join(base, "cache"),
+	}
+	rootNode := NewRoot(lay)
+	if err := rootNode.Err(); err != nil {
+		rootNode.Close()
+		srv.Close()
+		t.Fatal(err)
 	}
 	one := time.Second
-	fsrv, err := fs.Mount(mnt, NewRoot(lay), &fs.Options{
+	fsrv, err := fs.Mount(mnt, rootNode, &fs.Options{
+		NullPermissions: true,
 		MountOptions: fuse.MountOptions{
 			FsName: "rsbx-remote-test", DisableSplice: true,
 			// Production negotiates POSIX locks so the daemon arbitrates them;
@@ -90,9 +96,11 @@ func remoteMount(t *testing.T) (mnt, root string, lay *Layout) {
 		EntryTimeout: &one, AttrTimeout: &one,
 	})
 	if err != nil {
+		rootNode.Close()
+		srv.Close()
 		t.Skipf("cannot mount FUSE here: %v", err)
 	}
-	t.Cleanup(func() { fsrv.Unmount(); srv.Close() })
+	t.Cleanup(func() { fsrv.Unmount(); rootNode.Close(); srv.Close() })
 	return mnt, root, lay
 }
 
@@ -283,6 +291,58 @@ func TestRemoteCreateMode0600AndMkdir0700(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0o700 {
 		t.Fatalf("created dir mode %v, want 0700", fi.Mode().Perm())
+	}
+}
+
+// A native process creates its executable 0755 and then makes it 0755 with
+// fchmod through the descriptor. The daemon has to end up with that exact
+// mode: the create reply only describes the file, the mode the process asks
+// for is what the inode must carry. Sending the permission bits in the wrong
+// wire field applied chmod(0), so the daemon inode was 0000 and every later
+// exec answered EACCES even though install succeeded.
+func TestRemoteFchmodThroughDescriptorKeepsExecutableMode(t *testing.T) {
+	mnt, root, _ := remoteMount(t)
+	p := inView(mnt, filepath.Join(root, "proj", "remote-native"))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_CLOEXEC, 0o755)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := f.Write([]byte("\x7fELF")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Chmod(0o755); err != nil {
+		t.Fatalf("fchmod 0755: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The mode the daemon holds is the one that decides exec, so check it on
+	// the daemon side rather than through the mount's cached attributes.
+	var st syscall.Stat_t
+	if err := syscall.Stat(filepath.Join(root, "proj", "remote-native"), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		t.Fatalf("daemon mode %#o is not a regular file", st.Mode)
+	}
+	if got := st.Mode & 0o7777; got != 0o755 {
+		t.Fatalf("daemon mode after fchmod = %#o, want 0755", got)
+	}
+	// Owner-execute specifically: this is the bit the exec gate tests.
+	if err := syscall.Access(filepath.Join(root, "proj", "remote-native"), 0o1); err != nil {
+		t.Fatalf("daemon refused execute access: %v", err)
+	}
+	// And the mount reports the same full type and permission mode.
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o755 || !fi.Mode().IsRegular() {
+		t.Fatalf("mount mode = %v, want regular 0755", fi.Mode())
 	}
 }
 

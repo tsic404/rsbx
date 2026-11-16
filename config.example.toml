@@ -1,10 +1,9 @@
 # rsbx — a shell whose view of the machine is the daemon's, except for the
 # programs and paths explicitly listed under [local].
 #
-# The defaults need no configuration: /bin/sh (the entry shell) is the only
-# local executable, every other command runs on the daemon, and no host
-# library or /usr/bin tree is pulled in implicitly. This file just names the
-# socket; everything commented out is the default.
+# The entry shell runs locally. Its exact loader/library dependencies are
+# compiled and served read-only; no whole host library or PATH directory is
+# exposed implicitly. Every other named command is routed to the daemon.
 
 [daemon]
 # "unix"  : rsbxd listens on a socket on this machine
@@ -15,34 +14,27 @@ socket    = "~/.rsbx/daemon.sock"
 [local]
 # -- which programs run HERE --
 #
-# By default this list is empty. The only local command is local.entry below;
-# everything else — /bin/ls, /bin/cat, a shell tool, a coding agent — executes
-# on the daemon under its own filesystem view. That is the intended default,
-# and it is not a privilege question: the daemon's / is the machine you are
-# reaching, so ordinary commands and the project tree live there naturally.
-#
-# Add a program only when it must read local content. A daemon-side program
-# cannot see a [local.paths] tree, because the two sides have different
-# filesystem views. When such a tool fails, the sandbox says so:
-#
-#   rsbx: stat ran on the daemon and cannot see the local tree /work/a.txt;
-#         add /usr/bin/stat to local.allow to run it here instead
+# Entries are expanded once into exact executable identities. A directory or
+# glob is a startup snapshot, not permission for future files in that tree.
+# Interpreter/runtime dependencies are compiled with each program; they do
+# not authorize independent interpreter commands such as node -e.
+# A remote command cannot see local.paths. Do not upload local configuration
+# or silently run an unlisted command locally to work around that boundary.
 allow = []
 
-# The shell the session starts. It runs locally by definition, so it does not
-# need to be repeated in local.allow; a path outside a local tree would fail at
-# start-up, which is the error that rule exists to prevent.
+# The explicit entry is another local program, with the same dependency and
+# immutable-snapshot requirements. It need not be repeated in local.allow.
 entry = "/bin/sh"
 
 # -- which files are LOCAL --
-# Trees read and written on this machine. A redirected program on the daemon
-# cannot see them at all. Empty by default: the client's filesystem is the
-# daemon's, except for these trees and local.allow's executable bytes.
+# Configuration/state trees read and written on this machine. Programs running
+# on the daemon see only the daemon's native tree. These grants do not permit
+# executing new code created under a writable configuration directory.
 paths = []
 
-# Toolchain and device trees, served locally, read-only. Empty by default; add
-# a directory here only to make it local on purpose, never to reconstruct the
-# host /usr or library tree that the daemon already serves.
+# Explicit read-only local resource trees. Shared libraries required by the
+# selected local programs are already compiled as exact read-only assets;
+# use this only for extra resources such as an agent's installed package data.
 read_only_paths = []
 
 # There is no [remote] table and no daemon-side root. rsbxd runs on the remote
@@ -50,13 +42,17 @@ read_only_paths = []
 # path the daemon can open, sent verbatim.
 
 [sandbox]
+# These are base directories; each invocation owns unique children. They must
+# not overlap local content trees, including through symlink aliases.
 mount = "~/.rsbx/sandbox"
-# Disposable runtime scratch the client stages transient data in. It is not a
-# snapshot of remote files and nothing is ever served from it, so deleting it
-# only costs the client re-staging what it needs.
+# Disposable session scratch and a verified read-only native executable cache.
+# It contains no copied remote project tree. Do not delete it during a session.
 cache = "~/.rsbx/cache"
-# Agents talk to their APIs, so they need the network.
+# Agents talk to their APIs, so they need the network. This setting is
+# explicit-only: no transport implies it. The ssh transport runs outside the
+# sandbox and reaches the daemon through the broker, so it needs no host
+# networking.
 # share_network = false
-# Inside a container the runtime has already created a user namespace; nested
-# creation is refused on some hosts, so set unshare_user = false there.
+# Inside a container that cannot create a nested user namespace, use false.
+# Mount/PID/IPC/UTS isolation and execution restrictions remain mandatory.
 # unshare_user = false
