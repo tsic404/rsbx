@@ -16,6 +16,11 @@ import (
 // The paths are interpreted inside the sandbox, after the launcher has built
 // the view, which is why they are sandbox-absolute ("/usr/bin/bash") rather
 // than host paths: the guard runs where the kernel resolves them that way.
+// grantDeadline bounds the whole grant phase, not each path. Most loader paths
+// in the list do not exist on any given image, and waiting the full window for
+// every one of them turned a slow start into a minute-long one.
+const grantDeadline = 2 * time.Second
+
 func LandlockRuleset(paths []string) (int, error) {
 	attr := unix.LandlockRulesetAttr{Access_fs: unix.LANDLOCK_ACCESS_FS_EXECUTE}
 	fd, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
@@ -25,8 +30,9 @@ func LandlockRuleset(paths []string) (int, error) {
 	}
 	ruleset := int(fd)
 	all := append(append([]string(nil), paths...), loaderPaths()...)
+	deadline := time.Now().Add(grantDeadline)
 	for _, p := range all {
-		if err := addPathBeneath(ruleset, p); err != nil {
+		if err := addPathBeneath(ruleset, p, deadline); err != nil {
 			unix.Close(ruleset)
 			return 0, err
 		}
@@ -34,8 +40,8 @@ func LandlockRuleset(paths []string) (int, error) {
 	return ruleset, nil
 }
 
-func addPathBeneath(ruleset int, path string) error {
-	fd, err := openForRule(path)
+func addPathBeneath(ruleset int, path string, deadline time.Time) error {
+	fd, err := openForRule(path, deadline)
 	if err != nil {
 		// A path that is genuinely absent cannot be executed either, so
 		// skipping it keeps one missing entry from disabling the whole sandbox.
@@ -117,16 +123,18 @@ var _ = strings.HasPrefix
 // sandbox's own filesystem, which under load can answer a transient error for a
 // file that is plainly there, so a failure is retried on a short delay before it
 // is believed.
-func openForRule(path string) (int, error) {
+func openForRule(path string, deadline time.Time) (int, error) {
 	var err error
-	deadline := time.Now().Add(5 * time.Second)
 	for attempt := 0; ; attempt++ {
 		var fd int
 		fd, err = unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
 		if err == nil {
 			return fd, nil
 		}
-		if time.Now().After(deadline) {
+		// A path that is genuinely absent costs one attempt: only a path that
+		// is being created can benefit from waiting, and the retry loop must
+		// not spend the whole budget on the dozen loaders this image lacks.
+		if !time.Now().Before(deadline) {
 			break
 		}
 		// ENOENT is retried like any other error. The path is read through the
