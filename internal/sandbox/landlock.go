@@ -17,10 +17,11 @@ import (
 // The paths are interpreted inside the sandbox, after the launcher has built
 // the view, which is why they are sandbox-absolute ("/usr/bin/bash") rather
 // than host paths: the guard runs where the kernel resolves them that way.
-// grantDeadline bounds the whole grant phase, not each path. Most loader paths
-// in the list do not exist on any given image, and waiting the full window for
-// every one of them turned a slow start into a minute-long one.
-const grantDeadline = 2 * time.Second
+// grantDeadline is how long a path the policy named may take to resolve. Every
+// one of those must exist, so a slow answer is worth waiting for: the sandbox
+// filesystem builds its view on demand, and the first look at a path costs a
+// round trip to the daemon.
+const grantDeadline = 3 * time.Second
 
 func LandlockRuleset(paths []string) (int, error) {
 	attr := unix.LandlockRulesetAttr{Access_fs: unix.LANDLOCK_ACCESS_FS_EXECUTE}
@@ -30,10 +31,22 @@ func LandlockRuleset(paths []string) (int, error) {
 		return 0, fmt.Errorf("landlock_create_ruleset: %w", errno)
 	}
 	ruleset := int(fd)
-	all := append(append([]string(nil), paths...), loaderPaths()...)
-	deadline := time.Now().Add(grantDeadline)
-	for _, p := range all {
-		if err := addPathBeneath(ruleset, p, deadline); err != nil {
+	// The paths the policy named come first and get the whole window: every one
+	// of them must resolve, and a missing one is a real failure to report. The
+	// loader candidates follow with no retry at all, because most of that list
+	// does not exist on any given image and waiting on each absent name starved
+	// the ones that were real. Measured on the runner:
+	// /lib/ld-linux-x86-64.so.2 is absent on Debian 13 and spent two seconds of
+	// a two-second budget before the real loader under /usr/lib/x86_64-linux-gnu
+	// was even tried.
+	for _, p := range paths {
+		if err := addPathBeneath(ruleset, p, time.Now().Add(grantDeadline)); err != nil {
+			unix.Close(ruleset)
+			return 0, err
+		}
+	}
+	for _, p := range loaderPaths() {
+		if err := addPathBeneath(ruleset, p, time.Time{}); err != nil {
 			unix.Close(ruleset)
 			return 0, err
 		}
@@ -136,10 +149,10 @@ func openForRule(path string, deadline time.Time) (int, error) {
 		if err == nil {
 			return fd, nil
 		}
-		// A path that is genuinely absent costs one attempt: only a path that
-		// is being created can benefit from waiting, and the retry loop must
-		// not spend the whole budget on the dozen loaders this image lacks.
-		if !time.Now().Before(deadline) {
+		// A zero deadline is one attempt. The loader candidates use that: they
+		// are a guess at what the image might have, not paths the policy
+		// promised, and waiting on each absent one starves the real loader.
+		if deadline.IsZero() || !time.Now().Before(deadline) {
 			break
 		}
 		// ENOENT is retried like any other error. The path is read through the

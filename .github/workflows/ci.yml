@@ -202,7 +202,6 @@ jobs:
           docker run --rm --privileged --user 0 --network rsbx-e2e \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             -v "$PWD/e2e/client-state:/cfg:ro" \
-            -e RSBX_LANDLOCK_TRACE=1 \
             --entrypoint /bin/bash rsbx:ci -c '
               cp /cfg/config.toml /e2e/state/config.toml
               mkdir -p /e2e/state/sandbox /e2e/state/cache
