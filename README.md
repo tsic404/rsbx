@@ -279,6 +279,34 @@ The configured names are startup executable identities, not directory prefixes.
 Their runtime dependencies are resolved and verified with them. `multica` can
 drive remote `git` without naming git in the configuration.
 
+### Task workspaces
+
+The task workspace belongs to the daemon's tree, not to the caller's machine.
+The caller names the workspace's native daemon path and, when it has initial
+material (a checkout, the task instructions, platform state), the local
+directory that material came from:
+
+```sh
+rsbx -workspace /proj/tasks/4718 \
+     -workspace-seed /var/lib/multica/tasks/4718 -- codex
+```
+
+Before anything is mounted or started, the workspace is created in the
+daemon's tree and the seed is written through the daemon's filesystem channel.
+The session then starts in `/proj/tasks/4718`, so remote commands and the local
+entry work on one tree. Initialization is additive: paths present in the seed
+get the seed's bytes and modes, while files the agent already wrote stay.
+Symlinks in the seed are copied as links and never followed.
+
+That channel carries the workspace's own material only. A seed or workspace
+path that overlaps `local.paths` or `local.read_only_paths` is refused: those
+trees are this machine's private configuration, they are never sent to the
+daemon, and no failed remote read is answered from a local copy.
+
+`-workspace` without `-workspace-seed` attaches to a workspace that already
+exists in the daemon's tree. A missing start directory fails the session
+explicitly; rsbx never substitutes another directory.
+
 ### What is verified, and where
 
 `testdata/mixed/lab.sh` and `stress.sh` drive shell stand-ins, not real CLIs.
@@ -298,6 +326,13 @@ invocation), that project executable bytes are preserved, a custom `argv[0]`
 still routes by target, a named `execveat` descriptor runs remotely, a deleted
 descriptor is refused, a remote `git` clone is visible through the local view,
 and a detached local child and a canceled session are cleaned up.
+
+`tests/acceptance/TC-16/run.sh` is the task-workspace gate. It initializes a
+workspace from a seed, starts a session in it, and checks that remote commands
+and the local view agree; that a seed overlapping `local.paths` is refused
+without writing anything; that a missing start directory fails the session
+explicitly; and that re-initialization restores the seed while keeping the
+agent's products.
 
 Observed on a Linux amd64 client against a live daemon (client and daemon in
 separate disposable containers), all gates clean with no leftover mount or

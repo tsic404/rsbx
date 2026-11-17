@@ -67,6 +67,8 @@ func runCLI() (code int) {
 		noMount = flag.Bool("no-mount", false, "print the computed plan and exit")
 		serve   = flag.Bool("serve", false, "serve a session filesystem until interrupted")
 		showVer = flag.Bool("version", false, "print the version and exit")
+		wsPath  = flag.String("workspace", "", "absolute task-workspace path in the daemon's tree; the session starts there")
+		wsSeed  = flag.String("workspace-seed", "", "local directory whose own content initializes the workspace")
 	)
 	flag.Parse()
 	if *showVer {
@@ -109,6 +111,14 @@ func runCLI() (code int) {
 	if err != nil {
 		return report(err)
 	}
+	if *wsPath != "" || *wsSeed != "" {
+		if *wsSeed != "" && *wsPath == "" {
+			return report(fmt.Errorf("-workspace-seed requires -workspace: the seed is written into a directory in the daemon's tree"))
+		}
+		if err := plan.SetWorkspace(*wsPath, *wsSeed); err != nil {
+			return report(err)
+		}
+	}
 	defer func() {
 		if err := plan.Close(); err != nil {
 			_ = report(fmt.Errorf("session cleanup: %w", err))
@@ -140,6 +150,19 @@ func runCLI() (code int) {
 			_ = report(fmt.Errorf("close session connection: %w", err))
 		}
 		return interruptedCode(ctx)
+	}
+	// The workspace is established in the daemon's tree before the mount and
+	// before any process starts: its initial material travels through the
+	// daemon's filesystem channel, and a missing start directory fails the
+	// session here instead of being replaced by another one.
+	if err := plan.EnsureWorkspace(ctx); err != nil {
+		if ctx.Err() != nil {
+			// Cancellation owns this outcome; the phase already released the
+			// connection, so a daemon that stopped answering cannot hold the
+			// start open.
+			return interruptedCode(ctx)
+		}
+		return report(err)
 	}
 	if err := plan.StartFilesystem(ctx); err != nil {
 		if ctx.Err() != nil {

@@ -446,6 +446,44 @@ jobs:
           fi
           test "$(grep -c '^OK' mixed-stress.txt)" -eq 4
 
+      # The task workspace belongs to the daemon's tree: the caller's initial
+      # material is written there through the daemon's filesystem channel
+      # before the session starts, the agent's working directory is that
+      # remote path, and a tree declared local on the client never crosses.
+      - name: task workspace initialization
+        run: |
+          docker rm -f rsbxd-ws >/dev/null 2>&1 || true
+          docker volume rm ws-proj ws-run >/dev/null 2>&1 || true
+          docker network rm ws-net >/dev/null 2>&1 || true
+          docker network create ws-net >/dev/null
+          docker volume create ws-proj >/dev/null
+          docker volume create ws-run >/dev/null
+          docker run --rm --user 0 -v ws-run:/run/rsbx --entrypoint /bin/sh rsbx:ci \
+            -c 'mkdir -p /run/rsbx && chown 1000:1000 /run/rsbx'
+          docker run --rm --user 0 -v ws-proj:/proj --entrypoint /bin/sh rsbx:ci \
+            -c 'chmod 777 /proj'
+          docker run -d --rm --name rsbxd-ws --network ws-net \
+            -v ws-proj:/proj -v ws-run:/run/rsbx \
+            --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
+          docker run --rm --network ws-net -v ws-run:/run/rsbx \
+            --entrypoint /bin/bash rsbx:ci -c '
+              for i in $(seq 1 50); do [ -S /run/rsbx/daemon.sock ] && exit 0; sleep 0.2; done
+              echo "daemon socket never appeared"; exit 1
+            '
+          docker run --rm --privileged --user 0 --network ws-net \
+            -v "$PWD/tests/acceptance/TC-16:/probe:ro" -v ws-run:/run/rsbx \
+            --entrypoint /bin/bash rsbx:ci -c '
+              mkdir -p /state/sb /state/cache /work/agent /work/task
+              chmod -R 777 /state /work
+              MNT=/state F=/usr/local/bin/rsbx SOCK=/run/rsbx/daemon.sock \
+                AGENT_HOME=/work/agent SEED=/work/task WS=/proj/tasks/tc16 \
+                UNSHARE_USER=false timeout 300 bash /probe/run.sh
+            ' 2>&1 | tee tc16-out.txt
+          if grep -q "^FAIL" tc16-out.txt; then
+            echo "task workspace checks failed:"; grep "^FAIL" tc16-out.txt; exit 1
+          fi
+          test "$(grep -c '^OK' tc16-out.txt)" -eq 8
+
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3

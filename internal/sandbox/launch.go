@@ -806,10 +806,10 @@ func protectDevMount(target string) error {
 }
 
 // launchSpec builds the payload for this run.
-func (p *Plan) launchSpec(argv []string, b *broker) *launchSpec {
-	cwd, _ := os.Getwd()
-	if cwd != "" && !p.hasPath(cwd) {
-		cwd = ""
+func (p *Plan) launchSpec(argv []string, b *broker) (*launchSpec, error) {
+	cwd, err := p.startDir()
+	if err != nil {
+		return nil, err
 	}
 	target := ""
 	if len(argv) > 0 {
@@ -852,7 +852,22 @@ func (p *Plan) launchSpec(argv []string, b *broker) *launchSpec {
 			}
 		}
 	}
-	return spec
+	return spec, nil
+}
+
+// startDir is where the entry begins. A declared workspace is the session's
+// starting directory: it is a path in the daemon's tree, verified by the
+// workspace initializer before the mount exists. Without one, the caller's
+// own working directory is used as sent; there is no substitute directory.
+func (p *Plan) startDir() (string, error) {
+	if p.Workspace != nil && p.Workspace.Path != "" {
+		return p.Workspace.Path, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("session start directory: %w", err)
+	}
+	return cwd, nil
 }
 
 // Pin Start through Wait: Linux Pdeathsig tracks the creating OS thread,
