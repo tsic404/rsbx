@@ -9,6 +9,7 @@ boundaries knows a particular agent CLI.
 | filesystem | `internal/fusefs` | one immutable file source per inode: daemon bytes, exact native asset, or explicit local tree |
 | transport | `internal/rpc`, `internal/proto` | session-owned file and command connections with permanent close semantics |
 | daemon | `internal/daemon`, `internal/fsremote` | run commands and own the remote tree, with no jail or path rewrite |
+| workspace | `internal/workspace` | establish the task workspace in the daemon's tree from the caller's own material; refuse trees this machine declares local |
 | controller | `cmd/rsbx`, `internal/sandbox/filesystem.go` | allocate one session, own cancellation, report teardown failures |
 | launcher | `internal/sandbox/launch.go`, `exectrap_linux.go` | create real namespaces, remain PID 1, mediate every descendant exec |
 | guard/gateway | `cmd/rsbx-guard`, `cmd/rsbx-tramp` | trusted exec restriction entry and remote command gateway |

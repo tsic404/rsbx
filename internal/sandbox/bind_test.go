@@ -102,7 +102,10 @@ func TestLaunchSpecCarriesNoDaemonTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Stop()
-	spec := plan.launchSpec([]string{"/bin/sh"}, b)
+	spec, err := plan.launchSpec([]string{"/bin/sh"}, b)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if spec.Mount != plan.Mount || spec.BrokerDir != b.HostDir() {
 		t.Errorf("spec mispoints the root or broker: %+v", spec)
 	}
@@ -142,7 +145,10 @@ func TestReservedCwdIsNotCarried(t *testing.T) {
 	}
 	// Whatever the checkout happens to be, the spec never carries a cwd the
 	// view cannot reach.
-	spec := plan.launchSpec([]string{"/bin/sh"}, b)
+	spec, err := plan.launchSpec([]string{"/bin/sh"}, b)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if spec.Cwd != "" && !plan.hasPath(spec.Cwd) {
 		t.Errorf("cwd %q is unreachable in the sandbox view", spec.Cwd)
 	}

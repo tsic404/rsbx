@@ -15,6 +15,11 @@ func (p *Plan) Explain() string {
 	fmt.Fprintf(&b, "daemon:      %s\n", p.Cfg.Daemon.EffectiveEndpoint())
 	fmt.Fprintf(&b, "network:     %s\n", networkMode(p.usesHostNetwork()))
 	fmt.Fprintf(&b, "user ns:     %v\n", p.Cfg.Sandbox.UnshareUser)
+	if p.Workspace != nil && p.Workspace.Path != "" {
+		fmt.Fprintf(&b, "workspace:   %s (seed %s)\n", p.Workspace.Path, p.Workspace.Seed)
+	} else {
+		fmt.Fprintf(&b, "workspace:   none\n")
+	}
 	fmt.Fprintf(&b, "local (%d):\n", len(p.Exec.Local))
 	for _, e := range p.Exec.Local {
 		fmt.Fprintf(&b, "  %s\n", e)

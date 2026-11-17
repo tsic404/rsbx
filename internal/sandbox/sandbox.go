@@ -25,6 +25,7 @@ import (
 	"rsbx/internal/paths"
 	"rsbx/internal/policy"
 	"rsbx/internal/rpc"
+	"rsbx/internal/workspace"
 )
 
 // Reserved sandbox paths. All of them are synthetic in the FUSE layout: the
@@ -74,6 +75,9 @@ type Plan struct {
 	Local *paths.Set
 	// Exec is the executable policy.
 	Exec *policy.Policy
+	// Workspace, when set, is the task workspace in the daemon's tree: this
+	// session starts there after initializing it from the seed.
+	Workspace *workspace.Spec
 	// filesystem owns the only mount server for this session. It never pivots.
 	filesystem *filesystemWorker
 	root       *fusefs.Node
@@ -137,6 +141,59 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 	}
 	p.Remote = rpc.NewFS(p.Target)
 	return p, nil
+}
+
+// SetWorkspace attaches a task workspace. The path is a native path in the
+// daemon's tree, so it must stay outside every tree this machine declares
+// local; otherwise the session would start in local content that remote
+// commands cannot reach.
+func (p *Plan) SetWorkspace(path, seed string) error {
+	spec := workspace.Spec{Path: path, Seed: seed, Local: p.Local}
+	if err := workspace.Validate(spec); err != nil {
+		return err
+	}
+	if path != "" && !p.hasPath(path) {
+		return fmt.Errorf("workspace %s is a reserved sandbox path", path)
+	}
+	p.Workspace = &spec
+	return nil
+}
+
+// EnsureWorkspace writes the workspace's initial material through the daemon's
+// filesystem channel and proves the start directory exists there. It runs
+// before the mount exists, so a refused initialization costs no session.
+//
+// The phase belongs to the session: when ctx ends, this session's connection
+// is closed, which releases every pending request, and the call returns
+// without waiting for a daemon that stopped answering.
+func (p *Plan) EnsureWorkspace(ctx context.Context) error {
+	if p.Workspace == nil || p.Workspace.Path == "" {
+		return nil
+	}
+	// Capture the connection once: Close nils the field, so a read from the
+	// other goroutine during cancellation would race with it.
+	remote := p.Remote
+	if remote == nil {
+		return fmt.Errorf("workspace %s: session connection is closed", p.Workspace.Path)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- workspace.Ensure(remote, *p.Workspace)
+	}()
+	select {
+	case err := <-done:
+		if err != nil && ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		return err
+	case <-ctx.Done():
+		// Closing the transport unblocks the initializer: every request it is
+		// waiting on returns. The goroutine owns no other resource, so its
+		// result is collected before this phase reports the interruption.
+		_ = remote.Close()
+		<-done
+		return context.Cause(ctx)
+	}
 }
 
 // mergePaths combines the writable and read-only trees into one policy, keeping
@@ -348,5 +405,9 @@ func (p *Plan) Run(ctx context.Context, argv []string) (int, error) {
 		return 127, fmt.Errorf("sandbox broker: %w", err)
 	}
 	defer b.Close()
-	return p.launch(ctx, p.launchSpec(argv, b))
+	spec, err := p.launchSpec(argv, b)
+	if err != nil {
+		return 127, err
+	}
+	return p.launch(ctx, spec)
 }

@@ -61,7 +61,10 @@ func TestSpecRoundTripAndBound(t *testing.T) {
 	}
 	defer b.Stop()
 
-	spec := plan.launchSpec([]string{"/bin/sh", "-lc", "echo hi"}, b)
+	spec, err := plan.launchSpec([]string{"/bin/sh", "-lc", "echo hi"}, b)
+	if err != nil {
+		t.Fatal(err)
+	}
 	data, err := json.Marshal(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +149,10 @@ func TestLauncherSpecCarriesHelpers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Stop()
-	spec := plan.launchSpec([]string{"/bin/sh"}, b)
+	spec, err := plan.launchSpec([]string{"/bin/sh"}, b)
+	if err != nil {
+		t.Fatal(err)
+	}
 	foundGuard, foundGateway := false, false
 	for _, p := range spec.ExecPaths {
 		if p == GuardPath {
