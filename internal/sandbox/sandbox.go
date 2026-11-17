@@ -350,15 +350,6 @@ func (p *Plan) SandboxExecPaths() []string {
 	return out
 }
 
-// usesHostNetwork reports whether the sandbox keeps the host network namespace.
-// The daemon transport never decides this: the broker dials the daemon from its
-// own host process, outside the sandbox root and mount namespace, so an ssh
-// transport works with a private network namespace. Only the explicit
-// sandbox.share_network setting asks for host networking.
-func (p *Plan) usesHostNetwork() bool {
-	return p.Cfg.Sandbox.ShareNetwork
-}
-
 // hasPath reports whether a host path keeps its meaning inside the sandbox:
 // local trees do, daemon paths do (the view is the daemon's tree), reserved
 // mount points do not because the launcher replaces them.

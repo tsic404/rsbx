@@ -56,15 +56,15 @@ func runSession(ctx context.Context, dial func(context.Context) (net.Conn, error
 		return 127, err
 	}
 
+	// A failed write means that frame did not reach the daemon; it does not
+	// mean the reply is gone. The daemon may already have written the exit
+	// frame, and closing here would discard it before the read loop sees it.
+	// The sender that failed stops, and the loop ends on its own EOF.
 	var wmu sync.Mutex
 	send := func(typ byte, p []byte) error {
 		wmu.Lock()
-		err := proto.WriteFrame(conn, typ, p)
-		wmu.Unlock()
-		if err != nil {
-			conn.Close()
-		}
-		return err
+		defer wmu.Unlock()
+		return proto.WriteFrame(conn, typ, p)
 	}
 
 	// done prevents further session I/O after teardown. An arbitrary io.Reader

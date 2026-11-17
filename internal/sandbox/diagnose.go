@@ -13,7 +13,6 @@ func (p *Plan) Explain() string {
 	fmt.Fprintf(&b, "mount:       %s\n", p.Mount)
 	fmt.Fprintf(&b, "trampoline:  %s\n", p.Trampoline)
 	fmt.Fprintf(&b, "daemon:      %s\n", p.Cfg.Daemon.EffectiveEndpoint())
-	fmt.Fprintf(&b, "network:     %s\n", networkMode(p.usesHostNetwork()))
 	fmt.Fprintf(&b, "user ns:     %v\n", p.Cfg.Sandbox.UnshareUser)
 	if p.Workspace != nil && p.Workspace.Path != "" {
 		fmt.Fprintf(&b, "workspace:   %s (seed %s)\n", p.Workspace.Path, p.Workspace.Seed)
@@ -41,20 +40,9 @@ func (p *Plan) Explain() string {
 	return b.String()
 }
 
-func networkMode(share bool) string {
-	if share {
-		return "host (shared)"
-	}
-	return "private"
-}
-
 func namespaces(p *Plan) string {
-	out := ",net"
-	if p.usesHostNetwork() {
-		out = ""
-	}
 	if p.Cfg.Sandbox.UnshareUser {
-		out += ",user"
+		return ",user"
 	}
-	return out
+	return ""
 }

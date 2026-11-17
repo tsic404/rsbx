@@ -59,13 +59,6 @@ type Sandbox struct {
 	// ever served from a stale copy of the daemon's tree, so deleting it
 	// only costs the client re-staging what it needs.
 	Cache string `json:"cache"`
-	// ShareNetwork keeps the host network namespace inside the sandbox
-	// instead of creating a private one. It is explicit-only: no transport
-	// implies it. The ssh transport runs outside the sandbox and reaches the
-	// daemon through the broker, so it needs no host networking; agents that
-	// talk to their APIs do. A host that cannot create a network namespace
-	// is also a reason to set it.
-	ShareNetwork bool `json:"share_network"`
 	// UnshareUser creates a user namespace for the sandbox. Outside a
 	// container that is what allows it to run unprivileged. Inside one the
 	// runtime has already done it, and nested creation is refused on some
@@ -231,13 +224,6 @@ func assign(cfg *Config, table, key, raw string) error {
 			return str(&cfg.Sandbox.Mount)
 		case "cache":
 			return str(&cfg.Sandbox.Cache)
-		case "share_network":
-			v, err := parseBool(raw)
-			if err != nil {
-				return err
-			}
-			cfg.Sandbox.ShareNetwork = v
-			return nil
 		case "unshare_user":
 			v, err := parseBool(raw)
 			if err != nil {

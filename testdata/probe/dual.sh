@@ -79,7 +79,6 @@ entry = "/bin/sh"
 [sandbox]
 mount = "$MNT/sb$n"
 cache = "$MNT/c$n"
-share_network = true
 unshare_user = false
 CFG
   fi

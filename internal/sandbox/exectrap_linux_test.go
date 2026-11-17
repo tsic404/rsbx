@@ -127,3 +127,45 @@ func TestNativeSyscallInstructionEncoding(t *testing.T) {
 		t.Fatal("page assumption does not hold")
 	}
 }
+
+func TestStrayInjectionEventKeepsSignalDeliveries(t *testing.T) {
+	// A stop whose signal is not SIGTRAP carries no ptrace event code, which
+	// TrapCause reports as a negative value. SIGURG and the other ordinary
+	// signals a busy session receives must restart the injected call rather
+	// than fail the launch; they are queued for the next resume instead.
+	for _, cause := range []int{-1, -2, 0} {
+		if strayInjectionEvent(cause) {
+			t.Fatalf("cause %d treated as a stray ptrace event", cause)
+		}
+	}
+	// A real ptrace event other than PTRACE_EVENT_STOP means a second event
+	// arrived while the injected call was in flight, which is fatal.
+	for _, cause := range []int{unix.PTRACE_EVENT_SECCOMP, unix.PTRACE_EVENT_EXEC, unix.PTRACE_EVENT_FORK} {
+		if !strayInjectionEvent(cause) {
+			t.Fatalf("ptrace event %d accepted during injection", cause)
+		}
+	}
+	if strayInjectionEvent(unix.PTRACE_EVENT_STOP) {
+		t.Fatal("PTRACE_EVENT_STOP treated as a stray ptrace event")
+	}
+}
+
+func TestEntryBootstrapExecNeedsEntryGroupAndNoDecision(t *testing.T) {
+	decision := execDecision{expected: execAsset{Path: GuardPath}}
+	// The supervisor's own exec of the guard is reported for the entry group
+	// before any decision exists. It is the only such report accepted.
+	tracer := &tracer{entry: 11, decisions: map[int]execDecision{}}
+	if !tracer.entryBootstrapExec(11) {
+		t.Fatal("bootstrap exec of the entry group rejected")
+	}
+	if tracer.entryBootstrapExec(12) {
+		t.Fatal("exec of a non-entry group accepted as the bootstrap exec")
+	}
+	// Once a decision is recorded for the entry group, the same report shape
+	// is the guard's own exec of the entry program and must be validated
+	// against that decision, never waved through.
+	tracer.decisions[11] = decision
+	if tracer.entryBootstrapExec(11) {
+		t.Fatal("exec with a recorded decision accepted as the bootstrap exec")
+	}
+}

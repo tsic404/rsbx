@@ -196,7 +196,6 @@ jobs:
             '[sandbox]' \
             'mount = "/e2e/state/sandbox"' \
             'cache = "/e2e/state/cache"' \
-            'share_network = true' \
             'unshare_user = false' \
             > e2e/client-state/config.toml
           docker run --rm --privileged --user 0 --network rsbx-e2e \
@@ -231,8 +230,11 @@ jobs:
       - name: persistence probes
         if: always()
         run: |
-          # A previous run may have left root-owned files in the volumes.
-          docker volume rm "$RUN_VOL" rsbx-state 2>/dev/null || true
+          # This step runs even after an earlier failure, so it owns its
+          # daemon, network and volumes rather than borrowing a stale one.
+          docker rm -f rsbxd 2>/dev/null || true
+          docker volume rm "$PROJ_VOL" "$RUN_VOL" rsbx-state 2>/dev/null || true
+          docker network create rsbx-e2e 2>/dev/null || true
           docker volume create "$PROJ_VOL"
           docker volume create "$RUN_VOL"
           docker volume create rsbx-state
@@ -243,43 +245,62 @@ jobs:
             sh -c 'gcc -static -O1 -o /host/e2e/probes/atomic_write testdata/probe/atomic_write.c \
                    && gcc -static -O1 -o /host/e2e/probes/durable_write testdata/probe/durable_write.c'
           chmod 777 e2e/probes
-          # Seed the daemon's project volume. The client side never mounts it.
-          # The image runs as the unprivileged rsbx user, so the seed write runs
-          # as root and then hands the disposable volume to the sandbox user.
-          # RSBX_PROJ points at /proj/probe/<name>, so the scripts belong in
-          # /proj/probe, next to the probe binaries. The C probes also write
-          # there, so the directory has to exist before the run.
-          docker run --rm --user 0 -v "$PROJ_VOL":/seed -v "$PWD/e2e:/e2e" \
-            -v "$PWD/testdata/probe:/probes:ro" \
-            --entrypoint /bin/bash rsbx:ci \
-            -c 'mkdir -p /seed/probe/write && cp /e2e/probes/* /seed/probe/ &&
-                cp /probes/*.sh /probes/*.c /seed/probe/ &&
-                chmod -R 777 /seed &&
-                chmod 755 /seed/probe/*.sh'
+          # Seed only the daemon-side scratch tree. The probes are local
+          # programs: the client mounts them and the exact files it runs are
+          # expanded into local.allow below. No daemon path is named as a
+          # local executable.
+          docker run --rm --user 0 -v "$PROJ_VOL":/seed --entrypoint /bin/bash rsbx:ci \
+            -c 'mkdir -p /seed/probe/write && chmod -R 777 /seed'
+          docker run --rm --user 0 -v "$RUN_VOL":/run/rsbx --entrypoint /bin/sh rsbx:ci \
+            -c 'mkdir -p /run/rsbx && chown 1000:1000 /run/rsbx'
+          docker run -d --rm --name rsbxd --network rsbx-e2e \
+            -v "$PROJ_VOL":/proj -v "$RUN_VOL":/run/rsbx \
+            --entrypoint rsbxd rsbx:ci -socket /run/rsbx/daemon.sock
+          ok=0
+          for i in $(seq 1 100); do
+            if docker run --rm --network rsbx-e2e -v "$RUN_VOL":/run/rsbx \
+                 --entrypoint /bin/sh rsbx:ci -c 'test -S /run/rsbx/daemon.sock'; then
+              ok=1; break
+            fi
+            sleep 0.2
+          done
+          if [ "$ok" = 0 ]; then
+            echo "daemon socket never appeared"
+            docker logs rsbxd 2>&1 | tail -30 || true
+            exit 1
+          fi
           printf '%s\n' \
             '[daemon]' \
             'transport = "unix"' \
             'socket = "/run/rsbx/daemon.sock"' \
             '' \
             '[local]' \
-            'allow = ["/usr/bin", "/bin", "/proj/probe"]' \
+            'allow = ["/e2e/state/probes"]' \
             'entry = "/bin/sh"' \
             '' \
             '[sandbox]' \
             'mount = "/e2e/state/sandbox"' \
             'cache = "/e2e/state/cache"' \
-            'share_network = true' \
             'unshare_user = false' \
             > e2e/probe.toml
           # The same probes a developer runs by hand: workload, semantics,
           # agents, process, cache, execloc and runtime, driven by one script.
           # RSBX_PROJ is the daemon's native /proj/probe path — a disposable
-          # directory on the throwaway volume the daemon container serves.
+          # directory on the throwaway volume the daemon container serves. The
+          # probe programs themselves are mounted from the runner: they run on
+          # this machine, while every data path they touch stays on the daemon
+          # view.
           docker run --rm --privileged --user 0 --network rsbx-e2e \
             -v "$RUN_VOL":/run/rsbx -v rsbx-state:/e2e/state \
             -v "$PWD/e2e/probe.toml:/e2e/probe.toml:ro" \
+            -v "$PWD/testdata/probe:/probes:ro" \
+            -v "$PWD/e2e/probes:/probe-bin:ro" \
             --entrypoint /bin/bash rsbx:ci -c '
-              mkdir -p /e2e/state/sandbox /e2e/state/cache
+              mkdir -p /e2e/state/sandbox /e2e/state/cache /e2e/state/probes
+              cp /probes/*.sh /e2e/state/probes/
+              cp /probe-bin/* /e2e/state/probes/
+              chmod 755 /e2e/state/probes/*.sh /e2e/state/probes/atomic_write \
+                        /e2e/state/probes/durable_write
               # The sandbox has to start before any check means anything: a
               # failed entry would otherwise be read as one of the probes
               # failing.
@@ -287,16 +308,17 @@ jobs:
 
               rsbx -config /e2e/probe.toml -- /bin/sh -c "
                 echo \"=== atomic write (create, rename, reopen) ===\"
-                /proj/probe/atomic_write /proj/probe/write session.jsonl
+                /e2e/state/probes/atomic_write /proj/probe/write session.jsonl
                 echo \"=== durable write (fsync, wal) ===\"
-                /proj/probe/durable_write /proj/probe/write
-                RSBX_PROJ=/proj/probe/run /proj/probe/workload.sh
-                RSBX_PROJ=/proj/probe/deep /proj/probe/semantics.sh
-                RSBX_PROJ=/proj/probe/fleet /proj/probe/agents.sh
-                RSBX_PROJ=/proj/probe/proc /proj/probe/process.sh
-                RSBX_PROJ=/proj/probe/cache /proj/probe/cache.sh
-                RSBX_PROJ=/proj/probe/exec RSBX_EXEC_DIR=/e2e/probes /proj/probe/execloc.sh
-                RSBX_PROJ=/proj/probe/rt /proj/probe/runtime.sh
+                /e2e/state/probes/durable_write /proj/probe/write
+                RSBX_PROJ=/proj/probe/run /e2e/state/probes/workload.sh
+                RSBX_PROJ=/proj/probe/deep /e2e/state/probes/semantics.sh
+                RSBX_PROJ=/proj/probe/fleet /e2e/state/probes/agents.sh
+                RSBX_PROJ=/proj/probe/proc /e2e/state/probes/process.sh
+                RSBX_PROJ=/proj/probe/cache /e2e/state/probes/cache.sh
+                RSBX_PROJ=/proj/probe/exec RSBX_EXEC_DIR=/e2e/state/probes \
+                  /e2e/state/probes/execloc.sh
+                RSBX_PROJ=/proj/probe/rt /e2e/state/probes/runtime.sh
               "
             ' | tee probe-out.txt
           grep -q "reopen ok: payload" probe-out.txt
@@ -312,7 +334,8 @@ jobs:
           # died before printing, which the FAIL gate alone would not catch.
           # 69 OK + 10 SKIP: two C probes print their own markers instead of a
           # check line, and the skipped checks are the programs this image
-          # does not carry (python3, git, a configured agent).
+          # does not carry (python3, git, a configured agent) plus the exec
+          # directory checks, which need a writable exec tree.
           test "$total" -eq 79
 
       # Two rsbx clients sharing one daemon tree, which is what an agent team
@@ -349,13 +372,12 @@ jobs:
             'socket = "/run/rsbx/daemon.sock"' \
             '' \
             '[local]' \
-            'allow = ["/usr/bin/bash", "/bin", "/usr/bin"]' \
+            'allow = ["/usr/bin/bash"]' \
             'entry = "/bin/sh"' \
             '' \
             '[sandbox]' \
             'mount = "#MOUNT#"' \
             'cache = "#CACHE#"' \
-            'share_network = true' \
             'unshare_user = false' \
             > e2e/dual-cfg/base.toml
           docker run --rm --privileged --user 0 --network rsbx-dual \

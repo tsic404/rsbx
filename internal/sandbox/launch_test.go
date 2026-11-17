@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"rsbx/internal/config"
 	"rsbx/internal/paths"
 	"rsbx/internal/policy"
@@ -43,11 +45,46 @@ func testPlan(t *testing.T, allow, trees []string) (*Plan, string) {
 // clone time; a clone-time mount/PID namespace can be silently skipped
 // inside an outer container, which is exactly what must not happen.
 func TestLauncherCreatesNamespacesItself(t *testing.T) {
-	spec := &launchSpec{ShareNetwork: false, UnshareUser: true}
+	spec := &launchSpec{UnshareUser: true}
 	// No launchCloneFlags indirection: the launcher unshares mount/PID/IPC/
 	// UTS itself, and CLONE_NEWUSER is the only flag the parent may pass.
 	if spec.UnshareUser != true {
 		t.Fatal("fixture broken")
+	}
+}
+
+// A session keeps the caller's network namespace. The launcher must not ask
+// the kernel to create a private one, whether or not it creates a user
+// namespace.
+func TestLaunchAttrsDoNotCreateNetworkNamespace(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		unshareUser bool
+	}{
+		{"without user namespace", false},
+		{"with user namespace", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			attrs := launchAttrs(&launchSpec{UnshareUser: tc.unshareUser})
+			if attrs.Cloneflags&unix.CLONE_NEWNET != 0 {
+				t.Fatalf("clone flags create a network namespace: %#x", attrs.Cloneflags)
+			}
+			if attrs.Unshareflags&unix.CLONE_NEWNET != 0 {
+				t.Fatalf("unshare flags create a network namespace: %#x", attrs.Unshareflags)
+			}
+		})
+	}
+}
+
+// The diagnostic view is user-visible; it must not present a network mode or
+// a net namespace that the session no longer has.
+func TestExplainReportsNoNetworkNamespace(t *testing.T) {
+	plan, _ := testPlan(t, []string{"/bin/sh"}, nil)
+	out := plan.Explain()
+	for _, unwanted := range []string{"network:", ",net", " net,"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("plan still reports network namespace state %q:\n%s", unwanted, out)
+		}
 	}
 }
 

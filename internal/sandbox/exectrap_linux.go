@@ -473,6 +473,17 @@ func (t *tracer) dispatch(s traceStop) error {
 	case unix.PTRACE_EVENT_VFORK_DONE:
 		return t.resume(s.pid, 0)
 	case unix.PTRACE_EVENT_EXEC:
+		// The supervisor starts the guard itself, so a seize that lands while
+		// that bootstrap exec is committing reports an EXEC with no seccomp
+		// stop behind it. It is accepted only for the entry group and only as
+		// the exact pinned guard image; the guard's own exec of the entry
+		// program has a recorded decision and is validated normally.
+		if t.entryBootstrapExec(t.groupOf(s.pid)) {
+			if err := t.policy.imageMatches(s.pid, t.policy.guard); err != nil {
+				return err
+			}
+			return t.resume(s.pid, 0)
+		}
 		// The event reached the main loop instead of the injected wait: the
 		// execing thread was not the one this loop expected, or its report was
 		// queued while another descendant was being inspected. The decision is
@@ -493,6 +504,21 @@ func (t *tracer) dispatch(s traceStop) error {
 		return fmt.Errorf("unexpected ordinary syscall stop")
 	}
 	return t.resume(s.pid, int(sig))
+}
+
+// entryBootstrapExec reports whether an EXEC wait report is the supervisor's
+// own bootstrap exec of the pinned guard. The supervisor performs that exec
+// itself, outside the seccomp filter it later installs, so no controller
+// decision can precede it. The event is recognized structurally: the report
+// belongs to the entry thread group and no decision was recorded for it. Any
+// later exec of that group — including the guard's exec of the entry program —
+// has a recorded decision and is validated as one.
+func (t *tracer) entryBootstrapExec(group int) bool {
+	if group != t.entry {
+		return false
+	}
+	_, recorded := t.decisions[group]
+	return !recorded
 }
 
 // groupOf resolves the thread group a wait report belongs to. After an exec
@@ -626,7 +652,7 @@ func (t *tracer) injectedStop(pid int, want uint8, nr uint64, execEvent bool) (t
 			t.tasks[pid].stopped = false
 			continue
 		}
-		if cause != 0 && cause != unix.PTRACE_EVENT_STOP {
+		if strayInjectionEvent(cause) {
 			return s, traceSyscallInfo{}, fmt.Errorf("unexpected ptrace event during injection")
 		}
 		sig := s.status.StopSignal()
@@ -639,13 +665,28 @@ func (t *tracer) injectedStop(pid int, want uint8, nr uint64, execEvent bool) (t
 			// rather than resume the tracee into user code.
 			return s, traceSyscallInfo{}, fmt.Errorf("injected call interrupted by signal %d", sig)
 		} else {
+			// A delivered signal would run its handler in the middle of the
+			// injected call. Queue it for the next resume, which restarts
+			// the tracee with signal 0.
 			t.tasks[pid].pendingSignals = append(t.tasks[pid].pendingSignals, sig)
+			sig = 0
 		}
 		if err := unix.PtraceSyscall(pid, int(sig)); err != nil {
 			return s, traceSyscallInfo{}, err
 		}
 		t.tasks[pid].stopped = false
 	}
+}
+
+// strayInjectionEvent reports whether a stop observed while an injected call
+// is in flight means the tracee left that call. TrapCause is negative when the
+// stop signal is not SIGTRAP, which is an ordinary signal delivery rather than
+// a ptrace event, and zero for a plain SIGTRAP stop. Both are handled by the
+// restart path: a signal delivery is queued for the next resume, and a plain
+// SIGTRAP stop resumes with no signal. Only a real ptrace event other than
+// PTRACE_EVENT_STOP means a sibling event the injection cannot absorb.
+func strayInjectionEvent(cause int) bool {
+	return cause > 0 && cause != unix.PTRACE_EVENT_STOP
 }
 
 // injectedDeliverable reports whether a signal received during a restart
