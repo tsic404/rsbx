@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -9,12 +10,93 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"rsbx/internal/proto"
 )
+
+const sessionLifetimeTimeout = 5 * time.Second
+
+// finalFrameConn answers the session with its exit frame but rejects the
+// stdin frame that follows. That is the teardown order the daemon leaves
+// behind: the child exits, the exit frame is written, and only then does the
+// daemon stop reading. A client that closes the connection on that write
+// error throws away the reply it is about to read.
+type finalFrameConn struct {
+	reply     []byte
+	lateWrite chan struct{}
+	mu        sync.Mutex
+	writes    int
+	closed    bool
+}
+
+func (c *finalFrameConn) Read(p []byte) (int, error) {
+	select {
+	case <-c.lateWrite:
+	case <-time.After(sessionLifetimeTimeout):
+		return 0, errors.New("stdin frame was never written")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, errors.New("session closed the connection before the exit frame")
+	}
+	if len(c.reply) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.reply)
+	c.reply = c.reply[n:]
+	return n, nil
+}
+
+func (c *finalFrameConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes++
+	// WriteFrame writes the header first, then the payload. The frame is not
+	// known to have failed until the payload write rejects it.
+	if c.writes == 1 || c.writes == 2 {
+		return len(p), nil // TExec
+	}
+	close(c.lateWrite)
+	return 0, errors.New("daemon stopped reading after its final frame")
+}
+
+func (c *finalFrameConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *finalFrameConn) LocalAddr() net.Addr              { return nil }
+func (c *finalFrameConn) RemoteAddr() net.Addr             { return nil }
+func (c *finalFrameConn) SetDeadline(time.Time) error      { return nil }
+func (c *finalFrameConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *finalFrameConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestSessionKeepsReplyWhenLateWriteFails(t *testing.T) {
+	var reply bytes.Buffer
+	if err := proto.WriteFrame(&reply, proto.TExit, proto.ExitPayload(23)); err != nil {
+		t.Fatal(err)
+	}
+	conn := &finalFrameConn{reply: reply.Bytes(), lateWrite: make(chan struct{})}
+	result := make(chan sessionLifetimeResult, 1)
+	go func() {
+		code, err := runSession(context.Background(), func(context.Context) (net.Conn, error) {
+			return conn, nil
+		}, &proto.ExecReq{Target: "example", Argv: []string{"example"}, Dir: "/"},
+			strings.NewReader("stdin"), io.Discard, io.Discard)
+		result <- sessionLifetimeResult{code: code, err: err}
+	}()
+	got := awaitRPC(t, result)
+	if got.code != 23 || got.err != nil {
+		t.Fatalf("session = (%d, %v), want (23, nil)", got.code, got.err)
+	}
+}
 
 type sessionLifetimeResult struct {
 	code int

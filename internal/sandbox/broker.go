@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -116,8 +117,12 @@ func (b *broker) release(conn net.Conn) {
 	b.mu.Unlock()
 }
 
-// relay pipes one sandbox connection to its own daemon connection. Normal EOF
-// half-closes the destination; an error closes both streams before joining.
+// relay pipes one sandbox connection to its own daemon connection. A direction
+// that ends half-closes its destination, so the peer reads every byte before
+// EOF. The two directions settle independently: a daemon that has already
+// finished still owes its final frame to the sandbox, so a failed write toward
+// it must not tear down the other stream. Only a sandbox-side read failure, a
+// sandbox-side write failure, or a broker shutdown closes both.
 func (b *broker) relay(client net.Conn) {
 	defer b.release(client)
 	upstream, err := b.dial(b.ctx)
@@ -129,23 +134,59 @@ func (b *broker) relay(client net.Conn) {
 		return
 	}
 	defer b.release(upstream)
-	results := make(chan error, 2)
-	copyStream := func(dst, src net.Conn) {
-		_, err := io.Copy(dst, src)
-		if err == nil {
-			if c, ok := dst.(interface{ CloseWrite() error }); ok {
-				err = c.CloseWrite()
+	type direction struct {
+		fromClient bool
+		write      bool
+		err        error
+	}
+	results := make(chan direction, 2)
+	copyStream := func(dst, src net.Conn, fromClient bool) {
+		result := direction{fromClient: fromClient}
+		buf := make([]byte, 32<<10)
+		for {
+			n, rerr := src.Read(buf)
+			if n > 0 {
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					result.err, result.write = werr, true
+					break
+				}
+			}
+			if rerr != nil {
+				if !errors.Is(rerr, io.EOF) {
+					result.err = rerr
+				}
+				break
 			}
 		}
-		results <- err
+		if result.err == nil {
+			if c, ok := dst.(interface{ CloseWrite() error }); ok {
+				result.err = c.CloseWrite()
+				result.write = result.err != nil
+			}
+		}
+		results <- result
 	}
-	go copyStream(upstream, client)
-	go copyStream(client, upstream)
-	if err := <-results; err != nil || b.ctx.Err() != nil {
+	go copyStream(upstream, client, true)
+	go copyStream(client, upstream, false)
+	for range 2 {
+		result := <-results
+		if b.ctx.Err() != nil {
+			client.Close()
+			upstream.Close()
+			continue
+		}
+		if result.err == nil {
+			continue
+		}
+		// A write failure toward the daemon means that connection is finished:
+		// it may still hold the session's last frame for the sandbox, and that
+		// stream is the only one that may end the sandbox side.
+		if result.fromClient && result.write {
+			continue
+		}
 		client.Close()
 		upstream.Close()
 	}
-	<-results
 }
 
 // Stop is the no-result shutdown used by callers that do not need cleanup errors.

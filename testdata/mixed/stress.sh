@@ -35,7 +35,6 @@ read_only_paths = []
 [sandbox]
 mount = "$MNT/sb"
 cache = "$MNT/cache"
-share_network = true
 unshare_user = false
 CFG
 }

@@ -87,23 +87,6 @@ func TestSessionControlCannotBeExposedThroughLocalSymlink(t *testing.T) {
 	}
 }
 
-// The daemon transport runs outside the sandbox, so it must never widen the
-// network namespace: only sandbox.share_network does.
-func TestNetworkIsIndependentOfTransport(t *testing.T) {
-	cfg := config.Default()
-	cfg.Daemon.Transport = "ssh"
-	cfg.Daemon.Command = "ssh daemon-session"
-	cfg.Sandbox.ShareNetwork = false
-	plan := &Plan{Cfg: cfg}
-	if plan.usesHostNetwork() {
-		t.Fatal("ssh transport forced host networking")
-	}
-	cfg.Sandbox.ShareNetwork = true
-	if !plan.usesHostNetwork() {
-		t.Fatal("explicit share_network was ignored")
-	}
-}
-
 // A sibling that merely shares a name prefix is not inside the root, and the
 // filesystem root contains every absolute path rather than only "//" children.
 func TestWithinRootBoundary(t *testing.T) {

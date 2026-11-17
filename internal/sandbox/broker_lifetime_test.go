@@ -234,6 +234,87 @@ func TestBrokerRelayErrorClosesBothDirections(t *testing.T) {
 	closeBrokerWithin(t, b)
 }
 
+// gatedReplyConn is a daemon connection that has already produced its final
+// frame but is held back until the test releases it, while every write toward
+// it fails. That is the teardown race: a late frame from the sandbox reaches a
+// daemon whose connection is gone, after the daemon wrote its reply.
+type gatedReplyConn struct {
+	net.Conn
+	reply     chan struct{}
+	writeSeen chan struct{}
+	writeOnce sync.Once
+	mu        sync.Mutex
+	served    bool
+}
+
+func (c *gatedReplyConn) Read(p []byte) (int, error) {
+	<-c.reply
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.served {
+		c.served = true
+		return copy(p, "final"), nil
+	}
+	return 0, io.EOF
+}
+
+func (c *gatedReplyConn) Write([]byte) (int, error) {
+	c.writeOnce.Do(func() { close(c.writeSeen) })
+	return 0, errors.New("daemon connection is gone")
+}
+
+// A frame the sandbox sends late must not close the sandbox side of the relay:
+// the daemon already wrote the final frame of the session, and the other
+// direction still has to deliver it.
+func TestBrokerKeepsDaemonReplyWhenClientWriteFails(t *testing.T) {
+	upstream, daemon := net.Pipe()
+	t.Cleanup(func() { daemon.Close() })
+	gated := &gatedReplyConn{Conn: upstream, reply: make(chan struct{}), writeSeen: make(chan struct{})}
+	b, listener := newPipeRelay(t, func(context.Context) (net.Conn, error) { return gated, nil })
+	client, downstream := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+	injectRelay(t, listener, downstream)
+
+	written := beginRelayWrite(client, "late")
+	awaitRelay(t, gated.writeSeen)
+	if err := awaitRelay(t, written); err != nil {
+		t.Fatal(err)
+	}
+	// The failed sandbox-to-daemon direction has settled by now. The old relay
+	// closed the sandbox connection here, before the reply was delivered.
+	time.Sleep(100 * time.Millisecond)
+	close(gated.reply)
+
+	if err := client.SetReadDeadline(time.Now().Add(brokerLifetimeTimeout)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len("final"))
+	if _, err := io.ReadFull(client, buf); err != nil || string(buf) != "final" {
+		t.Fatalf("final daemon frame = (%q, %v), want %q", buf, err, "final")
+	}
+	closeBrokerWithin(t, b)
+}
+
+type relayClientReadErrorConn struct {
+	net.Conn
+	err error
+}
+
+func (c relayClientReadErrorConn) Read([]byte) (int, error) { return 0, c.err }
+
+// A sandbox connection that fails must still stop the daemon side: the daemon
+// has to learn that the session is over instead of running alone.
+func TestBrokerClientFailureStopsDaemon(t *testing.T) {
+	upstream, daemon := net.Pipe()
+	t.Cleanup(func() { daemon.Close() })
+	b, listener := newPipeRelay(t, func(context.Context) (net.Conn, error) { return upstream, nil })
+	client, downstream := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+	injectRelay(t, listener, relayClientReadErrorConn{Conn: downstream, err: errors.New("client failed")})
+	expectRelayPeerClosed(t, daemon)
+	closeBrokerWithin(t, b)
+}
+
 func TestBrokerKeepsSimultaneousClientsSeparate(t *testing.T) {
 	type upstreamPair struct {
 		daemon net.Conn

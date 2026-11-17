@@ -193,10 +193,6 @@ On `main` the image is pushed to `ghcr.io/<owner>/rsbx`.
   read-only native snapshots.** Local executables are cached by content
   digest under `exec-assets`; a replacement invalidates the snapshot instead
   of keeping a stale inode. No remote project file is ever copied there.
-* **`share_network` is explicit-only.** No transport implies it. The `ssh`
-  transport runs outside the sandbox and reaches the daemon through the
-  private broker, so it needs no host networking; agents that call their APIs
-  do.
 
 ## Tests
 

@@ -66,7 +66,6 @@ type launchSpec struct {
 	LocalAllow   []string      `json:"local_allow"`
 	RuntimePaths []string      `json:"runtime_paths"`
 	Scripts      []scriptChain `json:"scripts"`
-	ShareNetwork bool          `json:"share_network"`
 	UnshareUser  bool          `json:"unshare_user"`
 	// UID and GID are the host IDs mapped to 0 inside a user namespace.
 	UID int `json:"uid"`
@@ -256,9 +255,6 @@ func launchAttrs(spec *launchSpec) *syscall.SysProcAttr {
 		// namespace and its FUSE root.
 		Pdeathsig: syscall.SIGKILL,
 	}
-	if !spec.ShareNetwork {
-		a.Unshareflags |= unix.CLONE_NEWNET
-	}
 	if spec.UnshareUser {
 		a.Cloneflags |= unix.CLONE_NEWUSER
 		a.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: spec.UID, Size: 1}}
@@ -299,9 +295,10 @@ func verifyNamespaces(spec *launchSpec) error {
 		if err != nil {
 			return fmt.Errorf("read %s namespace: %w", name, err)
 		}
-		private := name != "net" && name != "user" ||
-			name == "net" && !spec.ShareNetwork ||
-			name == "user" && spec.UnshareUser
+		// The network namespace is always shared: it is the caller's, so a
+		// program's egress follows the machine it runs on.
+		private := (name != "net" && name != "user") ||
+			(name == "user" && spec.UnshareUser)
 		if (own != baseline) != private {
 			return fmt.Errorf("unexpected %s namespace membership: %s (controller %s)", name, own, baseline)
 		}
@@ -816,20 +813,19 @@ func (p *Plan) launchSpec(argv []string, b *broker) *launchSpec {
 		target = argv[0]
 	}
 	spec := &launchSpec{
-		Mount:        p.Mount,
-		RootFD:       rootFD,
-		AssetDirFD:   assetDirFD,
-		BrokerDir:    b.HostDir(),
-		HelperDir:    filepath.Dir(p.Trampoline),
-		Target:       target,
-		Argv:         append([]string(nil), argv...),
-		Env:          os.Environ(),
-		Cwd:          cwd,
-		ExecPaths:    p.SandboxExecPaths(),
-		ShareNetwork: p.usesHostNetwork(),
-		UnshareUser:  p.Cfg.Sandbox.UnshareUser,
-		UID:          os.Getuid(),
-		GID:          os.Getgid(),
+		Mount:       p.Mount,
+		RootFD:      rootFD,
+		AssetDirFD:  assetDirFD,
+		BrokerDir:   b.HostDir(),
+		HelperDir:   filepath.Dir(p.Trampoline),
+		Target:      target,
+		Argv:        append([]string(nil), argv...),
+		Env:         os.Environ(),
+		Cwd:         cwd,
+		ExecPaths:   p.SandboxExecPaths(),
+		UnshareUser: p.Cfg.Sandbox.UnshareUser,
+		UID:         os.Getuid(),
+		GID:         os.Getgid(),
 	}
 	if p.Exec != nil {
 		spec.LocalAllow = p.Exec.ExecPaths()

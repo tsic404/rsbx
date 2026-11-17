@@ -48,11 +48,6 @@ mount = "~/.rsbx/sandbox"
 # Disposable session scratch and a verified read-only native executable cache.
 # It contains no copied remote project tree. Do not delete it during a session.
 cache = "~/.rsbx/cache"
-# Agents talk to their APIs, so they need the network. This setting is
-# explicit-only: no transport implies it. The ssh transport runs outside the
-# sandbox and reaches the daemon through the broker, so it needs no host
-# networking.
-# share_network = false
 # Inside a container that cannot create a nested user namespace, use false.
 # Mount/PID/IPC/UTS isolation and execution restrictions remain mandatory.
 # unshare_user = false

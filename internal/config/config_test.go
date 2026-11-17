@@ -110,16 +110,16 @@ func TestBalancedIgnoresBracketsInStrings(t *testing.T) {
 	}
 }
 
-func TestParseShareNetwork(t *testing.T) {
-	cfg, err := Parse("[sandbox]\nshare_network = true\n")
-	if err != nil {
-		t.Fatal(err)
+// Network namespaces are not a configurable capability, so a configuration
+// that still carries the removed setting must fail like any other unknown key
+// instead of being ignored.
+func TestShareNetworkIsRejectedAsUnknown(t *testing.T) {
+	_, err := Parse("[sandbox]\nshare_network = true\n")
+	if err == nil {
+		t.Fatal("share_network accepted")
 	}
-	if !cfg.Sandbox.ShareNetwork {
-		t.Fatal("share_network not applied")
-	}
-	if _, err := Parse("[sandbox]\nshare_network = yes\n"); err == nil {
-		t.Fatal("non-boolean accepted")
+	if !strings.Contains(err.Error(), "unknown key sandbox.share_network") {
+		t.Errorf("error does not name the unknown setting: %v", err)
 	}
 }
 
