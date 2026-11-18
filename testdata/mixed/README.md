@@ -20,7 +20,7 @@ Two facts have to hold at once, and each is measured rather than asserted:
 
 | probe | what it does | what it catches |
 |---|---|---|
-| `lab.sh` | 11 checks: the stand-in CLI runs here, sees the daemon tree, `git` is absent here yet runs, `git` runs on the daemon, its work lands on the daemon tree and survives, the agent's config tree is local, its work product is remote, every agent CLI runs here, the CLI and `git` see one tree | a policy that runs the wrong program on the wrong side, or leaves a local tree on the daemon |
+| `lab.sh` | 12 checks: the stand-in CLI runs here, sees the daemon tree, `git` is absent here yet runs, `git` runs on the daemon, its work lands on the daemon tree and survives, startup diagnostics are reported on stderr and never as command output, the agent's config tree is local, its work product is remote, every agent CLI runs here, the CLI and `git` see one tree | a policy that runs the wrong program on the wrong side, leaves a local tree on the daemon, or turns a warning into command output |
 | `stress.sh` | 4 concurrent checks at N sessions sharing **one** configuration file: parallel commits, host and daemon programs interleaved 20 times with placement measured each round, agent config local while its product is remote, one shared remote file rewritten and re-read 10 times | contention that only appears when several sessions share one daemon, and any per-session resource that the caller accidentally shares |
 | `real.sh` | the real-CLI gate: installed Multica/OMP/Codex/Claude startups, real `multica config set/get` file IO, and the native substrate fixture's boundary checks (local config vs remote artifact, executable byte preservation, custom argv[0], named execveat, deleted descriptor refusal, remote git clone visibility, detached-child and canceled-session cleanup) | a native snapshot that cannot start, or a boundary that substitutes local bytes, loses argv[0], uploads anonymous descriptors, leaks remote paths into local trees, or leaks session descendants |
 
@@ -50,7 +50,7 @@ containers, every gate clean with no leftover mount or session directory:
   with `EPERM` (no upload, no local fallback), exact project executable and
   `.so` byte preservation, the remote `git` clone visible through the local
   view, detached-child cleanup, and canceled-session cleanup.
-- `lab.sh` **11/11** and `stress.sh` **4/4 at N=16**, the stress sessions all
+- `lab.sh` **12/12** and `stress.sh` **4/4 at N=16**, the stress sessions all
   sharing one configuration file.
 - Interactive PTY: typed input consumed by the local shell, Ctrl-C (`0x03`)
   delivered as a signal, the shell reporting `130`, `rsbx` exiting with the

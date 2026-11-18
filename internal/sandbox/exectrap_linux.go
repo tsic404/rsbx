@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -93,6 +94,138 @@ type tracer struct {
 	tick        *time.Ticker
 	deadline    time.Time
 	killed      bool
+
+	// reverseGroups are the guarded bootstraps the supervisor started for
+	// stub-driven commands. They are not the entry: their exit is reported
+	// back to the caller and never tears down the session.
+	reverseGroups map[int]bool
+	reverseStatus map[int]chan int
+	reverseJobs   chan reverseJob
+	reverseSpec   *launchSpec
+	acceptReverse bool
+}
+
+// localTarget reports whether a reverse caller asked for a program the
+// session's policy pinned as local. Identity is the inode, never the name, so
+// replacing the file after launch does not widen the grant.
+func (p *execPolicy) localTarget(target string) bool {
+	id, mode, err := pathIdentity(target)
+	if err != nil || mode&unix.S_IFMT != unix.S_IFREG {
+		return false
+	}
+	return p.local[id]
+}
+
+// spawnReverse starts one command under the same guard the entry receives.
+// It is called from the supervisor's wait loop, never from a goroutine: the
+// bootstrap freezes and seizes every thread, so the new process must not be
+// born while another ptrace operation is in flight.
+func (t *tracer) spawnReverse(spec *launchSpec, req *proto.ExecReq, reply chan<- reverseResult) error {
+	target, err := reverseTarget(spec, req)
+	if err != nil {
+		return err
+	}
+	req.Target = target
+	if !t.policy.localTarget(req.Target) {
+		return fmt.Errorf("local execution refused: %s is not an allowlisted local executable", req.Target)
+	}
+	if req.Dir != "" {
+		fi, err := os.Stat(req.Dir)
+		if err != nil || !fi.IsDir() {
+			return fmt.Errorf("local execution refused: chdir %s is not a directory", req.Dir)
+		}
+	}
+	data, err := json.Marshal(GuardSpec{Target: req.Target, Argv: req.Argv, Env: req.Env, ExecPaths: spec.ExecPaths})
+	if err != nil {
+		return err
+	}
+	guardSpec, err := sealedPayload("rsbx-guard-reverse", data)
+	if err != nil {
+		return err
+	}
+	defer guardSpec.Close()
+	gateR, gateW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer gateR.Close()
+	defer gateW.Close()
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		stdinR.Close()
+		stdinW.Close()
+		return err
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		stdinR.Close()
+		stdinW.Close()
+		outR.Close()
+		outW.Close()
+		return err
+	}
+	cmd := exec.Command(GuardPath, "-rsbx-guard-spec-fd", "3", "-rsbx-guard-gate-fd", "4")
+	cmd.Dir = req.Dir
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd.Stdin = stdinR
+	cmd.Stdout, cmd.Stderr = outW, errW
+	cmd.ExtraFiles = []*os.File{guardSpec, gateR}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	if err := cmd.Start(); err != nil {
+		stdinR.Close()
+		stdinW.Close()
+		outR.Close()
+		outW.Close()
+		errR.Close()
+		errW.Close()
+		return fmt.Errorf("start reverse guard: %w", err)
+	}
+	pid := cmd.Process.Pid
+	stdinR.Close()
+	started := false
+	defer func() {
+		if !started {
+			unix.Kill(-pid, unix.SIGKILL)
+			stdinW.Close()
+			outR.Close()
+			errR.Close()
+		}
+	}()
+	t.reverseGroups[pid] = true
+	outW.Close()
+	errW.Close()
+	gateR.Close()
+	defer cmd.Process.Release()
+	if err := t.attachBootstrap(pid); err != nil {
+		outR.Close()
+		errR.Close()
+		return err
+	}
+	if err := t.policy.imageMatches(pid, t.policy.guard); err != nil {
+		outR.Close()
+		errR.Close()
+		return err
+	}
+	// A reverse bootstrap execs the guard without a preceding seccomp stop,
+	// exactly like the entry, so the EXEC validator must accept it here too.
+	if _, err := gateW.Write([]byte{'1'}); err != nil {
+		outR.Close()
+		errR.Close()
+		return err
+	}
+	gateW.Close()
+	status := make(chan int, 1)
+	t.reverseStatus[pid] = status
+	if err = t.releaseFrozen(0); err != nil {
+		return err
+	}
+	started = true
+	reply <- reverseResult{stdout: outR, stderr: errR, stdin: stdinW, pid: pid, status: status}
+	return nil
 }
 
 func runTraced(spec *launchSpec, server *gatewayServer) (int, error) {
@@ -105,7 +238,24 @@ func runTraced(spec *launchSpec, server *gatewayServer) (int, error) {
 	if err != nil {
 		return 126, err
 	}
-	t := &tracer{policy: policy, server: server, tasks: map[int]*traceTask{}, permits: map[int]scriptPermit{}, decisions: map[int]execDecision{}, signals: make(chan os.Signal, 32), tick: time.NewTicker(time.Millisecond)}
+	// The reverse executor is reached only on a control connection the
+	// controller registered a session token on. Each accepted request spawns
+	// its own guarded bootstrap, exactly like the entry, so the new command
+	// inherits the session's exec policy instead of bypassing it.
+	var jobs chan reverseJob
+	if spec.ReverseToken != "" {
+		file := os.NewFile(6, "rsbx-reverse-listener")
+		listener, err := net.FileListener(file)
+		file.Close()
+		if err != nil {
+			return 126, err
+		}
+		jobs = make(chan reverseJob, 32)
+		reverse := newReverseListener(listener, spec.ReverseToken, jobs)
+		defer reverse.Close()
+	}
+	t := &tracer{policy: policy, server: server, tasks: map[int]*traceTask{}, permits: map[int]scriptPermit{}, decisions: map[int]execDecision{}, signals: make(chan os.Signal, 32), tick: time.NewTicker(time.Millisecond), reverseGroups: map[int]bool{}, reverseStatus: map[int]chan int{}, reverseJobs: jobs}
+	t.reverseSpec = spec
 	defer t.tick.Stop()
 	signal.Notify(t.signals, forwardedSignals...)
 	defer signal.Stop(t.signals)
@@ -166,6 +316,23 @@ func runTraced(spec *launchSpec, server *gatewayServer) (int, error) {
 		return 126, err
 	}
 	for {
+		// Reverse requests are only serviced between wait reports: the
+		// bootstrap freezes every descendant, so it must never overlap an
+		// in-flight exec interception. A refusal is a result, not a panic.
+		select {
+		case job := <-t.reverseJobs:
+			accepting := t.acceptReverse
+			t.acceptReverse = false
+			if err := t.spawnReverse(spec, job.request, job.reply); err != nil {
+				job.reply <- reverseResult{err: err}
+				if releaseErr := t.releaseFrozen(0); releaseErr != nil {
+					t.killAndReap()
+					return 126, releaseErr
+				}
+			}
+			t.acceptReverse = accepting
+		default:
+		}
 		var s traceStop
 		if len(t.queue) != 0 {
 			s = t.queue[0]
@@ -176,7 +343,12 @@ func runTraced(spec *launchSpec, server *gatewayServer) (int, error) {
 				continue
 			}
 		} else {
+			t.acceptReverse = true
 			s, err = t.receive()
+			t.acceptReverse = false
+			if s.pid == -1 {
+				continue
+			}
 			if err == unix.ECHILD {
 				return t.code, nil
 			}
@@ -291,6 +463,9 @@ func (t *tracer) receive() (traceStop, error) {
 		case sig := <-t.signals:
 			t.handleSignal(sig)
 		case <-t.tick.C:
+			if t.acceptReverse && len(t.reverseJobs) > 0 {
+				return traceStop{pid: -1}, nil
+			}
 		}
 	}
 }
@@ -312,6 +487,15 @@ func (t *tracer) note(s traceStop) error {
 		}
 
 		t.server.Forget(s.pid)
+		if t.reverseGroups[s.pid] {
+			// A reverse command's exit is a result, not a session end. The
+			// caller is draining both pipes and then reads this status.
+			delete(t.reverseGroups, s.pid)
+			if status := t.reverseStatus[s.pid]; status != nil {
+				status <- exitCode(s.status)
+			}
+			delete(t.reverseStatus, s.pid)
+		}
 		if s.pid == t.entry && !t.entryExited {
 			t.entryExited, t.code = true, exitCode(s.status)
 			_ = unix.Kill(-1, unix.SIGTERM)
@@ -478,7 +662,8 @@ func (t *tracer) dispatch(s traceStop) error {
 		// stop behind it. It is accepted only for the entry group and only as
 		// the exact pinned guard image; the guard's own exec of the entry
 		// program has a recorded decision and is validated normally.
-		if t.entryBootstrapExec(t.groupOf(s.pid)) {
+		_, recorded := t.decisions[t.groupOf(s.pid)]
+		if t.entryBootstrapExec(t.groupOf(s.pid)) || t.reverseGroups[t.groupOf(s.pid)] && !recorded {
 			if err := t.policy.imageMatches(s.pid, t.policy.guard); err != nil {
 				return err
 			}

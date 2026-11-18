@@ -26,6 +26,18 @@ allow = []
 # immutable-snapshot requirements. It need not be repeated in local.allow.
 entry = "/bin/sh"
 
+# An agent runs its tools through a command shell. If that shell is not listed
+# here it executes on the daemon, and every allowlisted program it calls by
+# absolute path fails there with ENOENT — the binary exists only on this
+# machine. List the shell when a local program must be reachable from a tool
+# invocation:
+#
+#   allow = ["/bin/sh", "/bin/bash", "/usr/local/bin/multica"]
+#
+# rsbx warns at startup when an allowlisted program is absent from the daemon
+# or when no shell is allowlisted, because both make the failure look like a
+# missing binary rather than a placement decision.
+
 # -- which files are LOCAL --
 # Configuration/state trees read and written on this machine. Programs running
 # on the daemon see only the daemon's native tree. These grants do not permit

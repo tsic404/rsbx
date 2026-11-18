@@ -840,22 +840,23 @@ func (n *Node) Getlk(ctx context.Context, f fs.FileHandle, owner uint64, lk *fus
 }
 
 func (n *Node) Setlk(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
-	return n.setlk(f, owner, lk, false)
+	return n.setlk(f, owner, lk, flags, false)
 }
 
 func (n *Node) Setlkw(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
-	return n.setlk(f, owner, lk, true)
+	return n.setlk(f, owner, lk, flags, true)
 }
 
-func (n *Node) setlk(f fs.FileHandle, owner uint64, lk *fuse.FileLock, wait bool) syscall.Errno {
+func (n *Node) setlk(f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32, wait bool) syscall.Errno {
 	h, _ := f.(*handle)
 	op := byte(proto.FxSetlk)
 	if wait {
 		op = proto.FxSetlkw
 	}
+	flock := flags&fuse.LK_FLOCK != 0
 	if h != nil && h.rhandle != 0 {
 		resp, err := h.lay.Remote.Do(&proto.FxReq{
-			Op: op, Handle: h.rhandle, Owner: owner,
+			Op: op, Handle: h.rhandle, Owner: owner, LkFlags: flags,
 			Lock: &proto.LockInfo{Typ: lk.Typ, Start: lk.Start, End: lk.End, Pid: lk.Pid},
 		})
 		if err != nil {
@@ -864,6 +865,28 @@ func (n *Node) setlk(f fs.FileHandle, owner uint64, lk *fuse.FileLock, wait bool
 		return respErrno(resp)
 	}
 	if h != nil && h.fd != nil {
+		if flock {
+			// flock(2) is a separate lock namespace from POSIX fcntl: route
+			// it to the real syscall instead of translating it.
+			op := int(0)
+			switch lk.Typ {
+			case syscall.F_RDLCK:
+				op = syscall.LOCK_SH
+			case syscall.F_WRLCK:
+				op = syscall.LOCK_EX
+			case syscall.F_UNLCK:
+				op = syscall.LOCK_UN
+			default:
+				return syscall.EINVAL
+			}
+			if !wait {
+				op |= syscall.LOCK_NB
+			}
+			if err := syscall.Flock(int(h.fd.Fd()), op); err != nil {
+				return errnoOf(err.Error())
+			}
+			return 0
+		}
 		cmd := syscall.F_SETLK
 		if wait {
 			cmd = syscall.F_SETLKW

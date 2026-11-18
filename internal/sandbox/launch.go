@@ -73,6 +73,12 @@ type launchSpec struct {
 	// NamespaceIDs is captured from the pinned controller thread: /proc/ppid
 	// is useless once the launcher is alone in its PID namespace.
 	NamespaceIDs map[string]string `json:"namespace_ids"`
+
+	// ReverseToken authorizes stub-driven local execution. It travels in the
+	// sealed spec, never in Env: a child that inherited it could mint its own
+	// local commands and turn the allowlist into a general exec service.
+	ReverseToken string   `json:"reverse_token"`
+	ReverseAllow []string `json:"reverse_allow"`
 }
 
 // MaybeRunLauncher checks whether this process is the reexecuted launcher
@@ -930,6 +936,10 @@ func (p *Plan) launch(ctx context.Context, spec *launchSpec) (code int, err erro
 	cmd := exec.Command(exe, launchFlag, strconv.Itoa(specFD))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.ExtraFiles = []*os.File{specFile, rootF, assets.dir}
+	if p.reverseFile != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, p.reverseFile)
+		defer p.reverseFile.Close()
+	}
 	cmd.SysProcAttr = launchAttrs(spec)
 	if err := cmd.Start(); err != nil {
 		return 127, fmt.Errorf("start sandbox PID 1: %w", err)

@@ -3,13 +3,17 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"rsbx/internal/rpc"
 	"syscall"
+	"time"
 
 	"rsbx/internal/daemon"
 )
@@ -21,6 +25,11 @@ func main() {
 	showVer := flag.Bool("version", false, "print the version and exit")
 	sock := flag.String("socket", "", "unix socket to listen on (empty = stdio)")
 	stdio := flag.Bool("stdio", false, "serve a single session over stdin/stdout")
+	listen := flag.String("listen", "", "authenticated TCP address")
+	ca := flag.String("tls-ca", "", "client certificate CA")
+	cert := flag.String("tls-cert", "", "server certificate")
+	key := flag.String("tls-key", "", "server key")
+	skipVerify := flag.Bool("tls-skip-verify", false, "local test only")
 	flag.Parse()
 
 	if *showVer {
@@ -28,6 +37,23 @@ func main() {
 		return
 	}
 	srv := &daemon.Server{}
+	if *listen != "" {
+		config, err := rpc.TLSConfig(*ca, *cert, *key, "", true, *skipVerify)
+		if err != nil {
+			log.Fatal(err)
+		}
+		ln, err := net.Listen("tcp", *listen)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for {
+			raw, err := ln.Accept()
+			if err != nil {
+				log.Fatal(err)
+			}
+			go serveTLS(srv, raw, config)
+		}
+	}
 
 	if *stdio || *sock == "" {
 		srv.ServeConn(stdioConn{})
@@ -64,6 +90,25 @@ func main() {
 		}
 		go srv.ServeConn(c)
 	}
+}
+
+// serveTLS completes the handshake before serving, and on a refused handshake
+// drains what the peer already sent before closing. Closing a socket with
+// unread data makes the kernel send RST, which can discard the TLS alert that
+// carries the real reason; the peer would then report a reset instead of the
+// rejected certificate. Draining keeps the alert deliverable.
+func serveTLS(srv *daemon.Server, raw net.Conn, config *tls.Config) {
+	conn := tls.Server(raw, config)
+	if err := conn.Handshake(); err != nil {
+		// The tls.Conn refuses further reads once its handshake failed, so
+		// the drain has to happen on the raw socket: unread bytes at close
+		// make the kernel answer with RST, which discards the alert.
+		raw.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		io.Copy(io.Discard, raw)
+		conn.Close()
+		return
+	}
+	srv.ServeConn(conn)
 }
 
 // lockInstance takes an exclusive advisory lock so only one daemon serves a

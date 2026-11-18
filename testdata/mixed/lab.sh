@@ -25,7 +25,17 @@ DAEMON_INIT=${DAEMON_INIT:-rsbxd}
 ok(){ echo "OK $1"; }
 bad(){ echo "FAIL $1: $2"; }
 
+# run keeps both streams: a session that dies before printing anything has
+# its reason on stderr, and the failure message must carry it.
 run(){ timeout 120 "$F" -config "$MNT/lab.toml" -- /bin/sh -c "$1" 2>&1; }
+
+# run_probe keeps the client's own stderr out of the answer. Startup
+# diagnostics are written there before the session starts, so a merged
+# capture would hand a placement check "warning + answer" and an exact
+# comparison would never match. PROBE_ERR keeps the diagnostic visible for
+# the failure message and for the check that proves it is still reported.
+PROBE_ERR=$MNT/probe.err
+run_probe(){ timeout 120 "$F" -config "$MNT/lab.toml" -- /bin/sh -c "$1" 2>"$PROBE_ERR"; }
 
 # The session has its own PID namespace and rsbx init. A native daemon command
 # sees the daemon's init; nonempty alone does not prove placement.
@@ -100,12 +110,29 @@ check_git_remote(){
   # The alias body must reach the daemon's git unchanged: it is single-quoted
   # at the local shell, so nothing here expands it. `cat /proc/1/comm` is the
   # daemon's own native procfs, which is what makes the placement observable.
-  # stderr is kept: a missing alias or a failed remote exec has to be visible
-  # in the failure message instead of becoming an empty string.
-  out=$(run "git -c 'alias.w=!cat /proc/1/comm' w")
+  # The probe reads stdout only: the answer is the init name, and the
+  # client's diagnostics are a different fact. They stay in PROBE_ERR so a
+  # failed alias or a failed remote exec is still visible below.
+  out=$(run_probe "git -c 'alias.w=!cat /proc/1/comm' w")
   rc=$?
-  [ $rc -eq 0 ] || { echo "git alias probe failed (rc=$rc): $out"; return 1; }
-  is_daemon_init "$out" || { echo "git init [$out] is not the daemon init $DAEMON_INIT"; return 1; }
+  [ $rc -eq 0 ] || { echo "git alias probe failed (rc=$rc): out=[$out] err=[$(head -c 240 "$PROBE_ERR" 2>/dev/null)]"; return 1; }
+  is_daemon_init "$out" || {
+    echo "git init [$out] is not the daemon init $DAEMON_INIT (stderr: [$(head -c 240 "$PROBE_ERR" 2>/dev/null)])"
+    return 1
+  }
+  return 0
+}
+
+# 5b. Startup diagnostics reach the operator without becoming command output.
+#     The stand-in CLIs are allowlisted here and absent from the daemon image,
+#     so the client has to name them; the probe's own stdout must stay empty.
+check_startup_diagnostic(){
+  local out err
+  out=$(run_probe 'true') || { echo "probe session failed: [$(head -c 240 "$PROBE_ERR" 2>/dev/null)]"; return 1; }
+  err=$(cat "$PROBE_ERR" 2>/dev/null)
+  [ -z "$out" ] || { echo "a startup diagnostic was written to stdout: [$out]"; return 1; }
+  printf '%s\n' "$err" | grep -q "is not present on the daemon at the same path" \
+    || { echo "no startup diagnostic on stderr for programs the daemon cannot see: [$err]"; return 1; }
   return 0
 }
 
@@ -184,7 +211,7 @@ mkcfg
 echo "=== client=$(hostname) ==="
 failed=0
 for t in check_multica_local check_multica_sees_remote check_git_absent_here \
-         check_git_runs check_git_remote check_git_writes_remote \
+         check_git_runs check_git_remote check_startup_diagnostic check_git_writes_remote \
          check_agent_config_local check_agent_io_remote check_all_agents_local \
          check_cli_drives_git check_one_tree; do
   if e=$($t 2>&1); then

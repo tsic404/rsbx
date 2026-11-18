@@ -24,7 +24,7 @@ Environment (all optional):
 
 | variable | default | meaning |
 |---|---|---|
-| `ACC_BIN` | `/tmp/tcbuild` | directory holding `rsbx`, `rsbxd`, `rsbx-tramp`, `rsbx-guard`; copied into both containers so the revision under test is the one that runs |
+| `ACC_BIN` | `/tmp/tcbuild` | directory holding `rsbx`, `rsbxd`, `rsbx-stub`, `rsbx-tramp`, `rsbx-guard`; copied into both containers so the revision under test is the one that runs |
 | `ACC_CLIENT_IMG` | `rsbx:ci` | client image (needs `fuse3` and `/bin/bash`) |
 | `ACC_DAEMON_IMG` | `rsbx-daemon:full` | daemon image (needs `git`, `python3` for the carriers that check them) |
 | `PTY_IMAGE` | `rsbx-pty-client:ci` | client image carrying `python3` for TC-13 |
@@ -125,6 +125,20 @@ Every check in the tree, with the code seam behind it:
 | 34 | TC-13 `pipe_signal_exit_distinguishable` | B | `TC-13/tc13_pty.py` | 137 vs 7 is a caller-visible distinction |
 | 35 | TC-15 `dual-concurrent-sessions` | A | `TC-15/run.sh` → `testdata/probe/dual.sh` | live concurrent sessions on one daemon tree |
 | 36 | TC-15 `stress-shared-configuration` | A | `TC-15/run.sh` → `testdata/mixed/stress.sh` | live concurrent sessions at load |
+| 37 | TC-17 `allowed-target-runs-in-sandbox` | A | `TC-17/run.sh` | the reverse channel's placement is `/proc/1/comm` on the machine that ran the program; one process cannot hold two inits |
+| 38 | TC-17 `symlink-spelling-runs-in-sandbox` | A | `TC-17/run.sh` | the same placement fact through the target's symlink spelling |
+| 39 | TC-17 `exit-status-preserved` | A | `TC-17/run.sh` | the caller's own status is only observable across the real channel |
+| 40 | TC-17 `unlisted-target-refused` | C + A | `TC-17/run.sh` | the refusal names `local.allow`; the carrier keeps the real session and the absent daemon-side marker |
+| 41 | TC-17 `missing-capability-refused` | C + A | `TC-17/run.sh` | refusal names the missing `RSBX_STUB_SOCKET`; the carrier keeps the real stub invocation |
+| 42 | TC-17 `wrong-capability-refused` | C + A | `TC-17/run.sh` | refusal names the socket it tried; the carrier keeps a live session that must stay untouched |
+| 43 | TC-17 `relative-cwd-refused` | C + A | `TC-17/run.sh` | refusal names the working directory; a relative cwd can only arrive on the wire |
+| 44 | TC-17 `tty-refused` | C + A | `TC-17/run.sh` | refusal names PTY support; the terminal flag is only expressible on the wire |
+| 45 | TC-17 `loader-injection-refused` | C + A | `TC-17/run.sh` | refusal names the variable; the environment is only expressible on the wire |
+| 46 | TC-17 `session-still-works` | A | `TC-17/run.sh` | the session that survived the refusals must still place work in this sandbox |
+| 47 | TC-18 `trusted-pair-establishes-session-and-runs` | A | `TC-18/run.sh` | two ends of a real mutual-TLS handshake; the command's placement is the daemon's init |
+| 48 | TC-18 `untrusted-client-certificate-rejected` | A | `TC-18/run.sh` | the rejection happens inside the handshake, which one process cannot stage as two ends |
+| 49 | TC-18 `missing-client-certificate-rejected` | A | `TC-18/run.sh` | same, with the certificate omitted rather than distrusted |
+| 50 | TC-18 `untrusted-server-certificate-rejected` | A | `TC-18/run.sh` | the client's own verdict on the server certificate needs the real client |
 
 TC-16's eight workspace checks are an external-rig gate run by the CI job; they
 are not part of this count.
@@ -149,6 +163,8 @@ criterion, the missing part was added first.
 | `TC-13/run.sh` | TC-13 | AC-7 | eight pty/pipe assertions (input, signal, foreground, exit status, termios, stdin order, two end states) |
 | `TC-15/run.sh` | TC-15 | AC-8 / AC-9 | entry only: drives the in-repo `testdata/probe/dual.sh` (8 checks) and `testdata/mixed/stress.sh` (4 checks) |
 | `TC-16/run.sh` | TC-16 | AC-10 | task-workspace gate; driven by the CI job with its own rig (`runner: external-rig`) |
+| `TC-17/run.sh` | TC-17 | AC-11 | ten checks on the reverse channel: placement, symlink spelling, exit status, four refusals with their reasons, and the session that survives them |
+| `TC-18/run.sh` | TC-18 | AC-12 | four mutual-TLS combinations: a trusted pair establishes a session and runs a command; an untrusted client certificate, a missing one and an untrusted server certificate are each rejected with the certificate named |
 
 ## Fixed or reported
 

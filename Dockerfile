@@ -13,6 +13,7 @@ ARG VERSION=dev
 ENV CGO_ENABLED=0
 RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/rsbx ./cmd/rsbx \
  && go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/rsbxd ./cmd/rsbxd \
+ && go build -trimpath -ldflags="-s -w" -o /out/rsbx-stub ./cmd/rsbx-stub \
  && go build -trimpath -ldflags="-s -w" -o /out/rsbx-tramp ./cmd/rsbx-tramp \
  && go build -trimpath -ldflags="-s -w" -o /out/rsbx-guard ./cmd/rsbx-guard
 

@@ -11,6 +11,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -75,6 +76,14 @@ type Plan struct {
 	Local *paths.Set
 	// Exec is the executable policy.
 	Exec *policy.Policy
+	// Reverse is the live reverse-exec channel, once Run opened one. It is
+	// exported so the caller can tell the agent where its stubs must dial.
+	Reverse *rpc.ReverseChannel
+	// reverseToken is this session's capability for local execution. It is
+	// generated per session and handed only to the supervisor's sealed spec.
+	reverseToken string
+	reverseAllow []string
+	reverseFile  *os.File
 	// Workspace, when set, is the task workspace in the daemon's tree: this
 	// session starts there after initializing it from the seed.
 	Workspace *workspace.Spec
@@ -93,6 +102,7 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	reverseAllow := pol.ExecPaths()
 	// local.entry explicitly selects another local program. It has the same
 	// compiled dependency and immutable-asset requirements as local.allow.
 	if entry := cfg.Local.Entry; entry != "" {
@@ -122,6 +132,10 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	target, err := targetOf(cfg)
+	if err != nil {
+		return nil, err
+	}
 	// Only explicitly configured read-only trees are local. Host toolchain
 	// and loader directories are not pulled in implicitly: a program whose
 	// bytes live on the daemon has to be started from there.
@@ -130,17 +144,74 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 		return nil, err
 	}
 	p := &Plan{
-		Cfg:        cfg,
-		Mount:      cfg.Sandbox.Mount,
-		Cache:      cfg.Sandbox.Cache,
-		Trampoline: tramp,
-		Guard:      guard,
-		Target:     targetOf(cfg),
-		Local:      mergePaths(local, machine),
-		Exec:       pol,
+		Cfg:          cfg,
+		Mount:        cfg.Sandbox.Mount,
+		Cache:        cfg.Sandbox.Cache,
+		Trampoline:   tramp,
+		Guard:        guard,
+		Target:       target,
+		Local:        mergePaths(local, machine),
+		Exec:         pol,
+		reverseAllow: reverseAllow,
 	}
 	p.Remote = rpc.NewFS(p.Target)
 	return p, nil
+}
+
+// StartupDiagnostics reports plan hazards a user could not see until a task
+// fails deep inside the sandbox. Each entry is a warning, never a refusal:
+// some sessions deliberately keep an allowlisted program local-only.
+func (p *Plan) StartupDiagnostics(ctx context.Context) []string {
+	var out []string
+	if p.Exec == nil {
+		return out
+	}
+	// An allowlisted program is local-only. A process routed to the daemon
+	// (a shell, a build tool) that calls it by absolute path sees ENOENT
+	// there, which is hard to attribute without this hint.
+	remote := p.Remote
+	if remote != nil {
+		done := make(chan []string, 1)
+		go func() {
+			var missing []string
+			for _, path := range p.Exec.ExecPaths() {
+				if _, err := remote.Stat(path); err != nil {
+					missing = append(missing, path)
+				}
+			}
+			done <- missing
+		}()
+		select {
+		case missing := <-done:
+			for _, path := range missing {
+				out = append(out, fmt.Sprintf(
+					"local.allow program %s is not present on the daemon at the same path; "+
+						"a non-local process (shell, build tool) calling it there fails with ENOENT", path))
+			}
+		case <-ctx.Done():
+			_ = remote.Close()
+			<-done
+			return out
+		}
+	}
+	if !shellAllowlisted(p.Exec) {
+		out = append(out,
+			"no command shell is in local.allow: agent tools that start /bin/sh or /bin/bash "+
+				"run on the daemon, so allowlisted programs are unreachable to them by path")
+	}
+	return out
+}
+
+// shellAllowlisted reports whether a POSIX shell is in the local allow set,
+// by exact path or by alias.
+func shellAllowlisted(pol *policy.Policy) bool {
+	for _, path := range pol.ExecPaths() {
+		switch filepath.Base(path) {
+		case "sh", "bash", "dash", "ash", "zsh", "ksh":
+			return true
+		}
+	}
+	return false
 }
 
 // SetWorkspace attaches a task workspace. The path is a native path in the
@@ -207,11 +278,21 @@ func mergePaths(writable, readOnly *paths.Set) *paths.Set {
 	return merged.WithReadOnly(ro)
 }
 
-func targetOf(cfg *config.Config) rpc.Target {
-	if cfg.Daemon.Transport == "ssh" {
-		return rpc.Target{Command: splitCommand(cfg.Daemon.Command)}
+// targetOf builds the daemon transport. A TLS transport whose configuration
+// cannot be used is reported here, before a session starts, instead of
+// surfacing as a handshake failure on the first request.
+func targetOf(cfg *config.Config) (rpc.Target, error) {
+	if cfg.Daemon.Transport == "tls" {
+		tlsConfig, err := rpc.TLSConfig(cfg.Daemon.TLSCA, cfg.Daemon.TLSCert, cfg.Daemon.TLSKey, cfg.Daemon.ServerName, false, cfg.Daemon.TLSSkipVerify)
+		if err != nil {
+			return rpc.Target{}, fmt.Errorf("daemon TLS: %w", err)
+		}
+		return rpc.Target{Address: cfg.Daemon.Address, TLSConfig: tlsConfig}, nil
 	}
-	return rpc.Target{Socket: cfg.Daemon.Socket}
+	if cfg.Daemon.Transport == "ssh" {
+		return rpc.Target{Command: splitCommand(cfg.Daemon.Command)}, nil
+	}
+	return rpc.Target{Socket: cfg.Daemon.Socket}, nil
 }
 
 // splitCommand splits a command line into argv, honouring double quotes so a
@@ -396,6 +477,50 @@ func (p *Plan) Run(ctx context.Context, argv []string) (int, error) {
 		return 127, fmt.Errorf("sandbox broker: %w", err)
 	}
 	defer b.Close()
+	// A fresh capability binds every reverse command to this exact session.
+	// The daemon never receives it: only the controller uses it to talk to
+	// the supervisor's private local-exec socket.
+	p.reverseToken, err = reverseToken()
+	if err != nil {
+		return 127, fmt.Errorf("generate reverse execution token: %w", err)
+	}
+	if p.Cfg.Daemon.Reverse {
+		if p.Cfg.Daemon.Address == "" {
+			return 127, fmt.Errorf("reverse execution requires daemon transport tls with mTLS")
+		}
+		bind := "127.0.0.1:0"
+		if p.Cfg.Daemon.Transport == "tls" && p.Cfg.Daemon.Reverse {
+			bind = "[::]:0"
+		}
+		listener, err := net.Listen("tcp", bind)
+		if err != nil {
+			return 127, err
+		}
+		defer listener.Close()
+		tcp := listener.(*net.TCPListener)
+		file, err := tcp.File()
+		if err != nil {
+			return 127, err
+		}
+		p.reverseFile = file
+		go func() { <-ctx.Done(); listener.Close() }()
+		client := &ReverseClient{Address: listener.Addr().String(), Token: p.reverseToken}
+		reverse, err := rpc.OpenReverse(ctx, p.Target, client)
+		if err != nil {
+			return 127, err
+		}
+		p.Reverse = reverse
+		defer reverse.Close()
+		spec, err := p.launchSpec(argv, b)
+		if err != nil {
+			return 127, err
+		}
+		spec.ReverseToken = p.reverseToken
+		spec.ReverseAllow = p.reverseAllow
+		spec.Env = append(spec.Env, "RSBX_STUB_SOCKET="+reverse.StubSocket)
+		fmt.Fprintf(os.Stderr, "rsbx: remote stub socket: %s\n", reverse.StubSocket)
+		return p.launch(ctx, spec)
+	}
 	spec, err := p.launchSpec(argv, b)
 	if err != nil {
 		return 127, err
