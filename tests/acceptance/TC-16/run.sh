@@ -12,6 +12,7 @@
 #   SEED        local directory holding the workspace's own initial material
 #   WS          workspace path in the daemon's tree
 #   UNSHARE_USER  sandbox user namespace (false inside a privileged container)
+# runner: external-rig
 set -u
 MNT=${MNT:?}; F=${F:?}; SOCK=${SOCK:?}
 AGENT_HOME=${AGENT_HOME:?}; SEED=${SEED:?}; WS=${WS:?}
