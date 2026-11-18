@@ -506,6 +506,55 @@ jobs:
           fi
           test "$(grep -c '^OK' tc16-out.txt)" -eq 8
 
+      # Every carrier under tests/acceptance runs here, on every change. The
+      # carriers build their own rigs, so this step only has to supply the
+      # images and the binaries they copy in. The three derived images are
+      # built from the release image, so all four describe this commit.
+      #
+      # FAIL fails the job. A run that only skipped is not a pass either: in
+      # this job every prerequisite is provisioned (/dev/fuse, --privileged,
+      # python3, git, the stand-in CLIs), so a SKIP means the rig stopped
+      # judging something and the result must not read as green.
+      - name: acceptance carriers
+        run: |
+          set -euo pipefail
+          docker build -q -t rsbx-daemon:full \
+            -f tests/acceptance/images/daemon.Dockerfile .
+          docker build -q -t rsbx-pty-client:ci \
+            -f tests/acceptance/images/pty-client.Dockerfile .
+          docker build -q -t rsbx-mixed-client:ci \
+            -f testdata/mixed/Dockerfile.client testdata/mixed
+
+          # The binaries the carriers copy into their containers are the ones
+          # this job just built into rsbx:ci, extracted so ACC_BIN names a real
+          # directory instead of falling back to the images' own copies.
+          mkdir -p dist
+          cid=$(docker create rsbx:ci)
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          for b in rsbx rsbxd rsbx-tramp rsbx-guard; do
+            docker cp "$cid:/usr/local/bin/$b" "dist/$b"
+          done
+          docker rm -f "$cid" >/dev/null
+          trap - EXIT
+
+          rc=0
+          # A carrier that wedges fails the job instead of holding it open;
+          # the value is generous because one carrier seeds a 256 MiB file and
+          # drives a deliberate disconnect.
+          CARRIER_TIMEOUT=1200 \
+          ACC_BIN=dist \
+          ACC_CLIENT_IMG=rsbx:ci \
+          ACC_DAEMON_IMG=rsbx-daemon:full \
+          PTY_IMAGE=rsbx-pty-client:ci \
+          MIXED_CLIENT_IMAGE=rsbx-mixed-client:ci \
+            bash tests/acceptance/run-all.sh || rc=$?
+          case $rc in
+            0) echo "acceptance carriers: every check held" ;;
+            1) echo "::error::acceptance carriers: a design criterion failed"; exit 1 ;;
+            77) echo "::error::acceptance carriers: checks were skipped in a fully provisioned rig, so the run is not a pass"; exit 1 ;;
+            *) echo "::error::acceptance carriers: runner exited $rc without a verdict"; exit 1 ;;
+          esac
+
       - name: log in to ghcr
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
