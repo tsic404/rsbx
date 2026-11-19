@@ -96,7 +96,11 @@ func TestLaunchSpecCarriesNoDaemonTransport(t *testing.T) {
 	cfg.Daemon.Command = `ssh host rsbxd --socket /x`
 	plan := planFor(t, dir, []string{"/bin/sh"}, nil)
 	plan.Cfg = cfg
-	plan.Target = targetOf(cfg)
+	target, err := targetOf(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Target = target
 	b, err := newBroker(plan.Target, filepath.Join(dir, "broker"))
 	if err != nil {
 		t.Fatal(err)

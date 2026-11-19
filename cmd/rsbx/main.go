@@ -145,6 +145,11 @@ func runCLI() (code int) {
 		if err != nil {
 			return report(fmt.Errorf("daemon unreachable (%s): %w", cfg.Daemon.EffectiveEndpoint(), err))
 		}
+		// The daemon answered; startup diagnostics can now be checked
+		// without hiding a transport failure.
+		for _, warning := range plan.StartupDiagnostics(ctx) {
+			fmt.Fprintf(os.Stderr, "rsbx: %s\n", warning)
+		}
 	case <-ctx.Done():
 		if err := remote.Close(); err != nil {
 			_ = report(fmt.Errorf("close session connection: %w", err))

@@ -95,6 +95,14 @@ mkcfg
 # plain program it starts (ls, cat, git, mkdir) is routed by the sandbox.
 run(){ timeout 240 "$F" -config "$MNT/real.toml" -- /bin/sh -c "$1" 2>&1; }
 fixture(){ timeout 240 "$F" -config "$MNT/real.toml" -- "$FIXTURE" "$@" 2>&1; }
+# The next two keep the client's own stderr out of the answer. Startup
+# diagnostics are written there before the session starts, so an exact
+# comparison of a command's output must read stdout only. PROBE_ERR keeps the
+# diagnostics and any session failure visible to the caller.
+PROBE_ERR=$MNT/probe.err
+run_out(){ timeout 240 "$F" -config "$MNT/real.toml" -- /bin/sh -c "$1" 2>"$PROBE_ERR"; }
+host_out(){ timeout 240 "$F" -config "$MNT/real.toml" -- "$@" 2>"$PROBE_ERR"; }
+perr(){ head -c 200 "$PROBE_ERR" 2>/dev/null; }
 # host runs the same fixture outside the sandbox. `find` only reads /proc; it
 # never signals a process, so observing cleanup cannot cause it.
 host(){ timeout 60 "$FIXTURE" "$@" 2>&1; }
@@ -161,9 +169,9 @@ check_versions(){
   for name in multica omp codex claude; do
     arg=--version
     [ "$name" = multica ] && arg=version
-    out=$(timeout 240 "$F" -config "$MNT/real.toml" -- "$REAL_TOOLS/$name" "$arg" 2>&1)
+    out=$(host_out "$REAL_TOOLS/$name" "$arg")
     rc=$?
-    [ $rc -eq 0 ] || { echo "$name startup failed (rc=$rc): $out"; return 1; }
+    [ $rc -eq 0 ] || { echo "$name startup failed (rc=$rc): $out [$(perr)]"; return 1; }
     [ -n "$out" ] || { echo "$name printed nothing"; return 1; }
     printf '%s: %s\n' "$name" "$out"
   done
@@ -212,10 +220,10 @@ check_local_remote_split(){
   if run "ls -d $AGENT_HOME/state/cfg-$id" >/dev/null 2>&1; then
     echo "local config is visible in the daemon tree"; return 1
   fi
-  out=$(run "cat $PROJ/artifact-$id"); rc=$?
-  [ $rc -eq 0 ] || { echo "artifact unreadable (rc=$rc): $out"; return 1; }
+  out=$(run_out "cat $PROJ/artifact-$id"); rc=$?
+  [ $rc -eq 0 ] || { echo "artifact unreadable (rc=$rc): $out [$(perr)]"; return 1; }
   [ "$out" = "remote artifact" ] || { echo "artifact not remote: $out"; return 1; }
-  out=$(fixture bytes); rc=$?
+  out=$(host_out "$FIXTURE" bytes); rc=$?
   [ $rc -eq 0 ] || { echo "byte preservation failed (rc=$rc): $out"; return 1; }
   return 0
 }
@@ -224,17 +232,17 @@ check_local_remote_split(){
 #    deleted descriptor refused.
 check_placement(){
   local out rc
-  out=$(fixture identity); rc=$?
+  out=$(host_out "$FIXTURE" identity); rc=$?
   [ $rc -eq 0 ] || { echo "local identity failed (rc=$rc): $out"; return 1; }
   [ "$out" = "init=$CLIENT_INIT argv0=$FIXTURE" ] || { echo "local identity: $out"; return 1; }
-  out=$(run "$PROJ/remote-native identity"); rc=$?
+  out=$(run_out "$PROJ/remote-native identity"); rc=$?
   [ $rc -eq 0 ] || { echo "remote identity failed (rc=$rc): $out"; return 1; }
   [ "$out" = "init=$DAEMON_INIT argv0=$PROJ/remote-native" ] || { echo "remote identity: $out"; return 1; }
-  out=$(fixture argv0); rc=$?
+  out=$(host_out "$FIXTURE" argv0); rc=$?
   [ $rc -eq 0 ] || { echo "custom argv[0] failed (rc=$rc): $out"; return 1; }
-  out=$(fixture fd); rc=$?
+  out=$(host_out "$FIXTURE" fd); rc=$?
   [ $rc -eq 0 ] || { echo "named execveat failed (rc=$rc): $out"; return 1; }
-  out=$(fixture deleted); rc=$?
+  out=$(host_out "$FIXTURE" deleted); rc=$?
   [ $rc -eq 0 ] || { echo "deleted descriptor not refused (rc=$rc): $out"; return 1; }
   return 0
 }
@@ -244,8 +252,8 @@ check_git_flow(){
   local out rc
   out=$(fixture gitflow "$id"); rc=$?
   [ $rc -eq 0 ] || { echo "git flow failed (rc=$rc): $out"; return 1; }
-  out=$(run "cat $PROJ/clone-$id/lib.c"); rc=$?
-  [ $rc -eq 0 ] || { echo "clone unreadable (rc=$rc): $out"; return 1; }
+  out=$(run_out "cat $PROJ/clone-$id/lib.c"); rc=$?
+  [ $rc -eq 0 ] || { echo "clone unreadable (rc=$rc): $out [$(perr)]"; return 1; }
   [ "$out" = "lib code" ] || { echo "git did not run remote or work is invisible: $out"; return 1; }
   [ ! -e "$AGENT_HOME/clone-$id" ] || { echo "remote clone leaked into local config"; return 1; }
   return 0
@@ -281,8 +289,8 @@ check_canceled_session_cleanup(){
   wait "$pid"; rc=$?
   [ $rc -ne 0 ] || { echo "canceled session exited 0"; return 1; }
   gone_after "$nonce" || { echo "hold process survived cancellation"; return 1; }
-  out=$(run "echo fresh-session"); rc=$?
-  [ $rc -eq 0 ] || { echo "fresh session failed (rc=$rc): $out"; return 1; }
+  out=$(run_out "echo fresh-session"); rc=$?
+  [ $rc -eq 0 ] || { echo "fresh session failed (rc=$rc): $out [$(perr)]"; return 1; }
   [ "$out" = "fresh-session" ] || { echo "fresh session after cancel: $out"; return 1; }
   return 0
 }

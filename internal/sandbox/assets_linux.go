@@ -194,7 +194,8 @@ func captureExecAssets(ctx context.Context, p *Plan, spec *launchSpec) (_ *execA
 		}
 		seenPaths[in.path] = true
 		if in.kind == "local" && p.Local != nil && p.Local.Writable(in.path) {
-			return nil, fmt.Errorf("local executable %s overlaps a writable local tree", in.path)
+			return nil, fmt.Errorf("local executable %s overlaps a writable local tree: "+
+				"an allowlisted program must be immutable, so move it out of the local.paths tree it is in", in.path)
 		}
 		src, err := os.Open(in.source)
 		if err != nil {

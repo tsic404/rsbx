@@ -78,6 +78,7 @@ jobs:
           mkdir -p dist
           go build -trimpath -ldflags="-s -w -X main.version=${{ github.sha }}" -o dist/rsbx ./cmd/rsbx
           go build -trimpath -ldflags="-s -w -X main.version=${{ github.sha }}" -o dist/rsbxd ./cmd/rsbxd
+          go build -trimpath -ldflags="-s -w" -o dist/rsbx-stub ./cmd/rsbx-stub
           go build -trimpath -ldflags="-s -w" -o dist/rsbx-tramp ./cmd/rsbx-tramp
           go build -trimpath -ldflags="-s -w" -o dist/rsbx-guard ./cmd/rsbx-guard
 
@@ -94,6 +95,11 @@ jobs:
         run: |
           ./dist/rsbx -version
           ./dist/rsbxd -version
+          # rsbx-stub has no -version: its target comes from argv[0], so a
+          # bare invocation must refuse with its usage message and the same
+          # status a misinvoked stub returns to the daemon.
+          rc=0; ./dist/rsbx-stub >/dev/null 2>&1 || rc=$?
+          test "$rc" -eq 126
 
       - uses: actions/upload-artifact@v4
         with:
@@ -452,7 +458,7 @@ jobs:
           if grep -q "^FAIL" mixed-out.txt; then
             echo "mixed-model checks failed:"; grep "^FAIL" mixed-out.txt; exit 1
           fi
-          test "$(grep -c '^OK' mixed-out.txt)" -eq 11
+          test "$(grep -c '^OK' mixed-out.txt)" -eq 12
           # The same model under load: many sessions at once, each running the
           # host programs and the daemon programs on one shared tree.
           docker run --rm --privileged --user 0 --network mix-net \
@@ -531,7 +537,7 @@ jobs:
           mkdir -p dist
           cid=$(docker create rsbx:ci)
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
-          for b in rsbx rsbxd rsbx-tramp rsbx-guard; do
+          for b in rsbx rsbxd rsbx-stub rsbx-tramp rsbx-guard; do
             docker cp "$cid:/usr/local/bin/$b" "dist/$b"
           done
           docker rm -f "$cid" >/dev/null

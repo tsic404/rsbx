@@ -114,7 +114,10 @@ acc_exec_dir_prepare(){
 }
 
 acc_rig_cleanup(){
-  docker rm -f "$ACC_CLIENT" "$ACC_DAEMON" >/dev/null 2>&1 || true
+  docker rm -f "$ACC_CLIENT" "$ACC_DAEMON" "${ACC_TLS_DAEMON:-}" >/dev/null 2>&1 || true
+  if [ -n "${ACC_TLS_DIR:-}" ]; then
+    rm -rf "$ACC_TLS_DIR"
+  fi
   docker network rm "$ACC_PREFIX-net" >/dev/null 2>&1 || true
   local v
   for v in proj run state work; do
@@ -135,21 +138,24 @@ acc_daemon(){ docker exec "$ACC_DAEMON" /bin/bash -c "$1"; }
 
 acc_daemon_kill(){ docker kill "$ACC_DAEMON" >/dev/null 2>&1 || true; }
 
-# acc_proc_match client|daemon PATTERN — print the command line of every
-# process on that side whose argv contains PATTERN, and succeed only when at
-# least one was found.
+# acc_proc_match client|daemon PATTERN [CONTAINER] — print the command line of
+# every process on that side whose argv contains PATTERN, and succeed only when
+# at least one was found. CONTAINER names another container on the same side
+# (a second daemon, for instance) when the rig has more than one.
 #
 # This reads /proc/*/cmdline instead of running ps: the slim images carry no
 # procps, and a missing ps would make "no process was left behind" pass
 # without anyone looking. The pattern travels in the environment, never in the
 # scanner's own command line, so the scanner cannot match itself.
 acc_proc_match(){
-  local where=$1 pattern=$2 container
+  local where=$1 pattern=$2 target=${3:-}
+  local container
   case $where in
     client) container=$ACC_CLIENT ;;
     daemon) container=$ACC_DAEMON ;;
     *) return 2 ;;
   esac
+  [ -z "$target" ] || container=$target
   docker exec -e ACC_PAT="$pattern" "$container" /bin/bash -c '
     rc=1
     for d in /proc/[0-9]*; do
@@ -220,12 +226,38 @@ acc_run(){
   return "$rc"
 }
 
+# acc_run_split CMD — same contract as acc_run, but stdout and stderr stay
+# apart: ACC_OUT holds the command's own output, ACC_ERR the client's
+# stderr. Startup diagnostics and refusal messages are on stderr, so a check
+# that compares an answer with an exact string must read ACC_OUT only.
+acc_run_split(){
+  local stamp=$RANDOM$RANDOM
+  local outfile=/tmp/.acc-out-$stamp errfile=/tmp/.acc-err-$stamp rcfile=/tmp/.acc-rc-$stamp
+  docker exec "$ACC_CLIENT" /bin/bash -c "$1 > $outfile 2> $errfile; echo \$? > $rcfile" >/dev/null 2>&1
+  ACC_OUT=$(docker exec "$ACC_CLIENT" /bin/bash -c "cat $outfile 2>/dev/null")
+  ACC_ERR=$(docker exec "$ACC_CLIENT" /bin/bash -c "cat $errfile 2>/dev/null")
+  local rc
+  rc=$(docker exec "$ACC_CLIENT" /bin/bash -c "cat $rcfile 2>/dev/null")
+  docker exec "$ACC_CLIENT" /bin/bash -c "rm -f $outfile $errfile $rcfile" >/dev/null 2>&1
+  [ -n "$rc" ] || { ACC_RC=255; return 255; }
+  ACC_RC=$rc
+  return "$rc"
+}
+
 # acc_session CFG ARGS... — one session. Output in ACC_OUT, status returned.
 # ACC_SESSION_FLAGS, when set, is inserted before the `--` separator; that is
 # where -workspace and -workspace-seed belong.
 acc_session(){
   local cfg=$1; shift
   acc_run "timeout $ACC_SESSION_TIMEOUT /usr/local/bin/rsbx -config $cfg ${ACC_SESSION_FLAGS:-} -- $(printf '%q ' "$@")"
+}
+
+# acc_session_split CFG ARGS... — one session with the two streams apart:
+# ACC_OUT is the command's stdout, ACC_ERR is everything the client wrote to
+# stderr (diagnostics and refusal reasons).
+acc_session_split(){
+  local cfg=$1; shift
+  acc_run_split "timeout $ACC_SESSION_TIMEOUT /usr/local/bin/rsbx -config $cfg ${ACC_SESSION_FLAGS:-} -- $(printf '%q ' "$@")"
 }
 
 # acc_session_log CFG LOG ARGS... — same, but the combined output is written
@@ -320,16 +352,29 @@ acc_init_names(){
 # acc_install_binaries: put the binaries under test on both sides. ACC_BIN is
 # the directory the build produced (default /tmp/tcbuild); without it the
 # images' own binaries are what runs, and the report says so.
-acc_install_binaries(){
-  local b installed=
-  for b in rsbx rsbxd rsbx-tramp rsbx-guard; do
+ACC_BINARIES=${ACC_BINARIES:-"rsbx rsbxd rsbx-stub rsbx-tramp rsbx-guard"}
+
+# acc_copy_binaries CONTAINER — copy every binary under test that exists into
+# the container's /usr/local/bin. Succeeds only when at least one was copied,
+# so a caller can tell "the image's own binaries" apart from "the revision
+# under test".
+acc_copy_binaries(){
+  local container=$1 b copied=
+  for b in $ACC_BINARIES; do
     [ -f "$ACC_BIN/$b" ] || continue
-    docker cp "$ACC_BIN/$b" "$ACC_CLIENT:/usr/local/bin/$b" >/dev/null 2>&1 || return 1
-    docker cp "$ACC_BIN/$b" "$ACC_DAEMON:/usr/local/bin/$b" >/dev/null 2>&1 || return 1
-    installed=$ACC_BIN
+    docker cp "$ACC_BIN/$b" "$container:/usr/local/bin/$b" >/dev/null 2>&1 || return 1
+    copied=1
   done
-  if [ -n "$installed" ]; then
-    acc_exec 'chmod 755 /usr/local/bin/rsbx /usr/local/bin/rsbx-tramp /usr/local/bin/rsbx-guard'
+  [ -n "$copied" ]
+}
+
+acc_install_binaries(){
+  local installed=
+  if [ -f "$ACC_BIN/rsbx" ]; then
+    acc_copy_binaries "$ACC_CLIENT" || return 1
+    acc_copy_binaries "$ACC_DAEMON" || return 1
+    installed=$ACC_BIN
+    acc_exec 'chmod 755 /usr/local/bin/rsbx /usr/local/bin/rsbxd /usr/local/bin/rsbx-stub /usr/local/bin/rsbx-tramp /usr/local/bin/rsbx-guard'
     # The daemon is already running the image's binary; restart it so the
     # binary under test is the one serving.
     docker restart "$ACC_DAEMON" >/dev/null
@@ -354,4 +399,139 @@ acc_ready(){
   acc_exec 'test -x /usr/local/bin/rsbx || exit 1' || {
     acc_skip_all client_binary "rsbx client binary absent in $ACC_CLIENT_IMG"; return 1; }
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# network transport (mutual TLS)
+#
+# Certificates are deployment input: neither binary mints them, so a carrier
+# that needs the network transport generates them on the host and copies them
+# in. That also makes the untrusted combinations possible, which is the point
+# of the authentication criterion.
+
+ACC_TLS_PORT=${ACC_TLS_PORT:-9443}
+ACC_TLS_DIR=
+ACC_TLS_WHY=
+ACC_TLS_DAEMON=
+
+# acc_tls_prepare mints one trusted CA, one untrusted CA, a server
+# certificate for localhost, and a client certificate from each CA.
+acc_tls_prepare(){
+  command -v openssl >/dev/null 2>&1 || { ACC_TLS_WHY="openssl not present on the carrier host"; return 1; }
+  ACC_TLS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/acc-tls-XXXXXX") || {
+    ACC_TLS_WHY="cannot create a host temp directory"; return 1; }
+  local dir=$ACC_TLS_DIR
+  (
+    set -e
+    cd "$dir"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem \
+      -days 2 -subj "/C=XX/O=rsbx-acceptance/CN=trusted-ca" >/dev/null 2>&1
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout other-ca.key -out other-ca.pem \
+      -days 2 -subj "/C=XX/O=rsbx-acceptance/CN=untrusted-ca" >/dev/null 2>&1
+    issue(){
+      local name=$1 cn=$2 ca=$3 san=$4
+      openssl req -newkey rsa:2048 -nodes -keyout "$name.key" -out "$name.csr" \
+        -subj "/C=XX/O=rsbx-acceptance/CN=$cn" >/dev/null 2>&1
+      printf 'subjectAltName=%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n' \
+        "$san" > "$name.ext"
+      openssl x509 -req -in "$name.csr" -CA "$ca.pem" -CAkey "$ca.key" \
+        -CAcreateserial -out "$name.pem" -days 2 -extfile "$name.ext" >/dev/null 2>&1
+    }
+    issue server localhost ca "DNS:localhost,IP:127.0.0.1"
+    issue client client ca "DNS:client"
+    issue client-other client other-ca "DNS:client"
+  ) || { ACC_TLS_WHY="certificate generation failed"; rm -rf "$dir"; ACC_TLS_DIR=; return 1; }
+  # The daemon reads these through a read-only mount while running as the
+  # image's own unprivileged user, whose uid need not match the uid that
+  # minted them. A 700 directory and 600 keys are then unreadable and the
+  # daemon exits at startup, so the material must be readable by every user.
+  chmod 755 "$dir"
+  chmod 644 "$dir"/*.pem "$dir"/*.key
+  return 0
+}
+
+# acc_tls_client_install puts the material the client may present under its
+# own scratch volume. Every case uses a subset of it.
+acc_tls_client_install(){
+  [ -n "$ACC_TLS_DIR" ] || return 1
+  acc_exec "mkdir -p $ACC_STATE/tls" >/dev/null 2>&1
+  local f
+  for f in ca.pem other-ca.pem client.pem client.key client-other.pem client-other.key; do
+    docker cp "$ACC_TLS_DIR/$f" "$ACC_CLIENT:$ACC_STATE/tls/$f" >/dev/null || return 1
+  done
+  return 0
+}
+
+# acc_tls_daemon_start starts a second rsbxd that serves the same project
+# volume over mutual TLS, on the rig's existing network.
+acc_tls_daemon_start(){
+  ACC_TLS_DAEMON=$ACC_PREFIX-tlsdaemon
+  # No --rm: a daemon that exits at startup must stay inspectable so the
+  # caller can report why instead of only "never accepted a connection".
+  docker run -d --name "$ACC_TLS_DAEMON" --network "$ACC_PREFIX-net" \
+    -v "$ACC_PREFIX-proj:$ACC_PROJ" -v "$ACC_TLS_DIR:/tls:ro" \
+    --entrypoint rsbxd "$ACC_DAEMON_IMG" \
+    -listen ":$ACC_TLS_PORT" -tls-ca /tls/ca.pem \
+    -tls-cert /tls/server.pem -tls-key /tls/server.key >/dev/null || return 1
+  # The binaries under test are the ones the image already carries; when
+  # ACC_BIN names a build, copy it in and restart so the rig serves that.
+  if acc_copy_binaries "$ACC_TLS_DAEMON" >/dev/null 2>&1; then
+    docker restart "$ACC_TLS_DAEMON" >/dev/null
+  fi
+  return 0
+}
+
+# acc_tls_daemon_diag prints why the TLS daemon is not serving: its state and
+# exit code, plus the log it wrote. The caller runs this before cleanup so a
+# startup failure names itself instead of becoming a bare timeout.
+acc_tls_daemon_diag(){
+  local container=${1:-$ACC_TLS_DAEMON}
+  docker ps -a --filter "name=^$container$" \
+    --format '    tls daemon state: {{.Status}}' 2>/dev/null
+  docker inspect "$container" \
+    --format '    tls daemon exit: {{.State.ExitCode}} ({{.State.Status}}){{if .State.Error}}: {{.State.Error}}{{end}}' \
+    2>/dev/null
+  docker logs "$container" 2>&1 | tail -10 | sed 's/^/    tls daemon log: /'
+}
+
+# acc_tls_wait waits until the TLS daemon accepts a TCP connection. Only
+# reachability is asked here; authentication is what the checks judge.
+acc_tls_wait(){
+  local container=${1:-$ACC_TLS_DAEMON}
+  acc_exec "for i in \$(seq 1 100); do (exec 3<>/dev/tcp/$container/$ACC_TLS_PORT) 2>/dev/null && exit 0; sleep 0.2; done; exit 1"
+}
+
+# acc_tls_config NAME ALLOW ENTRY CA CERT KEY [EXTRA]
+# Writes a TLS client config. CA/CERT/KEY name files installed under
+# $ACC_STATE/tls; "-" for CERT omits the certificate and key, which is the
+# "client presents no certificate" case. EXTRA is appended to [daemon];
+# ACC_TLS_LOCAL_PATHS, when set, is the [local] paths array (default empty).
+acc_tls_config(){
+  local name=$1 allow=$2 entry=${3:-/bin/sh} ca=${4:-ca.pem} cert=${5:-client.pem} key=${6:-client.key} extra=${7:-}
+  local mount=$ACC_STATE/sb-$name cache=$ACC_STATE/cache-$name material=
+  acc_exec "mkdir -p $mount $cache"
+  if [ "$cert" != "-" ]; then
+    material="tls_cert = \"$ACC_STATE/tls/$cert\"
+tls_key = \"$ACC_STATE/tls/$key\""
+  fi
+  printf '%s' "[daemon]
+transport = \"tls\"
+address = \"${ACC_TLS_DAEMON}:$ACC_TLS_PORT\"
+tls_ca = \"$ACC_STATE/tls/$ca\"
+$material
+server_name = \"localhost\"
+$extra
+
+[local]
+allow = $allow
+entry = \"$entry\"
+paths = ${ACC_TLS_LOCAL_PATHS:-[]}
+read_only_paths = []
+
+[sandbox]
+mount = \"$mount\"
+cache = \"$cache\"
+unshare_user = false
+" | docker exec -i "$ACC_CLIENT" /bin/bash -c "cat > $ACC_STATE/$name.toml"
+  printf '%s' "$ACC_STATE/$name.toml"
 }

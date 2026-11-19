@@ -20,6 +20,24 @@ const (
 	TWinch = 0x06 // client -> daemon: u16 rows, u16 cols
 	TSig   = 0x07 // client -> daemon: i32 signal
 
+	// TExecLocal is daemon -> client on an exec session connection: the
+	// daemon relays a stub's request for a command to run in the client's
+	// sandbox. Stdio/status reuse TStdin/TStdout/TStderr/TExit, and the
+	// session ends when both directions are drained.
+	TExecLocal = 0x08
+
+	// THello is client -> daemon and opens a reverse-exec channel. The daemon
+	// answers TReady with the path of the stub socket it published on its own
+	// host, then serves that channel until the client disconnects.
+	THello = 0x09
+
+	// Reverse-exec frames multiplex every stub the daemon serves over one
+	// session connection, so each carries a u32 request id before its payload.
+	// TExecLocal is daemon -> client and asks for one command; the rest carry
+	// stdio and status for that id in either direction.
+	TLocalData   = 0x0A
+	TLocalCancel = 0x0B
+
 	TStdin  = 0x10
 	TStdout = 0x11
 	TStderr = 0x12
@@ -370,7 +388,11 @@ type FxReq struct {
 	Flags  uint32 // FxOpen Linux O_* flags
 	Mode   uint32 // FxOpen/FxFchmod permission bits
 	Owner  uint64 // lock owner identity, meaningful across clients
-	Lock   *LockInfo
+	// LkFlags carries the FUSE LkIn flags for lock ops. Bit 0 (FUSE_LK_FLOCK)
+	// marks a flock(2) whole-file lock rather than a POSIX byte-range lock;
+	// the two namespaces are independent on Linux and must not be mixed.
+	LkFlags uint32
+	Lock    *LockInfo
 }
 
 func (r *FxReq) Encode() []byte {
@@ -387,6 +409,7 @@ func (r *FxReq) Encode() []byte {
 	e.U32(r.Flags)
 	e.U32(r.Mode)
 	e.U64(r.Owner)
+	e.U32(r.LkFlags)
 	if r.Lock != nil {
 		e.U8(1)
 		e.U32(r.Lock.Typ)
@@ -411,6 +434,7 @@ func DecodeFxReq(p []byte) (*FxReq, error) {
 	r.Flags = d.U32()
 	r.Mode = d.U32()
 	r.Owner = d.U64()
+	r.LkFlags = d.U32()
 	if d.U8() != 0 {
 		r.Lock = &LockInfo{Typ: d.U32(), Start: d.U64(), End: d.U64(), Pid: d.U32()}
 	}

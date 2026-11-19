@@ -21,6 +21,10 @@ DAEMON_INIT=${DAEMON_INIT:-rsbxd}
 ok(){ echo "OK $1"; }
 bad(){ echo "FAIL $1: $2"; }
 run(){ timeout 180 "$F" -config "$MNT/lab.toml" -- /bin/sh -c "$1" 2>&1; }
+# run_out keeps the session's answer on stdout only. The client writes
+# startup diagnostics to stderr before the session starts, and a value this
+# script compares with an exact string must not include them.
+run_out(){ timeout 180 "$F" -config "$MNT/lab.toml" -- /bin/sh -c "$1"; }
 # All concurrent invocations deliberately share the same configuration file.
 mkcfg(){
   cat > "$MNT/lab.toml" <<CFG
@@ -44,11 +48,11 @@ mkcfg
 concurrent_commits(){
   local i pids=() pid rc=0
   for i in $(seq 1 $N); do
-    ( run "rm -rf /proj/c$i; mkdir -p /proj/c$i; cd /proj/c$i && \
+    ( run_out "rm -rf /proj/c$i; mkdir -p /proj/c$i; cd /proj/c$i && \
         git init -q . && printf 'work-$i\n' > f.txt && \
         git add f.txt && \
         git -c user.email=a@b -c user.name=n commit -qm c$i && \
-        git rev-list --count HEAD" > "$MNT/commit.$i" 2>&1 ) &
+        git rev-list --count HEAD" > "$MNT/commit.$i" 2>"$MNT/commit.$i.err" ) &
     pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
@@ -61,14 +65,14 @@ concurrent_commits(){
       local got; got=$(cat "$MNT/commit.$i" 2>/dev/null)
       case "$got" in
         1) ;;
-        *) echo "c$i: [${got:0:160}]"; return 1 ;;
+        *) echo "c$i: [${got:0:160}] stderr=[$(head -c 160 "$MNT/commit.$i.err" 2>/dev/null)]"; return 1 ;;
       esac
     done
     echo "a session failed with no output"
     return 1
   }
   for i in $(seq 1 $N); do
-    local n; n=$(run "cd /proj/c$i && git rev-list --count HEAD")
+    local n; n=$(run_out "cd /proj/c$i && git rev-list --count HEAD")
     [ "$n" = 1 ] || { echo "c$i count=$n"; return 1; }
   done
 }

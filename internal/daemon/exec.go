@@ -40,6 +40,8 @@ func (s *Server) ServeConn(c net.Conn) {
 	switch f.Type {
 	case proto.TExec:
 		s.serveExec(c, f.Payload)
+	case proto.THello:
+		s.ReverseHandshake(c, f.Payload)
 	case proto.TFxReq:
 		s.serveFS(c, f)
 	default:

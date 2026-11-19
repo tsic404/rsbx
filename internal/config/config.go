@@ -23,13 +23,23 @@ type Config struct {
 
 type Daemon struct {
 	// Transport is "unix" (socket) or "ssh" (spawn Command).
-	Transport string `json:"transport"`
-	Socket    string `json:"socket"`
-	Command   string `json:"command"`
+	Transport     string `json:"transport"`
+	Socket        string `json:"socket"`
+	Command       string `json:"command"`
+	Address       string `json:"address"`
+	TLSCA         string `json:"tls_ca"`
+	TLSCert       string `json:"tls_cert"`
+	TLSKey        string `json:"tls_key"`
+	ServerName    string `json:"server_name"`
+	Reverse       bool   `json:"reverse"`
+	TLSSkipVerify bool   `json:"tls_skip_verify"`
 }
 
 // EffectiveEndpoint names the daemon for error messages.
 func (d Daemon) EffectiveEndpoint() string {
+	if d.Transport == "tls" {
+		return d.Address
+	}
 	if d.Transport == "ssh" {
 		return d.Command
 	}
@@ -162,6 +172,9 @@ func expandHome(cfg *Config) {
 		return s
 	}
 	cfg.Daemon.Socket = fix(cfg.Daemon.Socket)
+	cfg.Daemon.TLSCA = fix(cfg.Daemon.TLSCA)
+	cfg.Daemon.TLSCert = fix(cfg.Daemon.TLSCert)
+	cfg.Daemon.TLSKey = fix(cfg.Daemon.TLSKey)
 	cfg.Sandbox.Mount = fix(cfg.Sandbox.Mount)
 	cfg.Sandbox.Cache = fix(cfg.Sandbox.Cache)
 	for i := range cfg.Local.Paths {
@@ -198,6 +211,24 @@ func assign(cfg *Config, table, key, raw string) error {
 			return str(&cfg.Daemon.Socket)
 		case "command":
 			return str(&cfg.Daemon.Command)
+		case "address":
+			return str(&cfg.Daemon.Address)
+		case "tls_ca":
+			return str(&cfg.Daemon.TLSCA)
+		case "tls_cert":
+			return str(&cfg.Daemon.TLSCert)
+		case "tls_key":
+			return str(&cfg.Daemon.TLSKey)
+		case "server_name":
+			return str(&cfg.Daemon.ServerName)
+		case "reverse":
+			value, err := parseBool(raw)
+			cfg.Daemon.Reverse = value
+			return err
+		case "tls_skip_verify":
+			value, err := parseBool(raw)
+			cfg.Daemon.TLSSkipVerify = value
+			return err
 		}
 	case "local":
 		switch key {

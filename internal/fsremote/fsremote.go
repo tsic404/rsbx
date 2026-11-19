@@ -820,6 +820,9 @@ func (s *Server) fxSetlk(req *proto.FxReq, wait bool) *proto.FxResp {
 	if req.Lock == nil {
 		return errResp(req.ID, syscall.EINVAL)
 	}
+	if req.LkFlags&1 != 0 { // FUSE_LK_FLOCK: flock(2), not POSIX fcntl
+		return s.fxFlock(req, f, wait)
+	}
 	lk, err := kernelLock(req.Lock)
 	if err != nil {
 		return errResp(req.ID, err)
@@ -873,6 +876,52 @@ func (s *Server) fxSetlk(req *proto.FxReq, wait bool) *proto.FxResp {
 			return errResp(req.ID, syscall.EINTR)
 		case <-e.done:
 			return errResp(req.ID, syscall.EBADF)
+		case <-tick.C:
+		}
+	}
+}
+
+// fxFlock applies a whole-file flock(2) request on the daemon's own open
+// descriptor. flock and POSIX byte-range locks are independent namespaces on
+// Linux; routing a FUSE flock request through OFD fcntl would silently place
+// it in the wrong one. The FUSE lock type maps to LOCK_SH/LOCK_EX/LOCK_UN;
+// LOCK_MAND has no meaning over FUSE and is refused.
+func (s *Server) fxFlock(req *proto.FxReq, f *openFile, wait bool) *proto.FxResp {
+	var op int
+	switch req.Lock.Typ {
+	case 0:
+		op = syscall.LOCK_SH
+	case 1:
+		op = syscall.LOCK_EX
+	case 2:
+		op = syscall.LOCK_UN
+	default:
+		return errResp(req.ID, syscall.EINVAL)
+	}
+	fd := int(f.f.Fd())
+	if !wait {
+		if err := syscall.Flock(fd, op|syscall.LOCK_NB); err != nil {
+			return errResp(req.ID, err)
+		}
+		return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
+	}
+	cancel := s.registerWaiter(req.Handle)
+	defer s.unregisterWaiter(req.Handle, cancel)
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		err := syscall.Flock(fd, op|syscall.LOCK_NB)
+		if err == nil {
+			return &proto.FxResp{ID: req.ID, Kind: proto.KOk}
+		}
+		if !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			return errResp(req.ID, err)
+		}
+		select {
+		case <-s.closedCh:
+			return errResp(req.ID, syscall.EINTR)
+		case <-cancel:
+			return errResp(req.ID, syscall.EINTR)
 		case <-tick.C:
 		}
 	}

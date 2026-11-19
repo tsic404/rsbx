@@ -5,6 +5,7 @@ package rpc
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +24,9 @@ type Target struct {
 	// Socket is a unix socket path, used when Command is empty.
 	Socket string
 	// Command, when set, starts a stdio daemon (e.g. an ssh invocation).
-	Command []string
+	Command   []string
+	Address   string
+	TLSConfig *tls.Config
 }
 
 // DialContext connects to the daemon. For a command transport, ctx owns the
@@ -31,6 +34,13 @@ type Target struct {
 func (t Target) DialContext(ctx context.Context) (net.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if t.Address != "" {
+		if t.TLSConfig == nil {
+			return nil, fmt.Errorf("network transport requires authenticated TLS")
+		}
+		dialer := tls.Dialer{Config: t.TLSConfig, NetDialer: &net.Dialer{Timeout: 15 * time.Second}}
+		return dialer.DialContext(ctx, "tcp", t.Address)
 	}
 	if len(t.Command) == 0 {
 		var d net.Dialer
@@ -141,15 +151,28 @@ type FS struct {
 	closed    bool
 	wmu       sync.Mutex
 	next      uint32
-	pending   map[uint32]chan *proto.FxResp
+	pending   map[uint32]chan fxResult
 	closeOnce sync.Once
 	closeErr  error
 }
 
+// fxResult is one request's outcome. The error travels with the reply so a
+// request failed by a dying connection reports that connection's cause instead
+// of a bare disconnect that hides a rejected handshake.
+type fxResult struct {
+	resp *proto.FxResp
+	err  error
+}
+
+// connectionCauseWait bounds how long a failed write waits for the reader's
+// verdict. It only elapses when the peer sent nothing readable, so it costs a
+// failing request a fifth of a second at worst and never delays a live one.
+const connectionCauseWait = 200 * time.Millisecond
+
 // NewFS returns a session client that connects lazily until Close is called.
 func NewFS(t Target) *FS {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &FS{dial: t.DialContext, ctx: ctx, cancel: cancel, pending: make(map[uint32]chan *proto.FxResp)}
+	return &FS{dial: t.DialContext, ctx: ctx, cancel: cancel, pending: make(map[uint32]chan fxResult)}
 }
 
 // Do performs one filesystem request.
@@ -167,22 +190,36 @@ func (c *FS) Do(req *proto.FxReq) (*proto.FxResp, error) {
 	werr := proto.WriteFrame(conn, proto.TFxReq, req.Encode())
 	c.wmu.Unlock()
 	if werr != nil {
-		c.dropConn(conn, gen)
+		// A refused peer says why in its last readable bytes, so give the
+		// reader a moment to deliver that verdict for this request before the
+		// connection is torn down. Otherwise the caller sees only the write
+		// symptom (a reset or a broken pipe), which names no cause.
+		if res, ok := c.readerVerdict(ch); ok {
+			if c.ctx.Err() != nil {
+				return nil, net.ErrClosed
+			}
+			return nil, res
+		}
+		c.dropConn(conn, gen, werr)
 		if c.ctx.Err() != nil {
 			return nil, net.ErrClosed
 		}
-		return nil, werr
+		return nil, fmt.Errorf("rsbx: filesystem connection lost: %w", werr)
 	}
 	select {
 	case <-c.ctx.Done():
 		return nil, net.ErrClosed
-	case resp, ok := <-ch:
+	case res, ok := <-ch:
 		if !ok {
 			if c.ctx.Err() != nil {
 				return nil, net.ErrClosed
 			}
 			return nil, errors.New("rsbx: filesystem connection lost")
 		}
+		if res.err != nil {
+			return nil, res.err
+		}
+		resp := res.resp
 		if resp.Kind == proto.KErr || resp.Errno != 0 {
 			errno := syscall.Errno(resp.Errno)
 			if errno == 0 {
@@ -209,7 +246,7 @@ func errnoOf(s string) syscall.Errno {
 	return syscall.EIO
 }
 
-func (c *FS) register() (chan *proto.FxResp, uint32, net.Conn, uint64, error) {
+func (c *FS) register() (chan fxResult, uint32, net.Conn, uint64, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -254,10 +291,10 @@ func (c *FS) register() (chan *proto.FxResp, uint32, net.Conn, uint64, error) {
 }
 
 // registerLocked records the waiter atomically with selecting its connection.
-func (c *FS) registerLocked() (chan *proto.FxResp, uint32, net.Conn, uint64) {
+func (c *FS) registerLocked() (chan fxResult, uint32, net.Conn, uint64) {
 	c.next++
 	id := c.next
-	ch := make(chan *proto.FxResp, 1)
+	ch := make(chan fxResult, 1)
 	c.pending[id] = ch
 	return ch, id, c.conn, c.gen
 }
@@ -269,7 +306,7 @@ func (c *FS) readLoop(conn net.Conn, gen uint64) {
 			// Only the reader of the current generation may reset the
 			// connection; a stale reader from a replaced connection must not
 			// fail requests that belong to the newer one.
-			c.dropConn(conn, gen)
+			c.dropConn(conn, gen, err)
 			return
 		}
 		if f.Type != proto.TFxResp {
@@ -288,15 +325,31 @@ func (c *FS) readLoop(conn net.Conn, gen uint64) {
 		delete(c.pending, resp.ID)
 		c.mu.Unlock()
 		if ch != nil {
-			ch <- resp
+			ch <- fxResult{resp: resp}
 		}
+	}
+}
+
+// readerVerdict waits briefly for this request's failure verdict. A refused
+// peer reports why in its last readable bytes, and that reason is the one the
+// caller needs; the write symptom is only a fallback.
+func (c *FS) readerVerdict(ch chan fxResult) (error, bool) {
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return res.err, true
+		}
+		return nil, false
+	case <-time.After(connectionCauseWait):
+		return nil, false
 	}
 }
 
 // dropConn fails requests from this connection only. A stale reader or writer
 // must not tear down a replacement connection. A later Do may reconnect, but
-// the failed request itself is never retried.
-func (c *FS) dropConn(conn net.Conn, gen uint64) {
+// the failed request itself is never retried. Each failed request carries the
+// connection's cause, so a rejected handshake surfaces as itself.
+func (c *FS) dropConn(conn net.Conn, gen uint64, cause error) {
 	c.mu.Lock()
 	if c.conn != conn || c.gen != gen {
 		c.mu.Unlock()
@@ -306,7 +359,7 @@ func (c *FS) dropConn(conn net.Conn, gen uint64) {
 	c.gen++
 	for id, ch := range c.pending {
 		delete(c.pending, id)
-		close(ch)
+		ch <- fxResult{err: fmt.Errorf("rsbx: filesystem connection lost: %w", cause)}
 	}
 	c.mu.Unlock()
 	conn.Close()
@@ -385,6 +438,32 @@ func (c *FS) ReadFile(p string) ([]byte, proto.Attr, error) {
 		}
 	}
 	return buf, attr, nil
+}
+
+// Stat reports whether the daemon has an entry at p. It opens the path
+// read-only, which fails with os.ErrNotExist when the daemon does not have it.
+func (c *FS) Stat(p string) (proto.Attr, error) {
+	resp, err := c.Do(&proto.FxReq{
+		Op:    proto.FxOpen,
+		Path:  p,
+		Flags: uint32(syscall.O_RDONLY),
+	})
+	if err != nil {
+		return proto.Attr{}, err
+	}
+	if resp.Kind == proto.KNone {
+		return proto.Attr{}, os.ErrNotExist
+	}
+	if resp.Kind != proto.KHandle || resp.Handle == 0 {
+		return proto.Attr{}, syscall.EIO
+	}
+	h := resp.Handle
+	defer c.Do(&proto.FxReq{Op: proto.FxClose, Handle: h})
+	st, err := c.Do(&proto.FxReq{Op: proto.FxFstat, Handle: h})
+	if err != nil {
+		return proto.Attr{}, err
+	}
+	return st.Attr, nil
 }
 
 // WriteFile replaces a remote file body via handle open/write/close.
