@@ -275,6 +275,15 @@ The configured names are startup executable identities, not directory prefixes.
 Their runtime dependencies are resolved and verified with them. `multica` can
 drive remote `git` without naming git in the configuration.
 
+**Tool commands must become real processes.** Some agent runtimes answer
+common commands (`uname`, `cat`, `id`) inside their own process. No `execve`
+happens, so execution supervision has nothing to route and the answer comes
+from this machine. The session adds the runtime's documented switch that
+disables that emulation (`PI_DISABLE_UUTILS_BUILTINS=1`) unless the caller
+already set it; an agent that still answers a command in-process is outside
+what exec supervision can place. The agent's own process and its configuration
+stay local either way.
+
 ### Task workspaces
 
 The task workspace belongs to the daemon's tree, not to the caller's machine.

@@ -826,7 +826,7 @@ func (p *Plan) launchSpec(argv []string, b *broker) (*launchSpec, error) {
 		HelperDir:   filepath.Dir(p.Trampoline),
 		Target:      target,
 		Argv:        append([]string(nil), argv...),
-		Env:         os.Environ(),
+		Env:         sessionEnvironment(os.Environ()),
 		Cwd:         cwd,
 		ExecPaths:   p.SandboxExecPaths(),
 		UnshareUser: p.Cfg.Sandbox.UnshareUser,

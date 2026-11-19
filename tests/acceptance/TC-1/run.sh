@@ -9,6 +9,8 @@
 #      names: the daemon still runs it;
 #   d. a name added to an allowlisted directory after startup is served by the
 #      daemon, while a name that was there at startup stayed here.
+#   e. a local agent program whose tool answers commands in-process still
+#      starts an unlisted child for that command, so the child lands remotely.
 #
 # Placement is read from /proc/1/comm of the machine the process really ran
 # on: the client container's init for a local program, the daemon's init for
@@ -131,6 +133,48 @@ check_custom_argv0(){
     || { echo "    a custom argv[0] moved the target onto this machine"; return 1; }
 }
 
+# --- e. a tool command is a real exec -------------------------------------
+# Some agent runtimes answer common commands inside their own process. No
+# exec happens, so execution supervision has nothing to route and the answer
+# comes from this machine. The stand-in reproduces that shape: it emulates
+# unless the session supplies the runtime's emulation switch, then execs an
+# unlisted shell. Without the session setting the emulated branch answers and
+# this check fails; with it the child lands on the daemon.
+check_tool_command_remote(){
+  local cfg out
+  acc_put "$ACC_LOCAL_DIR/tc1-tool" "#!/bin/sh
+init=\"\"; IFS= read -r init < /proc/1/comm 2>/dev/null
+case \"\$1\" in
+  identity) echo \"AGENT init=\$init\" ;;
+  tool)
+    shift
+    if [ \"\${PI_DISABLE_UUTILS_BUILTINS:-}\" = 1 ]; then
+      exec /bin/sh -c \"\$1\"
+    fi
+    echo \"EMULATED init=\$init\"
+    ;;
+  *) exit 2 ;;
+esac
+" 755
+  cfg=$(acc_config tool '["'"$ACC_LOCAL_DIR"'/tc1-tool"]' '[]' "$ACC_LOCAL_DIR/tc1-tool")
+  acc_session "$cfg" "$ACC_LOCAL_DIR/tc1-tool" identity
+  out=$ACC_OUT
+  printf '%s\n' "$out" | grep -qx "AGENT init=$ACC_CLIENT_INIT" \
+    || { echo "    the agent program did not run here"; return 1; }
+  acc_session "$cfg" "$ACC_LOCAL_DIR/tc1-tool" tool \
+    'IFS= read -r p < /proc/1/comm 2>/dev/null; echo TOOL init=$p'
+  out=$ACC_OUT
+  printf '%s\n' "$out" | sed 's/^/    /'
+  printf '%s\n' "$out" | grep -qx "TOOL init=$ACC_DAEMON_INIT" \
+    || { echo "    the tool command did not become a remote exec"; return 1; }
+  acc_session "$cfg" /bin/sh -c \
+    'IFS= read -r p < /proc/1/comm 2>/dev/null; echo DIRECT init=$p'
+  out=$ACC_OUT
+  printf '%s\n' "$out" | sed 's/^/    /'
+  printf '%s\n' "$out" | grep -qx "DIRECT init=$ACC_DAEMON_INIT" \
+    || { echo "    the direct-exec control did not land remotely"; return 1; }
+}
+
 # --- d. a directory allowlist is a startup snapshot ------------------------
 # The session starts with tc1-pre present locally and tc1-newafter absent from
 # this machine. The name is created on the daemon while the session is live;
@@ -201,6 +245,7 @@ check four-spellings-local check_spellings
 check alternating-rounds-one-placement-each check_alternating_rounds
 check unlisted-child-remote check_unlisted_child
 check custom-argv0-remote check_custom_argv0
+check tool-command-remote check_tool_command_remote
 check directory-startup-snapshot check_directory_snapshot
 
 acc_finish
