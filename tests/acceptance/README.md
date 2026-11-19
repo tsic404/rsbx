@@ -139,6 +139,17 @@ Every check in the tree, with the code seam behind it:
 | 48 | TC-18 `untrusted-client-certificate-rejected` | A | `TC-18/run.sh` | the rejection happens inside the handshake, which one process cannot stage as two ends |
 | 49 | TC-18 `missing-client-certificate-rejected` | A | `TC-18/run.sh` | same, with the certificate omitted rather than distrusted |
 | 50 | TC-18 `untrusted-server-certificate-rejected` | A | `TC-18/run.sh` | the client's own verdict on the server certificate needs the real client |
+| 51 | TC-14 `cancel-scene-live-and-escaped` | A | `TC-14/run.sh` | the scene needs a live remote command and a local descendant in its own session, both placed by the init each one really sees |
+| 52 | TC-14 `cancel-terminates-remote-command` | A | `TC-14/run.sh` | the command runs on the daemon; only a real cancel across the channel can stop it, and its heartbeat is the evidence |
+| 53 | TC-14 `cancel-reaps-detached-local-descendant` | A | `TC-14/run.sh` | a descendant that left the entry's process group must still die; one process cannot stage a real `setsid` escape |
+| 54 | TC-14 `cancel-leaves-no-session-process` | A | `TC-14/run.sh` | "no process on either machine" is a count over two real `/proc` trees |
+| 55 | TC-14 `cancel-releases-session-resources` | A | `TC-14/run.sh` | the per-session mount and `session-*` directories live in two trees; only the real teardown removes them |
+| 56 | TC-14 `crash-scene-live-and-escaped` | A | `TC-14/run.sh` | same scene, with the caller killed by SIGKILL so no cleanup of its own can run |
+| 57 | TC-14 `crash-terminates-remote-command` | A | `TC-14/run.sh` | the daemon must notice a dead connection; a unit test drives one pipe, not a killed caller |
+| 58 | TC-14 `crash-reaps-detached-local-descendant` | A | `TC-14/run.sh` | the escaped descendant's reclamation is owned by the launcher's death signal, observable only with a real process |
+| 59 | TC-14 `crash-leaves-no-session-process` | A | `TC-14/run.sh` | same two-tree count after an abnormal end |
+| 60 | TC-14 `crash-releases-session-resources` | A | `TC-14/run.sh` | the mount and session directories must be gone after a crash, not only after a clean cancel |
+| 61 | TC-14 `crash-keeps-new-sessions-working` | A | `TC-14/run.sh` | a session started after the crash must still place a command on the daemon |
 
 TC-16's eight workspace checks are an external-rig gate run by the CI job; they
 are not part of this count.
@@ -161,6 +172,7 @@ criterion, the missing part was added first.
 | `TC-10a/run.sh` | TC-10a | AC-5a | a mid-read disconnect fails the read, kills the long command and fails later access; a replaced program still runs the startup snapshot |
 | `TC-11/run.sh` | TC-11 | AC-6 | without Landlock the session is refused and names the capability; the control starts where it is present |
 | `TC-13/run.sh` | TC-13 | AC-7 | eight pty/pipe assertions (input, signal, foreground, exit status, termios, stdin order, two end states) |
+| `TC-14/run.sh` | TC-14 | AC-8 | cancel and crash: the remote command terminates, the detached local descendant is reclaimed, no session process, mount or cache is left on either machine, and a new session still works |
 | `TC-15/run.sh` | TC-15 | AC-8 / AC-9 | entry only: drives the in-repo `testdata/probe/dual.sh` (8 checks) and `testdata/mixed/stress.sh` (4 checks) |
 | `TC-16/run.sh` | TC-16 | AC-10 | task-workspace gate; driven by the CI job with its own rig (`runner: external-rig`) |
 | `TC-17/run.sh` | TC-17 | AC-11 | ten checks on the reverse channel: placement, symlink spelling, exit status, four refusals with their reasons, and the session that survives them |
