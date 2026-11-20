@@ -150,6 +150,9 @@ Every check in the tree, with the code seam behind it:
 | 59 | TC-14 `crash-leaves-no-session-process` | A | `TC-14/run.sh` | same two-tree count after an abnormal end |
 | 60 | TC-14 `crash-releases-session-resources` | A | `TC-14/run.sh` | the mount and session directories must be gone after a crash, not only after a clean cancel |
 | 61 | TC-14 `crash-keeps-new-sessions-working` | A | `TC-14/run.sh` | a session started after the crash must still place a command on the daemon |
+| 62 | TC-2 `executable-bytes-match-daemon` | A | `TC-2/run.sh` | two real trees: this machine's copy and the daemon's, compared as bytes |
+| 63 | TC-2 `library-bytes-match-daemon` | A | `TC-2/run.sh` | the shared library has its own comparison; the executable's result never stands in for it |
+| 64 | TC-2 `execution-lands-on-daemon` | A | `TC-2/run.sh` | the program is not allowlisted; both sides' `/proc/1/comm` are measured and required to differ, and a declared name may only confirm the measurement |
 
 TC-16's eight workspace checks are an external-rig gate run by the CI job; they
 are not part of this count.
@@ -165,6 +168,7 @@ criterion, the missing part was added first.
 | entry | TC | design clause | checks |
 |---|---|---|---|
 | `TC-1/run.sh` | TC-1 | AC-1 | placement in a real two-machine rig (see the classification above) |
+| `TC-2/run.sh` | TC-2 | AC-2 | the daemon's executable and its shared library, read back through the view, are byte-for-byte the daemon's own, and the executable's run lands on the daemon |
 | `TC-6/run.sh` | TC-6 | AC-4 | read-only declared tree rejects writes and changes neither side, remote view cannot observe local content |
 | `TC-6a/run.sh` | TC-6a | AC-4a | writes to a snapshot program and its runtime dependency fail read-only, the program still runs its startup bytes |
 | `TC-7/run.sh` | TC-7 | AC-5 | unreachable daemon produces no session (the two unit-test cases are listed above) |
