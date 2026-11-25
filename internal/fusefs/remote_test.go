@@ -468,3 +468,34 @@ func TestRemoteDirFsyncThroughMount(t *testing.T) {
 	}
 	_ = root
 }
+
+// The daemon's own lock table is what answers a remote query, and its answer
+// spells "to the end of the file" with the protocol maximum. A conflicting
+// whole-file query has to reach the kernel as OFFSET_MAX, so this exercises the
+// remote reply path through a real mount, not just the daemon's handler.
+func TestRemoteConflictingWholeFileGetlkThroughMount(t *testing.T) {
+	mnt, root, _ := remoteMount(t)
+	host := filepath.Join(root, "held.lock")
+	if err := os.WriteFile(host, []byte("database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The holder lives outside this process: POSIX record locks never conflict
+	// with themselves, and a same-process lock would hide the reply bug.
+	startWholeFileLockHolder(t, host)
+
+	f, err := os.OpenFile(inView(mnt, host), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open through mount: %v", err)
+	}
+	defer f.Close()
+	query := syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+	if err := syscall.FcntlFlock(f.Fd(), syscall.F_GETLK, &query); err != nil {
+		t.Fatalf("conflicting whole-file F_GETLK through the remote mount: %v", err)
+	}
+	if query.Type != syscall.F_WRLCK {
+		t.Fatalf("conflicting lock type = %d, want F_WRLCK", query.Type)
+	}
+	if query.Start != 0 || query.Len != 0 {
+		t.Fatalf("conflicting lock = start %d len %d, want start 0 len 0", query.Start, query.Len)
+	}
+}

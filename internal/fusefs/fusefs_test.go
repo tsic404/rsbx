@@ -2,6 +2,7 @@ package fusefs
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -684,5 +685,76 @@ func TestAssetAliasCannotWidenTheCompiledSnapshot(t *testing.T) {
 	defer root.Close()
 	if root.Err() == nil {
 		t.Fatal("an uncompiled alias target silently widened host visibility")
+	}
+}
+
+// A whole-file lock is asked for as "to the end of the file", which the kernel
+// forwards as End == LLONG_MAX. The node must accept that range and must not
+// report its own descriptor as a conflict.
+func TestLockRangeCoversWholeFileOnTheWire(t *testing.T) {
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "session.lock")
+	if err := os.WriteFile(filename, []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, _ := sourceRoot(t, &Layout{Local: fixedLocal(dir)})
+	node, _ := lookupNode(t, root, filename)
+	h, _, errno := node.Open(context.Background(), uint32(os.O_RDWR))
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	defer h.(*handle).Release(context.Background())
+
+	// The kernel spells "to the end of the file" as End == LLONG_MAX on the
+	// wire, not as the FUSE maximum, so the range that has to work is this one.
+	whole := func(typ uint32) fuse.FileLock {
+		return fuse.FileLock{Typ: typ, Start: 0, End: math.MaxInt64}
+	}
+	for _, typ := range []uint32{syscall.F_WRLCK, syscall.F_UNLCK} {
+		lk := whole(typ)
+		if errno := node.Setlk(context.Background(), h, 11, &lk, 0); errno != 0 {
+			t.Fatalf("whole-file Setlk(type=%d) = %v, want success", typ, errno)
+		}
+	}
+	// POSIX locks are per-process, so the holder this descriptor sees is
+	// itself: the answer must be F_UNLCK rather than a self-conflict.
+	question := whole(syscall.F_WRLCK)
+	var found fuse.FileLock
+	if errno := node.Getlk(context.Background(), h, 11, &question, 0, &found); errno != 0 {
+		t.Fatalf("whole-file Getlk = %v, want success", errno)
+	}
+	if found.Typ != syscall.F_UNLCK {
+		t.Fatalf("own descriptor reported a conflicting holder: %+v", found)
+	}
+}
+
+// A rejected lock must name the kernel's real reason. A negative length makes
+// fcntl answer EINVAL, and reporting that as EIO hides a malformed request
+// behind "input/output error".
+func TestLockRangeRejectsInvalidRangeAsEINVAL(t *testing.T) {
+	if _, errno := lockRange(&fuse.FileLock{Typ: syscall.F_WRLCK, Start: 10, End: 5}); errno != syscall.EINVAL {
+		t.Fatalf("end before start = %v, want EINVAL", errno)
+	}
+	beyond := &fuse.FileLock{Typ: syscall.F_WRLCK, Start: math.MaxUint64, End: math.MaxUint64}
+	if _, errno := lockRange(beyond); errno != syscall.EINVAL {
+		t.Fatalf("start beyond int64 = %v, want EINVAL", errno)
+	}
+	whole, errno := lockRange(&fuse.FileLock{Typ: syscall.F_WRLCK, Start: 0, End: ^uint64(0)})
+	if errno != 0 || whole.Len != 0 {
+		t.Fatalf("whole-file range = len %d errno %v, want len 0", whole.Len, errno)
+	}
+	atMax, errno := lockRange(&fuse.FileLock{Typ: syscall.F_WRLCK, Start: 0, End: math.MaxInt64})
+	if errno != 0 || atMax.Len != 0 {
+		t.Fatalf("End=LLONG_MAX range = len %d errno %v, want len 0", atMax.Len, errno)
+	}
+	partial, errno := lockRange(&fuse.FileLock{Typ: syscall.F_WRLCK, Start: 0, End: 99})
+	if errno != 0 || partial.Len != 100 {
+		t.Fatalf("partial range = len %d errno %v, want 100", partial.Len, errno)
+	}
+	if got := lockRangeEnd(&syscall.Flock_t{Start: 0, Len: 0}); got != ^uint64(0) {
+		t.Fatalf("reverse of a whole-file lock = %d, want the end-of-file maximum", got)
+	}
+	if got := lockRangeEnd(&syscall.Flock_t{Start: 0, Len: 100}); got != 99 {
+		t.Fatalf("reverse of [0,100) = %d, want 99", got)
 	}
 }
