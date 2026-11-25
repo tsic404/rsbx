@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -29,7 +28,9 @@ import (
 	"syscall"
 	"time"
 
+	"rsbx/internal/lockrange"
 	"rsbx/internal/proto"
+	"rsbx/internal/syserrno"
 )
 
 // openFile is one open descriptor. append records O_APPEND at open time so a
@@ -181,21 +182,9 @@ func attrOf(st *syscall.Stat_t) proto.Attr {
 // errResp builds a failure reply carrying the numeric errno. Err keeps a
 // detail string for logs; the errno is the value callers branch on. A wrapped
 // syscall.Errno is unwrapped, so *os.PathError and fmt-wrapped errors still
-// report the value the kernel chose.
+// report the value the kernel chose instead of a generic EIO.
 func errResp(id uint32, err error) *proto.FxResp {
-	errno := uint32(syscall.EIO)
-	var en syscall.Errno
-	switch {
-	case errors.As(err, &en):
-		errno = uint32(en)
-	case errors.Is(err, os.ErrNotExist):
-		errno = uint32(syscall.ENOENT)
-	case errors.Is(err, os.ErrPermission):
-		errno = uint32(syscall.EACCES)
-	case errors.Is(err, os.ErrExist):
-		errno = uint32(syscall.EEXIST)
-	}
-	resp := &proto.FxResp{ID: id, Kind: proto.KErr, Errno: errno}
+	resp := &proto.FxResp{ID: id, Kind: proto.KErr, Errno: uint32(syserrno.Of(err))}
 	if err != nil {
 		resp.Err = err.Error()
 	}
@@ -720,19 +709,11 @@ func kernelLock(info *proto.LockInfo) (*syscall.Flock_t, error) {
 	default:
 		return nil, syscall.EINVAL
 	}
-	if info.Start > math.MaxInt64 {
-		return nil, syscall.EINVAL
+	lk, err := lockrange.ToFlock(typ, info.Start, info.End)
+	if err != nil {
+		return nil, err
 	}
-	lk := &syscall.Flock_t{Type: typ, Whence: 0, Start: int64(info.Start)}
-	switch {
-	case info.End == ^uint64(0) || info.End >= math.MaxInt64:
-		lk.Len = 0 // infinite
-	case info.End < info.Start:
-		return nil, syscall.EINVAL
-	default:
-		lk.Len = int64(info.End-info.Start) + 1
-	}
-	return lk, nil
+	return &lk, nil
 }
 
 // fuseLockType maps the kernel's lock type back into FUSE's numbering.
@@ -749,12 +730,7 @@ func fuseLockType(t int16) uint32 {
 
 // lockEnd turns start and length back into FUSE's inclusive end. A zero
 // length is "to the end of the file", spelled as the maximum value.
-func lockEnd(start int64, length int64) uint64 {
-	if length <= 0 {
-		return ^uint64(0)
-	}
-	return uint64(start) + uint64(length) - 1
-}
+func lockEnd(start int64, length int64) uint64 { return lockrange.End(start, length) }
 
 // fxGetlk asks the kernel which lock conflicts with the caller's question,
 // through the owner's own description so the owner's locks are not reported

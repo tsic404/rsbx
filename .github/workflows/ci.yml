@@ -137,7 +137,7 @@ jobs:
         run: |
           docker build --target test -t rsbx-test-env .
           docker run --rm --privileged --user 0 -v /dev/fuse:/dev/fuse \
-            rsbx-test-env test ./internal/fusefs
+            rsbx-test-env test -v -count=1 ./internal/fusefs
 
       # Every end-to-end job below has the same shape: the daemon runs in its
       # own disposable container with a throwaway project volume mounted at

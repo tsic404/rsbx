@@ -1,8 +1,12 @@
 package fusefs
 
 import (
+	"bufio"
+	"fmt"
 	"io"
+	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -45,6 +49,13 @@ func (e *emptyRemote) WriteFile(string, []byte) error {
 // coincide in production. A file at sandbox path /a/b/c is reachable as
 // mountpoint/a/b/c.
 func mounted(t *testing.T) (mnt, tree string) {
+	return mountedWith(t, fuse.MountOptions{FsName: "rsbx-test", DisableSplice: true})
+}
+
+// mountedWith serves one local tree through a real FUSE mount with the given
+// mount options. Lock negotiation has to be asked for explicitly, so a mount
+// that judges locks cannot share the default helper.
+func mountedWith(t *testing.T, mountOptions fuse.MountOptions) (mnt, tree string) {
 	t.Helper()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skip("no /dev/fuse")
@@ -80,7 +91,7 @@ func mounted(t *testing.T) (mnt, tree string) {
 	one := time.Second
 	srv, err := fs.Mount(mnt, rootNode, &fs.Options{
 		NullPermissions: true,
-		MountOptions:    fuse.MountOptions{FsName: "rsbx-test", DisableSplice: true},
+		MountOptions:    mountOptions,
 		EntryTimeout:    &one,
 		AttrTimeout:     &one,
 	})
@@ -591,4 +602,171 @@ func TestHandleStatMatchesItsContent(t *testing.T) {
 			fi.Size(), len("gen1-abcdefgh"))
 	}
 	f.Close()
+}
+
+// A local tree is locked through the host descriptor, so the kernel asks this
+// filesystem for every POSIX range — including the whole-file form a program
+// spells as "to the end" (`l_len` 0, which the kernel sends as
+// `End == LLONG_MAX`). Turning that into a length must not overflow: a
+// negative length makes fcntl answer EINVAL and a session that only wanted a
+// session lock cannot start.
+func TestWholeFileRecordLockThroughMount(t *testing.T) {
+	mnt, tree := mountedWith(t, fuse.MountOptions{
+		FsName: "rsbx-lock-test", DisableSplice: true,
+		// The production mount negotiates lock forwarding; without it the
+		// kernel keeps its own lock table and none of this reaches the node.
+		EnableLocks: true,
+	})
+	p := inView(mnt, filepath.Join(tree, "session.lock"))
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte("state")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	whole := func(typ int16) syscall.Flock_t {
+		return syscall.Flock_t{Type: typ, Whence: 0, Start: 0, Len: 0}
+	}
+	// A program that means "the whole file" may also say it the long way:
+	// length LLONG_MAX, which the kernel forwards as start 0, end 2^63-1.
+	longWay := func(typ int16) syscall.Flock_t {
+		return syscall.Flock_t{Type: typ, Whence: 0, Start: 0, Len: math.MaxInt64}
+	}
+	stages := []struct {
+		name string
+		cmd  int
+		lk   syscall.Flock_t
+	}{
+		{"whole-file SETLK", syscall.F_SETLK, whole(syscall.F_WRLCK)},
+		{"whole-file GETLK", syscall.F_GETLK, whole(syscall.F_WRLCK)},
+		{"whole-file SETLKW", syscall.F_SETLKW, whole(syscall.F_WRLCK)},
+		{"whole-file SETLK release", syscall.F_SETLK, whole(syscall.F_UNLCK)},
+		{"LLONG_MAX-length SETLK", syscall.F_SETLK, longWay(syscall.F_WRLCK)},
+		{"LLONG_MAX-length release", syscall.F_SETLK, longWay(syscall.F_UNLCK)},
+		{"partial-range SETLK", syscall.F_SETLK,
+			syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 0, Start: 0, Len: 100}},
+		{"partial-range GETLK", syscall.F_GETLK,
+			syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 0, Start: 0, Len: 100}},
+		{"partial-range release", syscall.F_SETLK,
+			syscall.Flock_t{Type: syscall.F_UNLCK, Whence: 0, Start: 0, Len: 100}},
+	}
+	for _, stage := range stages {
+		lk := stage.lk
+		if err := syscall.FcntlFlock(f.Fd(), stage.cmd, &lk); err != nil {
+			t.Fatalf("%s through a local-tree mount: %v", stage.name, err)
+		}
+	}
+
+	// flock(2) is a separate namespace and already worked; it must stay
+	// working so a fix for the record-lock path cannot regress it.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock(LOCK_EX) through a local-tree mount: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("flock(LOCK_UN) through a local-tree mount: %v", err)
+	}
+}
+
+// lockHolderPathEnv names the file the helper process locks. The helper is this
+// test binary re-executed with the variable set: POSIX record locks never
+// conflict with their own process, so a real conflicting query needs a second
+// process holding the lock.
+const lockHolderPathEnv = "RSBX_TEST_LOCK_HOLDER_PATH"
+
+// TestLockHolderProcess is the helper, not a test. It takes a whole-file write
+// lock on the named path and holds it until its stdin closes.
+func TestLockHolderProcess(t *testing.T) {
+	path := os.Getenv(lockHolderPathEnv)
+	if path == "" {
+		t.Skip("helper process for the conflicting-lock regression")
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		fmt.Printf("holder open: %v\n", err)
+		os.Exit(1)
+	}
+	lk := syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+	if err := syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &lk); err != nil {
+		fmt.Printf("holder lock: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("LOCKED")
+	io.Copy(io.Discard, os.Stdin)
+	f.Close()
+}
+
+// startWholeFileLockHolder runs the helper on path and waits until it reports
+// the lock is held, so the caller never queries before the conflict exists.
+func startWholeFileLockHolder(t *testing.T, path string) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test binary: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestLockHolderProcess$")
+	cmd.Env = append(os.Environ(), lockHolderPathEnv+"="+path)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("holder stdin: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("holder stdout: %v", err)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start holder: %v", err)
+	}
+	t.Cleanup(func() {
+		stdin.Close()
+		if err := cmd.Wait(); err != nil {
+			t.Logf("lock holder exited: %v (%s)", err, stderr.String())
+		}
+	})
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if strings.TrimSpace(line) != "LOCKED" {
+		t.Fatalf("lock holder never locked: %q err=%v stderr=%s", line, err, stderr.String())
+	}
+}
+
+// A program that asks which lock conflicts must get an answer, not EIO. The
+// kernel checks the end of a conflicting range against OFFSET_MAX and rejects
+// anything beyond it, so the reply's end-of-file spelling has to be the kernel's
+// own maximum. An unlocked answer bypasses that check, which is why only a real
+// second holder exercises this path.
+func TestConflictingWholeFileRecordLockThroughMount(t *testing.T) {
+	mnt, tree := mountedWith(t, fuse.MountOptions{
+		FsName: "rsbx-lock-conflict", DisableSplice: true,
+		EnableLocks: true,
+	})
+	host := filepath.Join(tree, "held.lock")
+	if err := os.WriteFile(host, []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startWholeFileLockHolder(t, host)
+
+	p := inView(mnt, host)
+	f, err := os.OpenFile(p, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open through mount: %v", err)
+	}
+	defer f.Close()
+
+	query := syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 0, Start: 0, Len: 0}
+	if err := syscall.FcntlFlock(f.Fd(), syscall.F_GETLK, &query); err != nil {
+		t.Fatalf("conflicting whole-file F_GETLK through the mount: %v", err)
+	}
+	if query.Type != syscall.F_WRLCK {
+		t.Fatalf("conflicting lock type = %d, want F_WRLCK (%d)", query.Type, syscall.F_WRLCK)
+	}
+	if query.Start != 0 {
+		t.Fatalf("conflicting lock start = %d, want 0", query.Start)
+	}
+	if query.Len != 0 {
+		t.Fatalf("conflicting lock length = %d, want 0 (to the end of the file)", query.Len)
+	}
 }

@@ -23,7 +23,9 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sys/unix"
 
+	"rsbx/internal/lockrange"
 	"rsbx/internal/proto"
+	"rsbx/internal/syserrno"
 )
 
 // LocalPaths is the path policy the filesystem consults. It is an interface so
@@ -548,7 +550,7 @@ func (h *handle) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
 			case errors.Is(err, syscall.EINVAL), errors.Is(err, syscall.ENOTSUP):
 				return 0
 			}
-			return errnoOf(err.Error())
+			return errnoFromErr(err)
 		}
 		return 0
 	}
@@ -599,7 +601,7 @@ func (h *handle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 			case errors.Is(err, syscall.EINVAL), errors.Is(err, syscall.ENOTSUP):
 				return 0
 			}
-			return errnoOf(err.Error())
+			return errnoFromErr(err)
 		}
 		return 0
 	}
@@ -750,7 +752,7 @@ func (n *Node) Write(ctx context.Context, f fs.FileHandle, data []byte, off int6
 			cnt, err = h.fd.WriteAt(data, off)
 		}
 		if err != nil {
-			return 0, errnoOf(err.Error())
+			return 0, errnoFromErr(err)
 		}
 		return uint32(cnt), 0
 	}
@@ -819,24 +821,54 @@ func (n *Node) Getlk(ctx context.Context, f fs.FileHandle, owner uint64, lk *fus
 			return syscall.Errno(resp.Errno)
 		}
 		if resp.Lock != nil {
-			out.Typ, out.Start, out.End, out.Pid = resp.Lock.Typ, resp.Lock.Start, resp.Lock.End, resp.Lock.Pid
+			setReplyLock(out, resp.Lock.Typ, resp.Lock.Start, resp.Lock.End, resp.Lock.Pid)
 		} else {
 			out.Typ = syscall.F_UNLCK
 		}
 		return 0
 	}
 	if h != nil && h.fd != nil {
-		fl := syscall.Flock_t{Type: int16(lk.Typ), Start: int64(lk.Start), Len: int64(lk.End - lk.Start + 1)}
+		fl, errno := lockRange(lk)
+		if errno != 0 {
+			return errno
+		}
 		if err := syscall.FcntlFlock(h.fd.Fd(), syscall.F_GETLK, &fl); err != nil {
-			return errnoOf(err.Error())
+			return errnoFromErr(err)
 		}
-		out.Typ, out.Start, out.End = uint32(fl.Type), uint64(fl.Start), uint64(fl.Start+fl.Len-1)
-		if fl.Type == syscall.F_UNLCK {
-			out.Typ = syscall.F_UNLCK
-		}
+		setReplyLock(out, uint32(fl.Type), uint64(fl.Start), lockRangeEnd(&fl), uint32(fl.Pid))
 		return 0
 	}
 	return syscall.EBADF
+}
+
+// lockRange converts one FUSE lock range into the kernel's Flock_t. The range
+// is inclusive on the wire and the kernel wants a length, so the shared
+// converter owns the arithmetic: a whole-file range would otherwise overflow
+// into a negative length and fcntl would answer EINVAL.
+func lockRange(lk *fuse.FileLock) (syscall.Flock_t, syscall.Errno) {
+	// FUSE's lock types are the kernel's on Linux: 0/1/2 for read, write and
+	// unlock, which is what Flock_t.Type expects.
+	fl, err := lockrange.ToFlock(int16(lk.Typ), lk.Start, lk.End)
+	if err != nil {
+		return syscall.Flock_t{}, syscall.EINVAL
+	}
+	return fl, 0
+}
+
+// lockRangeEnd turns the kernel's start and length back into FUSE's inclusive
+// end, where a zero length means "to the end of the file".
+func lockRangeEnd(fl *syscall.Flock_t) uint64 { return lockrange.End(fl.Start, fl.Len) }
+
+// setReplyLock fills the FUSE reply for a Getlk answer. End-of-file has one
+// spelling internally (the maximum) and another on a Linux reply (OFFSET_MAX),
+// and the kernel rejects the former outright, so the reply is normalized here
+// for local and remote handles alike. An unlocked answer carries no range.
+func setReplyLock(out *fuse.FileLock, typ uint32, start, end uint64, pid uint32) {
+	out.Typ = typ
+	if typ == syscall.F_UNLCK {
+		return
+	}
+	out.Start, out.End, out.Pid = start, lockrange.ReplyEnd(end), pid
 }
 
 func (n *Node) Setlk(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
@@ -883,7 +915,7 @@ func (n *Node) setlk(f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uin
 				op |= syscall.LOCK_NB
 			}
 			if err := syscall.Flock(int(h.fd.Fd()), op); err != nil {
-				return errnoOf(err.Error())
+				return errnoFromErr(err)
 			}
 			return 0
 		}
@@ -891,9 +923,12 @@ func (n *Node) setlk(f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uin
 		if wait {
 			cmd = syscall.F_SETLKW
 		}
-		fl := syscall.Flock_t{Type: int16(lk.Typ), Start: int64(lk.Start), Len: int64(lk.End - lk.Start + 1)}
+		fl, errno := lockRange(lk)
+		if errno != 0 {
+			return errno
+		}
 		if err := syscall.FcntlFlock(h.fd.Fd(), cmd, &fl); err != nil {
-			return errnoOf(err.Error())
+			return errnoFromErr(err)
 		}
 		return 0
 	}
@@ -1486,42 +1521,14 @@ func respErrno(resp *proto.FxResp) syscall.Errno {
 	return syscall.EIO
 }
 
-// errnoFromErr preserves a typed syscall.Errno carried by a transport error.
-// A remote Do returns the daemon's errno directly, so this never guesses from
-// message text when the error already names an errno.
-func errnoFromErr(err error) syscall.Errno {
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		return errno
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return syscall.ENOENT
-	}
-	if errors.Is(err, os.ErrPermission) {
-		return syscall.EACCES
-	}
-	if errors.Is(err, os.ErrExist) {
-		return syscall.EEXIST
-	}
-	return errnoOf(err.Error())
-}
-func errnoOf(msg string) syscall.Errno {
-	switch {
-	case strings.Contains(msg, "no such file"):
-		return syscall.ENOENT
-	case strings.Contains(msg, "permission denied"):
-		return syscall.EACCES
-	case strings.Contains(msg, "is a directory"):
-		return syscall.EISDIR
-	case strings.Contains(msg, "not a directory"):
-		return syscall.ENOTDIR
-	case strings.Contains(msg, "not empty"):
-		return syscall.ENOTEMPTY
-	case strings.Contains(msg, "file exists"):
-		return syscall.EEXIST
-	}
-	return syscall.EIO
-}
+// errnoFromErr keeps the local name for the shared resolver: a local kernel
+// call names its errno, and only an error that carries none is guessed from
+// text.
+func errnoFromErr(err error) syscall.Errno { return syserrno.Of(err) }
+
+// errnoOf is the text-only form, for a daemon reply whose detail string is
+// all the transport kept.
+func errnoOf(msg string) syscall.Errno { return syserrno.OfText(msg) }
 
 // There is deliberately no whole-file cache here. Every remote read, write,
 // stat and fsync is answered by the daemon's own descriptor for the file, so
