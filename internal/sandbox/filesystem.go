@@ -31,6 +31,10 @@ type filesystemSpec struct {
 	Mount     string        `json:"mount"`
 	Cache     string        `json:"cache"`
 	SessionID string        `json:"session_id"`
+	// Session is the token the controller allocated for this session. The
+	// worker's filesystem connection must answer for the same session as the
+	// commands the sandbox runs, so it cannot mint its own.
+	Session string `json:"session"`
 	// Resources pins the directories the controller allocated for this
 	// session, so the worker can release them even when the controller is
 	// killed and never runs its own cleanup.
@@ -348,6 +352,7 @@ func runFilesystem(fd int) int {
 		_ = json.NewEncoder(ready).Encode(filesystemReady{SessionID: spec.SessionID, Error: err.Error()})
 		return 127
 	}
+	plan.UseSession(spec.Session)
 	plan.Mount, plan.Cache = spec.Mount, spec.Cache
 	// Capture the connection once: nothing nils it in this process, but a
 	// stable reference keeps the cancellation goroutine and the deferred
@@ -513,7 +518,8 @@ func (p *Plan) startFilesystem(ctx context.Context) error {
 	}
 	spec := filesystemSpec{
 		Config: cfg, ExeDir: filepath.Dir(p.Trampoline), Mount: p.Mount,
-		Cache: p.Cache, SessionID: p.sessionID, RuntimePaths: p.Exec.RuntimePaths(),
+		Cache: p.Cache, SessionID: p.sessionID, Session: p.sessionToken,
+		RuntimePaths: p.Exec.RuntimePaths(),
 	}
 	// Pin this session's allocated directories so the worker can release
 	// them itself when the controller is killed before its own cleanup.

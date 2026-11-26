@@ -61,6 +61,33 @@ type lockEntry struct {
 	done     chan struct{}
 }
 
+// SessionState is the per-session state one connection can share with the
+// others of the same session. The daemon runs the session's commands itself,
+// so only it can tell whether a command may be changing names, and which names
+// the session established.
+type SessionState interface {
+	// Created reports whether this session established the name at path.
+	Created(path string) bool
+	// MarkDir records a directory this session's view resolved, with its
+	// children. Comparing it after a command is how the daemon learns which
+	// names that command added or removed: it never infers provenance from an
+	// inode's timestamps.
+	MarkDir(path string, dev, ino uint64, names []string)
+	// MarkCreated and MarkRemoved update that ledger with a name this
+	// connection established or removed.
+	MarkCreated(path string)
+	MarkRemoved(path string)
+	// LedgerSeq reports the current generation. Read it before observing the
+	// tree so ForgetCreated can retire only the record that observation saw.
+	LedgerSeq() uint64
+	// ForgetCreated retires the record for a name an observation found gone. A
+	// name that merely appeared is not recorded and must not be inferred.
+	ForgetCreated(path string, seq uint64)
+	// State reports the session's mutation epoch and whether one of its
+	// commands is running right now.
+	State() (epoch uint64, running bool)
+}
+
 // Server answers file operations for one connection.
 type Server struct {
 	mu      sync.Mutex
@@ -70,10 +97,22 @@ type Server struct {
 	// waiters carries the cancellation channel of every waiting FxSetlkw for a
 	// handle, so closing that handle wakes its waiters.
 	waiters map[uint64]map[chan struct{}]struct{}
+	// created records the names this connection established. The view asks
+	// before it retains a resolution: a name the session created must be
+	// re-resolved every time, so a later delete or rename is visible at once.
+	// A name stays recorded for the connection's lifetime; only removing it
+	// through this connection forgets it, and forgetting would be the unsafe
+	// direction.
+	created map[string]struct{}
 	closed  bool
 	// closedCh is closed when Close runs; it wakes lock requests waiting for a
 	// conflicting lock instead of leaving them stuck on the descriptor table.
 	closedCh chan struct{}
+	// sess is shared by every connection of one session. With a session bound,
+	// the session's ledger answers creation provenance and its state stamps
+	// every reply; without one the connection answers for itself.
+	sessMu sync.RWMutex
+	sess   SessionState
 }
 
 // NewServer creates a per-connection file server.
@@ -82,8 +121,112 @@ func NewServer() *Server {
 		handles:  make(map[uint64]*openFile),
 		locks:    make(map[lockKey]*lockEntry),
 		waiters:  make(map[uint64]map[chan struct{}]struct{}),
+		created:  make(map[string]struct{}),
 		closedCh: make(chan struct{}),
 	}
+}
+
+func (s *Server) markCreated(p string) {
+	s.sessMu.RLock()
+	sess := s.sess
+	s.sessMu.RUnlock()
+	if sess != nil {
+		sess.MarkCreated(p)
+		return
+	}
+	s.mu.Lock()
+	s.created[p] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *Server) markRemoved(p string) {
+	s.sessMu.RLock()
+	sess := s.sess
+	s.sessMu.RUnlock()
+	if sess != nil {
+		sess.MarkRemoved(p)
+		return
+	}
+	s.mu.Lock()
+	delete(s.created, p)
+	s.mu.Unlock()
+}
+
+func (s *Server) isCreated(p string) bool {
+	s.sessMu.RLock()
+	sess := s.sess
+	s.sessMu.RUnlock()
+	if sess != nil {
+		return sess.Created(p)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.created[p]
+	return ok
+}
+
+// ledgerSeq reports the session's current ledger generation, or zero for a
+// connection that answers for itself.
+func (s *Server) ledgerSeq() uint64 {
+	s.sessMu.RLock()
+	sess := s.sess
+	s.sessMu.RUnlock()
+	if sess == nil {
+		return 0
+	}
+	return sess.LedgerSeq()
+}
+
+// forgetAbsent retires the ledger record for a name an observation found gone.
+// seq is the generation read before the observation, so only the record that
+// observation could have seen is dropped and one that landed after it began is
+// kept.
+func (s *Server) forgetAbsent(p string, seq uint64) {
+	s.sessMu.RLock()
+	sess := s.sess
+	s.sessMu.RUnlock()
+	if sess != nil {
+		sess.ForgetCreated(p, seq)
+		return
+	}
+	s.mu.Lock()
+	delete(s.created, p)
+	s.mu.Unlock()
+}
+
+// markDir records a directory a view just resolved. A reply produced while a
+// command runs describes the tree mid-change and is never a baseline, so only
+// answers given with no command running are recorded.
+func (s *Server) markDir(p string, st *syscall.Stat_t, names []string) {
+	s.sessMu.RLock()
+	sess := s.sess
+	s.sessMu.RUnlock()
+	if sess == nil {
+		return
+	}
+	if _, running := sess.State(); running {
+		return
+	}
+	if names == nil {
+		des, err := os.ReadDir(p)
+		if err != nil {
+			return
+		}
+		names = make([]string, 0, len(des))
+		for _, de := range des {
+			names = append(names, de.Name())
+		}
+	}
+	sess.MarkDir(p, uint64(st.Dev), uint64(st.Ino), names)
+}
+
+// UseSession binds this connection to the session it belongs to. It must be
+// called before the first request: the binding decides both creation
+// provenance and the epoch stamped on every reply.
+func (s *Server) UseSession(sess SessionState) {
+	s.sessMu.Lock()
+	s.sess = sess
+	s.sessMu.Unlock()
 }
 
 // Close cancels waiting operations and releases every descriptor the
@@ -209,10 +352,30 @@ func okOrErr(id uint32, err error) *proto.FxResp {
 	return &proto.FxResp{ID: id, Kind: proto.KOk}
 }
 
-// Handle answers one request. It never blocks longer than the operation
+// Handle answers one request and stamps the reply with the session state the
+// operation started under. The epoch is read before the operation runs: a
+// command that starts during it then holds an epoch the reply does not have, so
+// the view cannot retain a result produced before that command's changes.
+func (s *Server) Handle(req *proto.FxReq) *proto.FxResp {
+	s.sessMu.RLock()
+	sess := s.sess
+	s.sessMu.RUnlock()
+	var epoch uint64
+	var running bool
+	if sess != nil {
+		epoch, running = sess.State()
+	}
+	resp := s.handle(req)
+	if resp != nil {
+		resp.Epoch, resp.Volatile = epoch, running
+	}
+	return resp
+}
+
+// handle answers one request. It never blocks longer than the operation
 // itself: a waiting lock runs on its own goroutine, so the connection's
 // reader stays live.
-func (s *Server) Handle(req *proto.FxReq) *proto.FxResp {
+func (s *Server) handle(req *proto.FxReq) *proto.FxResp {
 	switch req.Op {
 	case proto.FxOpen:
 		return s.fxOpen(req)
@@ -249,15 +412,32 @@ func (s *Server) Handle(req *proto.FxReq) *proto.FxResp {
 	case proto.FxUnlink:
 		return s.fxUnlink(req)
 	case proto.FxRmdir:
-		return okOrErr(req.ID, syscall.Rmdir(req.Path))
+		if err := syscall.Rmdir(req.Path); err != nil {
+			return errResp(req.ID, err)
+		}
+		s.markRemoved(req.Path)
+		return okOrErr(req.ID, nil)
 	case proto.FxSymlink:
 		// Arg is the link text, Path is the name to create.
-		return okOrErr(req.ID, os.Symlink(req.Arg, req.Path))
+		if err := os.Symlink(req.Arg, req.Path); err != nil {
+			return errResp(req.ID, err)
+		}
+		s.markCreated(req.Path)
+		return okOrErr(req.ID, nil)
 	case proto.FxLink:
 		// Path is the new name, Arg is the existing file.
-		return okOrErr(req.ID, os.Link(req.Arg, req.Path))
+		if err := os.Link(req.Arg, req.Path); err != nil {
+			return errResp(req.ID, err)
+		}
+		s.markCreated(req.Path)
+		return okOrErr(req.ID, nil)
 	case proto.FxRename:
-		return okOrErr(req.ID, os.Rename(req.Path, req.Arg))
+		if err := os.Rename(req.Path, req.Arg); err != nil {
+			return errResp(req.ID, err)
+		}
+		s.markRemoved(req.Path)
+		s.markCreated(req.Arg)
+		return okOrErr(req.ID, nil)
 	case proto.FxAccess:
 		return s.fxAccess(req)
 	case proto.FxChmod:
@@ -274,20 +454,33 @@ func (s *Server) Handle(req *proto.FxReq) *proto.FxResp {
 
 func (s *Server) fxStat(req *proto.FxReq) *proto.FxResp {
 	var st syscall.Stat_t
+	// The generation is read before the lookup: an establishment made after this
+	// point carries a higher one, so the forgetting below leaves it alone.
+	seq := s.ledgerSeq()
 	if err := syscall.Lstat(req.Path, &st); err != nil {
 		if errors.Is(err, syscall.ENOENT) {
+			// The name this session established is gone. Retire the record so a
+			// later name at the same path is not answered as this session's own.
+			s.forgetAbsent(req.Path, seq)
 			// Only a metadata lookup that found nothing answers KNone; every
 			// mutation and open reports KErr with its errno.
 			return &proto.FxResp{ID: req.ID, Kind: proto.KNone, Errno: uint32(syscall.ENOENT), Err: err.Error()}
 		}
 		return errResp(req.ID, err)
 	}
-	return &proto.FxResp{ID: req.ID, Kind: proto.KStat, Attr: attrOf(&st)}
+	if statMode(&st)&proto.SIFDIR == proto.SIFDIR {
+		s.markDir(req.Path, &st, nil)
+	}
+	return &proto.FxResp{ID: req.ID, Kind: proto.KStat, Attr: attrOf(&st), Created: s.isCreated(req.Path)}
 }
 
 func (s *Server) fxList(req *proto.FxReq) *proto.FxResp {
 	var des []os.DirEntry
 	var err error
+	dir := req.Path
+	var df *os.File
+	var id syscall.Stat_t
+	haveID := false
 	if req.Handle != 0 {
 		f, ok := s.get(req.Handle)
 		if !ok {
@@ -296,17 +489,126 @@ func (s *Server) fxList(req *proto.FxReq) *proto.FxResp {
 		// List the opened inode, not the current name: a directory renamed
 		// after it was opened still lists its own entries.
 		des, err = readDirHandle(f.f)
+		df = f.f
+		id, haveID = statFile(f.f)
+		// Children are named relative to the directory's current path, which is
+		// also what the creation ledger records. The name is reported only when
+		// it still leads to the listed inode: a directory replaced at that path
+		// is another directory, and its children must not be filed under it.
+		if current, ok := handleDirPath(f.f); ok {
+			dir = current
+			var st syscall.Stat_t
+			if serr := syscall.Lstat(current, &st); serr != nil || !sameInode(&st, &id, haveID) {
+				dir = ""
+			}
+		} else {
+			dir = ""
+		}
 	} else {
 		des, err = os.ReadDir(req.Path)
+		var st syscall.Stat_t
+		if serr := syscall.Lstat(req.Path, &st); serr == nil {
+			id, haveID = st, true
+		}
 	}
 	if err != nil {
 		return errResp(req.ID, err)
 	}
 	ents := make([]proto.DirEntry, 0, len(des))
 	for _, de := range des {
-		ents = append(ents, proto.DirEntry{Name: de.Name(), Mode: dirEntryMode(de)})
+		entry := proto.DirEntry{Name: de.Name()}
+		if df != nil {
+			// A descriptor listing has no path to resolve children against:
+			// de.Info() would stat the bare name in the daemon's working
+			// directory. Read each child from the open directory instead, and
+			// leave its attributes off when that is not possible.
+			if st, ok := statAt(df, de.Name()); ok {
+				entry.Mode = statMode(&st)
+				entry.Attr = attrOf(&st)
+				if dir != "" {
+					entry.Created = s.isCreated(dir + "/" + de.Name())
+				}
+			} else {
+				entry.Mode = direntTypeMode(de)
+			}
+			ents = append(ents, entry)
+			continue
+		}
+		// Attach the child's attributes to the entry when the listing can read
+		// them. Children then share the listing's single expiry instead of
+		// each starting a window of its own.
+		if info, err := de.Info(); err == nil {
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				entry.Mode = statMode(st)
+				entry.Attr = attrOf(st)
+				entry.Created = s.isCreated(dir + "/" + de.Name())
+			} else {
+				entry.Mode = entryMode(info)
+			}
+		} else {
+			entry.Mode = dirEntryMode(de)
+		}
+		ents = append(ents, entry)
 	}
-	return &proto.FxResp{ID: req.ID, Kind: proto.KDir, Ents: ents}
+	resp := &proto.FxResp{ID: req.ID, Kind: proto.KDir, Ents: ents, DirPath: dir}
+	if haveID {
+		resp.DirDev, resp.DirIno = statDev(&id), uint64(id.Ino)
+	}
+	if dir != "" && haveID {
+		names := make([]string, len(ents))
+		for i, entry := range ents {
+			names[i] = entry.Name
+		}
+		s.markDir(dir, &id, names)
+	}
+	return resp
+}
+
+// entryMode maps a FileInfo onto the wire mode when the native stat is not
+// available (non-Linux builds).
+func entryMode(info os.FileInfo) uint32 {
+	mode := uint32(info.Mode().Perm())
+	switch {
+	case info.IsDir():
+		mode |= proto.SIFDIR
+	case info.Mode()&os.ModeSymlink != 0:
+		mode |= proto.SIFLNK
+	default:
+		mode |= proto.SIFREG
+	}
+	return mode
+}
+
+// direntTypeMode reports the Linux type bits a directory entry carries itself,
+// without resolving the name against any directory.
+func direntTypeMode(de os.DirEntry) uint32 {
+	switch {
+	case de.IsDir():
+		return proto.SIFDIR
+	case de.Type()&os.ModeSymlink != 0:
+		return proto.SIFLNK
+	default:
+		return proto.SIFREG
+	}
+}
+
+// statFile reports the inode an open descriptor refers to.
+func statFile(f *os.File) (syscall.Stat_t, bool) {
+	info, err := f.Stat()
+	if err != nil {
+		return syscall.Stat_t{}, false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return syscall.Stat_t{}, false
+	}
+	return *st, true
+}
+
+// sameInode reports whether st names the inode id holds. An unknown identity
+// confirms nothing, so the caller must not claim a name for it.
+func sameInode(st, id *syscall.Stat_t, known bool) bool {
+	return known && uint64(st.Dev) == uint64(id.Dev) && st.Ino == id.Ino
 }
 
 // dirEntryMode reports the Linux type and permission bits of a directory
@@ -316,16 +618,7 @@ func dirEntryMode(de os.DirEntry) uint32 {
 		if st, ok := info.Sys().(*syscall.Stat_t); ok {
 			return statMode(st)
 		}
-		mode := uint32(info.Mode().Perm())
-		switch {
-		case info.IsDir():
-			mode |= proto.SIFDIR
-		case info.Mode()&os.ModeSymlink != 0:
-			mode |= proto.SIFLNK
-		default:
-			mode |= proto.SIFREG
-		}
-		return mode
+		return entryMode(info)
 	}
 	switch {
 	case de.IsDir():
@@ -350,7 +643,11 @@ func (s *Server) fxMkdir(req *proto.FxReq) *proto.FxResp {
 	if err != nil {
 		return errResp(req.ID, err)
 	}
-	return okOrErr(req.ID, os.Mkdir(req.Path, mode))
+	if err := os.Mkdir(req.Path, mode); err != nil {
+		return errResp(req.ID, err)
+	}
+	s.markCreated(req.Path)
+	return okOrErr(req.ID, nil)
 }
 
 // typedMode takes a permission mode from the typed Mode field when it is set,
@@ -380,7 +677,11 @@ func (s *Server) fxUnlink(req *proto.FxReq) *proto.FxResp {
 			return errResp(req.ID, syscall.EISDIR)
 		}
 	}
-	return okOrErr(req.ID, os.Remove(req.Path))
+	if err := os.Remove(req.Path); err != nil {
+		return errResp(req.ID, err)
+	}
+	s.markRemoved(req.Path)
+	return okOrErr(req.ID, nil)
 }
 
 func (s *Server) fxAccess(req *proto.FxReq) *proto.FxResp {
@@ -424,7 +725,7 @@ func (s *Server) fxTruncate(req *proto.FxReq) *proto.FxResp {
 // O_CREAT pairs with the requested Mode, and O_APPEND stays on the descriptor
 // so every write lands at the end decided by the file itself.
 func (s *Server) fxOpen(req *proto.FxReq) *proto.FxResp {
-	f, err := os.OpenFile(req.Path, int(req.Flags), os.FileMode(req.Mode&0o7777))
+	f, created, err := s.openPath(req.Path, int(req.Flags), os.FileMode(req.Mode&0o7777))
 	if err != nil {
 		return errResp(req.ID, err)
 	}
@@ -438,7 +739,33 @@ func (s *Server) fxOpen(req *proto.FxReq) *proto.FxResp {
 		f.Close()
 		return errResp(req.ID, syscall.EBADF)
 	}
-	return &proto.FxResp{ID: req.ID, Kind: proto.KHandle, Handle: h, Attr: attrOf(&st)}
+	if created {
+		s.markCreated(req.Path)
+	}
+	if statMode(&st)&proto.SIFDIR == proto.SIFDIR {
+		s.markDir(req.Path, &st, nil)
+	}
+	return &proto.FxResp{ID: req.ID, Kind: proto.KHandle, Handle: h, Attr: attrOf(&st), Created: created || s.isCreated(req.Path)}
+}
+
+// openPath opens p and reports whether this call established the name. A
+// create is attempted exclusively first so the answer is a fact rather than an
+// inference: an O_CREAT that meets an existing name is an open, not a
+// creation, and must not be recorded as one.
+func (s *Server) openPath(p string, flags int, mode os.FileMode) (*os.File, bool, error) {
+	if flags&syscall.O_CREAT == 0 {
+		f, err := os.OpenFile(p, flags, mode)
+		return f, false, err
+	}
+	f, err := os.OpenFile(p, flags|syscall.O_EXCL, mode)
+	if err == nil {
+		return f, true, nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return nil, false, err
+	}
+	f, err = os.OpenFile(p, flags, mode)
+	return f, false, err
 }
 
 func (s *Server) fxClose(req *proto.FxReq) *proto.FxResp {

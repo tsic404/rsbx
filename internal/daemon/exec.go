@@ -20,6 +20,9 @@ import (
 type Server struct {
 	// Logf is optional.
 	Logf func(format string, args ...any)
+	// sessions ties the connections of one rsbx session together. It is shared
+	// by every connection this server accepts.
+	sessions sessionTable
 }
 
 func (s *Server) logf(format string, args ...any) {
@@ -42,7 +45,7 @@ func (s *Server) ServeConn(c net.Conn) {
 		s.serveExec(c, f.Payload)
 	case proto.THello:
 		s.ReverseHandshake(c, f.Payload)
-	case proto.TFxReq:
+	case proto.TFxReq, proto.TSession:
 		s.serveFS(c, f)
 	default:
 		s.logf("rsbxd: unexpected opening frame %#x", f.Type)
@@ -56,11 +59,19 @@ func (s *Server) serveExec(c net.Conn, payload []byte) {
 		proto.WriteFrame(c, proto.TExit, proto.ExitPayload(127))
 		return
 	}
+	// The command runs on this machine, so this is the only place that learns
+	// it may change names the session's view retained. A request without a
+	// session token answers for itself and announces nothing.
+	var sess *session
+	if req.Session != "" {
+		sess = s.sessions.acquire(req.Session)
+		defer s.sessions.release(req.Session, sess)
+	}
 	if req.TTY {
-		s.execTTY(c, req)
+		s.execTTY(c, req, sess)
 		return
 	}
-	s.execPipes(c, req)
+	s.execPipes(c, req, sess)
 }
 
 // resolveCwd validates the requested working directory. There is no fallback:
@@ -100,7 +111,7 @@ func (s *Server) build(req *proto.ExecReq, dir string) *exec.Cmd {
 	return cmd
 }
 
-func (s *Server) execPipes(c net.Conn, req *proto.ExecReq) {
+func (s *Server) execPipes(c net.Conn, req *proto.ExecReq, sess *session) {
 	dir, ok := s.resolveCwd(c, req.Dir)
 	if !ok {
 		return
@@ -135,7 +146,9 @@ func (s *Server) execPipes(c net.Conn, req *proto.ExecReq) {
 	}
 	cmd.Stdout = outW
 	cmd.Stderr = errW
+	sess.commandStarted()
 	if err := cmd.Start(); err != nil {
+		sess.commandFinished()
 		stdin.Close()
 		outR.Close()
 		outW.Close()
@@ -240,13 +253,14 @@ func (s *Server) execPipes(c net.Conn, req *proto.ExecReq) {
 	// manage the stdout/stderr pipes, so it cannot drop their buffered output:
 	// we drain both to EOF first, then report.
 	_ = cmd.Wait()
+	sess.commandFinished()
 	pumps.Wait()
 	send(proto.TExit, proto.ExitPayload(waitStatus(cmd)))
 	close(done)
 	stdinWg.Wait()
 }
 
-func (s *Server) execTTY(c net.Conn, req *proto.ExecReq) {
+func (s *Server) execTTY(c net.Conn, req *proto.ExecReq, sess *session) {
 	dir, ok := s.resolveCwd(c, req.Dir)
 	if !ok {
 		return
@@ -266,7 +280,9 @@ func (s *Server) execTTY(c net.Conn, req *proto.ExecReq) {
 	// terminal. That makes it the session (and process group) leader, so
 	// signalling -pid reaches the whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	sess.commandStarted()
 	if err := cmd.Start(); err != nil {
+		sess.commandFinished()
 		slave.Close()
 		proto.WriteFrame(c, proto.TErr, []byte(fmt.Sprintf("rsbxd: exec %s: %v", req.Target, err)))
 		proto.WriteFrame(c, proto.TExit, proto.ExitPayload(127))
@@ -333,6 +349,7 @@ func (s *Server) execTTY(c net.Conn, req *proto.ExecReq) {
 	// Wait for the child to exit naturally, then let the pump observe the
 	// hangup and drain the last bytes before reporting the real status.
 	_ = cmd.Wait()
+	sess.commandFinished()
 	<-pumpDone
 	send(proto.TExit, proto.ExitPayload(waitStatus(cmd)))
 }

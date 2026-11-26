@@ -44,6 +44,17 @@ const (
 
 	TFxReq  = 0x20
 	TFxResp = 0x21
+
+	// TSession is client -> daemon and opens a filesystem connection for one
+	// session. Every connection that belongs to the same session carries the
+	// same token, so the daemon can answer for the session as a whole instead
+	// of for one connection at a time.
+	TSession = 0x22
+	// TInvalidate is daemon -> client: the session's own command has begun and
+	// may change any name the view retained, so the view must stop answering
+	// from results it obtained before. The payload carries the epoch the view
+	// must adopt; replies stamped with an older epoch are not retainable.
+	TInvalidate = 0x23
 )
 
 const (
@@ -262,6 +273,10 @@ type ExecReq struct {
 	Dir        string
 	TTY        bool
 	Rows, Cols uint16
+	// Session names the session this command belongs to. The daemon runs the
+	// command itself, so this is the only way it learns that a command of that
+	// session may change names the session's view has retained.
+	Session string
 }
 
 func (r *ExecReq) Encode() []byte {
@@ -284,6 +299,7 @@ func (r *ExecReq) Encode() []byte {
 	for _, a := range r.Env {
 		e.Str(a)
 	}
+	e.Str(r.Session)
 	return e.B
 }
 
@@ -304,6 +320,7 @@ func DecodeExecReq(p []byte) (*ExecReq, error) {
 	for i := 0; i < n && d.Err == nil; i++ {
 		r.Env = append(r.Env, d.Str())
 	}
+	r.Session = d.Str()
 	if d.Err != nil {
 		return nil, d.Err
 	}
@@ -372,6 +389,13 @@ func decodeAttr(d *Dec) Attr {
 type DirEntry struct {
 	Name string
 	Mode uint32
+	// Attr carries the child's full attributes when the daemon could read them
+	// with the listing. A zero Ino means the entry was listed by type only and
+	// the child has to be resolved separately.
+	Attr Attr
+	// Created marks a child this session established, so the view never
+	// answers its resolution from a listing or a retained result.
+	Created bool
 }
 
 // FxReq is one filesystem operation against the remote tree.
@@ -455,6 +479,29 @@ type FxResp struct {
 	Handle uint64 // KHandle, and echoed for handle ops
 	Count  uint32 // bytes transferred (KData, KOk)
 	Errno  uint32 // numeric errno; non-zero only for failures
+	// Created marks a stat or open reply whose path was established by this
+	// connection. The daemon is the only side that can answer it: the session
+	// also creates names through commands it runs there, which never pass
+	// through the view's own callbacks.
+	Created bool
+	// Epoch is the session's mutation epoch when this reply was produced. A
+	// command the session runs on the daemon may change any name, and the
+	// daemon announces the new epoch before the command starts; a reply from
+	// an older epoch may describe a tree that command has since changed.
+	Epoch uint64
+	// Volatile marks a reply produced while one of the session's commands is
+	// running. The daemon cannot tell which names that command touches, so the
+	// view must not retain such an answer at all.
+	Volatile bool
+	// DirPath, DirDev and DirIno identify the directory a listing describes.
+	// The names are relative to DirPath, and (DirDev, DirIno) is the inode the
+	// listing was read from: a listing asked for through a descriptor answers
+	// for that descriptor, which may live at another name than it was opened
+	// under. DirPath is empty when the daemon cannot confirm that the path still
+	// names that inode; the view then fills no per-path cache from the reply.
+	DirPath string
+	DirDev  uint64
+	DirIno  uint64
 	// Lock reports the conflicting lock for FxGetlk, if any.
 	Lock *LockInfo
 }
@@ -481,6 +528,12 @@ func (r *FxResp) Encode() []byte {
 		for _, it := range r.Ents {
 			e.Str(it.Name)
 			e.U32(it.Mode)
+			it.Attr.encode(&e)
+			if it.Created {
+				e.U8(1)
+			} else {
+				e.U8(0)
+			}
 		}
 	case KData:
 		e.U32(uint32(len(r.Data)))
@@ -493,6 +546,17 @@ func (r *FxResp) Encode() []byte {
 	e.U64(r.Handle)
 	e.U32(r.Count)
 	e.U32(r.Errno)
+	if r.Created {
+		e.U8(1)
+	} else {
+		e.U8(0)
+	}
+	e.U64(r.Epoch)
+	if r.Volatile {
+		e.U8(1)
+	} else {
+		e.U8(0)
+	}
 	if r.Lock != nil {
 		e.U8(1)
 		e.U32(r.Lock.Typ)
@@ -502,6 +566,9 @@ func (r *FxResp) Encode() []byte {
 	} else {
 		e.U8(0)
 	}
+	e.Str(r.DirPath)
+	e.U64(r.DirDev)
+	e.U64(r.DirIno)
 	return e.B
 }
 
@@ -518,7 +585,9 @@ func DecodeFxResp(p []byte) (*FxResp, error) {
 		for i := 0; i < n && d.Err == nil; i++ {
 			name := d.Str()
 			mode := d.U32()
-			r.Ents = append(r.Ents, DirEntry{Name: name, Mode: mode})
+			attr := decodeAttr(d)
+			created := d.U8() != 0
+			r.Ents = append(r.Ents, DirEntry{Name: name, Mode: mode, Attr: attr, Created: created})
 		}
 	case KData:
 		n := int(d.U32())
@@ -529,9 +598,15 @@ func DecodeFxResp(p []byte) (*FxResp, error) {
 	r.Handle = d.U64()
 	r.Count = d.U32()
 	r.Errno = d.U32()
+	r.Created = d.U8() != 0
+	r.Epoch = d.U64()
+	r.Volatile = d.U8() != 0
 	if d.U8() != 0 {
 		r.Lock = &LockInfo{Typ: d.U32(), Start: d.U64(), End: d.U64(), Pid: d.U32()}
 	}
+	r.DirPath = d.Str()
+	r.DirDev = d.U64()
+	r.DirIno = d.U64()
 	if d.Err != nil {
 		return nil, d.Err
 	}
@@ -543,6 +618,65 @@ func ExitPayload(status int) []byte {
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], uint32(int32(status)))
 	return b[:]
+}
+
+// SessionPayload builds the TSession payload: the session token a connection
+// belongs to. The token is an opaque correlation key, never an authorization:
+// the daemon serves the same tree with or without it.
+func SessionPayload(token string) []byte {
+	var e Enc
+	e.Str(token)
+	return e.B
+}
+
+// DecodeSessionPayload reads a TSession payload. An empty or malformed token
+// leaves the connection outside any session, which is the pre-existing
+// behaviour for a client that does not send one.
+func DecodeSessionPayload(p []byte) (string, error) {
+	d := &Dec{B: p}
+	token := d.Str()
+	if d.Err != nil {
+		return "", d.Err
+	}
+	if len(token) > 128 {
+		return "", fmt.Errorf("session token is too long")
+	}
+	if d.Off != len(p) {
+		return "", fmt.Errorf("session token contains trailing payload bytes")
+	}
+	return token, nil
+}
+
+// InvalidatePayload builds the TInvalidate payload: the epoch the view adopts
+// and the names whose retained answers are no longer usable. An announcement
+// without names only moves the epoch, which is what a command start does.
+func InvalidatePayload(epoch uint64, names []string) []byte {
+	var e Enc
+	e.U64(epoch)
+	e.U32(uint32(len(names)))
+	for _, name := range names {
+		e.Str(name)
+	}
+	return e.B
+}
+
+// DecodeInvalidate reads a TInvalidate payload. Exactly eight bytes is an
+// epoch-only announcement from a peer that predates the name list.
+func DecodeInvalidate(p []byte) (uint64, []string, error) {
+	if len(p) == 8 {
+		return binary.BigEndian.Uint64(p), nil, nil
+	}
+	d := &Dec{B: p}
+	epoch := d.U64()
+	n := int(d.U32())
+	var names []string
+	for i := 0; i < n && d.Err == nil; i++ {
+		names = append(names, d.Str())
+	}
+	if d.Err != nil {
+		return 0, nil, d.Err
+	}
+	return epoch, names, nil
 }
 
 func ParseExit(p []byte) int {

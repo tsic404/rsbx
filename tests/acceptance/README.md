@@ -153,6 +153,15 @@ Every check in the tree, with the code seam behind it:
 | 62 | TC-2 `executable-bytes-match-daemon` | A | `TC-2/run.sh` | two real trees: this machine's copy and the daemon's, compared as bytes |
 | 63 | TC-2 `library-bytes-match-daemon` | A | `TC-2/run.sh` | the shared library has its own comparison; the executable's result never stands in for it |
 | 64 | TC-2 `execution-lands-on-daemon` | A | `TC-2/run.sh` | the program is not allowlisted; both sides' `/proc/1/comm` are measured and required to differ, and a declared name may only confirm the measurement |
+| 65 | TC-19 `missing-name-not-remembered` | B + A | `TC-19/run.sh` + `TestMissingNameIsNeverRemembered` | the request count is a fact about the client's own stream, asserted at the mount; the real second client that creates the name is a carrier fact |
+| 66 | TC-19 `removed-name-visible-after-window-and-held-descriptor-keeps-bytes` | A | `TC-19/run.sh` | a name removed by another client during one live session, and a descriptor opened before the removal |
+| 67 | TC-19 `enumeration-does-not-hide-new-names` | A | `TC-19/run.sh` | a child added by another client after this view enumerated the directory, looked up by name and by a later listing |
+| 68 | TC-19 `repeat-resolution-inside-and-after-the-window` | B | `TestRepeatResolveWithinWindowAsksDaemonNothing` + `TestMountOptionsKeepOneSecondWindow` | the request count per resolution and the window itself are both client-side facts |
+| 69 | TC-19 `read-only-close-sends-no-sync` | B | `TestReadOnlyCloseSkipsImplicitSyncButStillCloses` | the close-time request stream is only visible at the mount |
+| 70 | TC-10a `failed-read-fails-the-reader` | B | `TestFailedReadIsNotPresentedAsEndOfFile` | a failing daemon request must not be flattened into a clean end of file; the carrier cannot control the reply |
+| 71 | TC-19 `command-created-name-keeps-the-ordinary-window` | B | `TestCommandCreatedNameExpiryStartsAtItsResult` | the window begins when the result is obtained, and a later delete by the command does not restart it; both bounds are client-side request facts |
+| 72 | TC-19 `recreated-name-does-not-inherit-an-old-creation-record` | B | `TestRecreatedNameDoesNotInheritAnOldCreationRecord` | the record belongs to the removed name, not the spelling; a name the command creates at the same path afterwards keeps the ordinary window |
+| 73 | TC-19 `unreadable-parent-keeps-the-creation-record` | B | `TestUnreadableParentKeepsTheCreationRecord` + `TestUnreadableDirectoryKeepsItsCreatedRecords` | a lookup that failed for lack of permission is not an absence; after the permission returns, a name this session created is still asked for on every query |
 
 TC-16's eight workspace checks are an external-rig gate run by the CI job; they
 are not part of this count.
@@ -181,6 +190,7 @@ criterion, the missing part was added first.
 | `TC-16/run.sh` | TC-16 | AC-10 | task-workspace gate; driven by the CI job with its own rig (`runner: external-rig`) |
 | `TC-17/run.sh` | TC-17 | AC-11 | ten checks on the reverse channel: placement, symlink spelling, exit status, four refusals with their reasons, and the session that survives them |
 | `TC-18/run.sh` | TC-18 | AC-12 | four mutual-TLS combinations: a trusted pair establishes a session and runs a command; an untrusted client certificate, a missing one and an untrusted server certificate are each rejected with the certificate named |
+| `TC-19/run.sh` | TC-19 | AC-9 | second-client visibility across one live session: a name created after two failed lookups is found with its bytes, a name removed after the view confirmed it is gone after the window while the held descriptor keeps its bytes, and a child added after an enumeration is found by name and by a later listing |
 
 ## Fixed or reported
 

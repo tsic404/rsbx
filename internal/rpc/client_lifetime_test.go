@@ -116,6 +116,28 @@ func TestFSCloseReleasesBlockedWrite(t *testing.T) {
 	}
 }
 
+// A lost connection is reported before any later request notices. The
+// filesystem view turns that signal into dropping its retained results; without
+// it a query that the view answered locally would keep succeeding after the
+// daemon is gone.
+func TestFSReportsLostConnection(t *testing.T) {
+	client, daemon := net.Pipe()
+	fs := newLifetimeFS(t, func(context.Context) (net.Conn, error) { return client, nil })
+	lost := make(chan struct{})
+	var once sync.Once
+	fs.OnLost(func() { once.Do(func() { close(lost) }) })
+
+	out := startFSRequest(fs, "/lost")
+	if _, err := proto.ReadFrame(daemon); err != nil {
+		t.Fatalf("read request: %v", err)
+	}
+	daemon.Close()
+	if reply := awaitRPC(t, out); reply.err == nil {
+		t.Fatal("the request on a closed connection succeeded")
+	}
+	awaitRPC(t, lost)
+}
+
 func TestFSCloseCancelsDial(t *testing.T) {
 	started := make(chan struct{})
 	var dials atomic.Int32

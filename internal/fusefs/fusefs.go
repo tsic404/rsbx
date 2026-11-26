@@ -43,6 +43,19 @@ type Remote interface {
 	WriteFile(p string, data []byte) error
 }
 
+// connectionLoss is implemented by a Remote that can report a lost connection.
+// The view drops every retained result when it fires, so a disconnected daemon
+// produces an explicit failure instead of an answer obtained before it died.
+type connectionLoss interface {
+	OnLost(func())
+}
+
+// sessionForget is implemented by a Remote that can name the paths one of this
+// session's commands changed. The view drops exactly those results.
+type sessionForget interface {
+	OnForget(func([]string))
+}
+
 // Layout describes which sandbox paths come from where.
 type Layout struct {
 	Remote Remote
@@ -74,6 +87,23 @@ type Node struct {
 	src   backing
 }
 
+// EntryRetention is how long the view may answer a resolution, an attribute set
+// or a directory listing without asking the daemon again, measured from the
+// moment that result was obtained.
+//
+// The window is granted per name, not per tree. A name this session established
+// is never retained: the session may delete or rename it next, and the next
+// query has to show that. The daemon answers which names those are, because it
+// executes the session's own mkdir, unlink and rename; the view cannot infer it
+// from a tree's write permission.
+//
+// Remote results are retained by the view itself, not by the kernel: the kernel
+// cannot be told to drop a cached entry when the daemon disconnects, and C-19
+// requires an explicit failure instead of a retained answer during an outage.
+// Local host trees keep their answers in the kernel, where no daemon is
+// involved.
+const EntryRetention = time.Second
+
 var _ = (fs.NodeLookuper)((*Node)(nil))
 var _ = (fs.NodeReaddirer)((*Node)(nil))
 var _ = (fs.NodeGetattrer)((*Node)(nil))
@@ -100,7 +130,14 @@ var _ = (fs.NodeFsyncer)((*Node)(nil))
 // and Close after unmounting to release every descriptor the layout owns.
 func NewRoot(l *Layout) *Node {
 	layout := *l
-	return &Node{lay: &layout, state: newMountState(&layout), path: "/", src: backing{kind: sourceUnion, attr: proto.Attr{Mode: proto.SIFDIR | 0o555}, readOnly: true}}
+	state := newMountState(&layout)
+	if notifier, ok := layout.Remote.(connectionLoss); ok {
+		notifier.OnLost(state.invalidate)
+	}
+	if notifier, ok := layout.Remote.(sessionForget); ok {
+		notifier.OnForget(state.forgetNames)
+	}
+	return &Node{lay: &layout, state: state, path: "/", src: backing{kind: sourceUnion, attr: proto.Attr{Mode: proto.SIFDIR | 0o555}, readOnly: true}}
 }
 
 func (n *Node) Err() error { return n.state.err }
@@ -178,6 +215,18 @@ func (n *Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 }
 
 func (n *Node) lookupBacking(p string) (backing, syscall.Errno) {
+	// A result this view already holds is answered without the daemon. A name
+	// this session created is never retained, so it is absent here and its
+	// query below reaches the daemon.
+	if held, ok := n.state.retainedResolve(p); ok {
+		// A retained answer describes the daemon's tree. This path may belong to
+		// a declared local tree, an asset or a mount point instead, so the route
+		// decides whether the answer is usable at all.
+		switch n.state.route(p).kind {
+		case sourceRemote, sourceUnion:
+			return held, 0
+		}
+	}
 	r := n.state.route(p)
 	src := backing{kind: r.kind, attr: r.attr, readOnly: r.readOnly, link: r.link, tree: r.tree}
 	switch r.kind {
@@ -200,18 +249,25 @@ func (n *Node) lookupBacking(p string) (backing, syscall.Errno) {
 			src.readOnly = src.readOnly || n.state.protected[[2]uint64{attr.Dev, attr.Ino}]
 		}
 	case sourceRemote:
-		attr, errno := n.remoteStat(p)
+		sent := n.state.beginRequest()
+		attr, created, volatile, errno := n.remoteStat(p)
 		if errno != 0 {
 			return backing{}, errno
 		}
 		src.attr = attr
+		n.state.retainResolve(p, src, created, volatile, sent)
 	case sourceUnion:
-		attr, errno := n.remoteStat(p)
+		sent := n.state.beginRequest()
+		attr, created, volatile, errno := n.remoteStat(p)
 		if errno == 0 && kind(attr.Mode) == proto.SIFDIR {
 			src.attr = attr
 		} else if errno != 0 && errno != syscall.ENOENT && errno != syscall.ENOTDIR {
 			return backing{}, errno
 		}
+		// A structural ancestor of a declared local tree exists in the view
+		// whether or not the daemon has that directory; when it does, the
+		// attributes above are the daemon's and must not outlive a disconnect.
+		n.state.retainResolve(p, src, created, volatile, sent)
 	case sourceSynthetic:
 		if src.attr.Mode == 0 {
 			if child := n.GetChild(path.Base(p)); child != nil {
@@ -245,6 +301,15 @@ func (n *Node) newEntry(ctx context.Context, p string, src backing, out *fuse.En
 	if src.tree != nil {
 		gen ^= ino(src.tree.prefix)
 	}
+	// Local answers may be kept by the kernel: no daemon is involved, so a lost
+	// connection cannot turn them into a stale success. Anything derived from
+	// the daemon is retained by the view instead, which drops its results when
+	// the connection dies; the kernel is told nothing, so it asks again every
+	// time and the view decides whether a request is needed.
+	if !remoteDerived(src) && src.readOnly {
+		out.SetEntryTimeout(EntryRetention)
+		out.SetAttrTimeout(EntryRetention)
+	}
 	stable := fs.StableAttr{Mode: kind(src.attr.Mode), Ino: inoN, Gen: gen}
 	if existing := n.GetChild(path.Base(p)); existing != nil && existing.StableAttr() == stable {
 		return existing
@@ -256,24 +321,29 @@ func (n *Node) newEntry(ctx context.Context, p string, src backing, out *fuse.En
 	return n.NewInode(ctx, child, stable)
 }
 
-func (n *Node) remoteStat(p string) (proto.Attr, syscall.Errno) {
+// remoteStat asks the daemon about one path. The second result reports whether
+// this session established the name and the third whether one of the session's
+// commands was running when the answer was produced. The daemon alone can
+// answer both: the session also creates names through the commands it runs
+// there, and those never pass through the view's own callbacks.
+func (n *Node) remoteStat(p string) (proto.Attr, bool, bool, syscall.Errno) {
 	if n.lay.Remote == nil {
-		return proto.Attr{}, syscall.EIO
+		return proto.Attr{}, false, false, syscall.EIO
 	}
 	resp, err := n.lay.Remote.Do(&proto.FxReq{Op: proto.FxStat, Path: p})
 	if err != nil {
-		return proto.Attr{}, errnoFromErr(err)
+		return proto.Attr{}, false, false, errnoFromErr(err)
 	}
 	if resp == nil {
-		return proto.Attr{}, syscall.EIO
+		return proto.Attr{}, false, false, syscall.EIO
 	}
 	if errno := respErrno(resp); errno != 0 {
-		return proto.Attr{}, errno
+		return proto.Attr{}, false, false, errno
 	}
 	if resp.Kind != proto.KStat {
-		return proto.Attr{}, syscall.EIO
+		return proto.Attr{}, false, false, syscall.EIO
 	}
-	return resp.Attr, 0
+	return resp.Attr, resp.Created, resp.Volatile, 0
 }
 
 // hostMetadata uses the mapping selected at Lookup. It never asks the policy
@@ -319,6 +389,10 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 		return n.handleGetattr(h, out)
 	}
 	p := n.currentPath()
+	if held, ok := n.state.retainedResolve(p); ok && remoteDerived(held) {
+		out.Attr = attrOfRemote(held.attr, remoteIno(held.attr, p))
+		return 0
+	}
 	switch n.src.kind {
 	case sourceHost:
 		host, owned, errno := n.hostMetadata()
@@ -333,21 +407,31 @@ func (n *Node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 			return errnoFromErr(err)
 		}
 		out.Attr = attrOfRemote(attr, identityIno("host", attr, p))
+		out.SetTimeout(EntryRetention)
 	case sourceRemote, sourceUnion:
 		if n.src.kind == sourceUnion && n.src.attr.Ino == 0 {
 			out.Attr = attrOfRemote(n.src.attr, ino(p))
+			out.SetTimeout(EntryRetention)
 			return 0
 		}
-		attr, errno := n.remoteStat(p)
+		sent := n.state.beginRequest()
+		attr, created, volatile, errno := n.remoteStat(p)
 		if errno != 0 {
 			return errno
 		}
 		if !sameIdentity(n.src.attr, attr) {
 			return syscall.ESTALE
 		}
+		// The reply just obtained is the one worth keeping: retaining n.src
+		// would store the attributes the node was created with, so the next
+		// query inside the window could read back a value this one replaced.
+		fresh := n.src
+		fresh.attr = attr
+		n.state.retainResolve(p, fresh, created, volatile, sent)
 		out.Attr = attrOfRemote(attr, remoteIno(attr, p))
 	default:
 		out.Attr = attrOfRemote(n.src.attr, ino(p))
+		out.SetTimeout(EntryRetention)
 	}
 	return 0
 }
@@ -396,6 +480,7 @@ type handle struct {
 	ents   []proto.DirEntry
 	path   string
 	lay    *Layout
+	state  *mountState
 	// base records the opened inode for creation replies. Descriptor stats are
 	// always fresh fstat requests and never depend on this snapshot.
 	base proto.Attr
@@ -408,10 +493,22 @@ type handle struct {
 	// phantom marks a handle for a sandbox-reserved bind target: the launcher
 	// mounts a real file there, so the daemon is never consulted.
 	phantom bool
+	// readOnlyOpen records that the descriptor was opened without any write
+	// intent. Closing it has no durability to wait for, so the implicit sync a
+	// close performs is skipped; an explicit fsync still reaches the daemon.
+	readOnlyOpen bool
 }
 
 func (b *backing) hostWritable() bool {
 	return b.kind == sourceHost && !b.readOnly && kind(b.attr.Mode) != proto.SIFLNK
+}
+
+// remoteDerived reports whether the answer came from the daemon. Structural
+// union directories whose daemon stat failed keep an inode number of zero: they
+// exist only because a local tree is declared under them, so the view owns that
+// answer and the kernel may keep it.
+func remoteDerived(b backing) bool {
+	return b.kind == sourceRemote || (b.kind == sourceUnion && b.attr.Ino != 0)
 }
 
 // OpendirHandle keeps the real directory inode for listing and fsync. Union
@@ -451,7 +548,7 @@ func (n *Node) OpendirHandle(ctx context.Context, flags uint32) (fs.FileHandle, 
 			return nil, 0, syscall.ESTALE
 		}
 	}
-	h.dir, h.path, h.lay = true, p, n.lay
+	h.dir, h.path, h.lay, h.state = true, p, n.lay, n.state
 	h.overlay = n.state.children[p]
 	return h, 0, 0
 }
@@ -478,20 +575,39 @@ func (h *handle) loadEntries() syscall.Errno {
 			entries[i] = proto.DirEntry{Name: entry.Name(), Mode: mode}
 		}
 	} else if h.rhandle != 0 {
-		resp, err := h.lay.Remote.Do(&proto.FxReq{Op: proto.FxList, Handle: h.rhandle})
-		if err != nil {
-			return errnoFromErr(err)
+		id := dirID{dev: h.base.Dev, ino: h.base.Ino}
+		held, ok := []proto.DirEntry(nil), false
+		// An enumeration result is retained like a resolution: re-reading the
+		// same inode inside its window reuses the result that was obtained
+		// then, and does not restart the window. The key is the inode, not the
+		// path: a directory replaced at this path is another directory, and a
+		// handle answers for the one it opened.
+		if id.ino != 0 {
+			held, ok = h.state.retainedListing(id)
 		}
-		if resp == nil {
-			return syscall.EIO
+		if ok {
+			entries = append([]proto.DirEntry(nil), held...)
+		} else {
+			sent := h.state.beginRequest()
+			resp, err := h.lay.Remote.Do(&proto.FxReq{Op: proto.FxList, Handle: h.rhandle, Path: h.path})
+			if err != nil {
+				return errnoFromErr(err)
+			}
+			if resp == nil {
+				return syscall.EIO
+			}
+			if resp.Errno != 0 {
+				return syscall.Errno(resp.Errno)
+			}
+			if resp.Kind != proto.KDir {
+				return syscall.EIO
+			}
+			entries = append([]proto.DirEntry(nil), resp.Ents...)
+			// The daemon names the directory the listing was read from. When it
+			// cannot confirm that name, no child is filed under a path: the
+			// inode may have been replaced or renamed since the handle opened.
+			h.state.retainListing(id, resp.DirPath, entries, resp.Volatile, sent)
 		}
-		if resp.Errno != 0 {
-			return syscall.Errno(resp.Errno)
-		}
-		if resp.Kind != proto.KDir {
-			return syscall.EIO
-		}
-		entries = resp.Ents
 	}
 	if len(h.overlay) != 0 {
 		positions := make(map[string]int, len(entries)+len(h.overlay))
@@ -571,7 +687,16 @@ func (h *handle) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
 // a loop rely on it: they write, flush, write, flush. Without it the bytes sit
 // in the handle until the file is finally released, and an append that reopens
 // the path in between sees nothing.
+//
+// A descriptor opened without write intent has nothing to make durable, so the
+// implicit sync a close would otherwise send is skipped. Release still closes
+// the daemon descriptor, so locks are released on the real handle either way,
+// and a program's own fsync is unaffected because it arrives as an explicit
+// Fsync rather than through this path.
 func (h *handle) Flush(ctx context.Context) syscall.Errno {
+	if h.readOnlyOpen {
+		return 0
+	}
 	return h.Fsync(ctx, 0)
 }
 
@@ -636,8 +761,12 @@ func (h *handle) Release(ctx context.Context) syscall.Errno {
 	return 0
 }
 
+// writeFlags are the open flags that give a descriptor write intent. A handle
+// opened with none of them has nothing a close-time sync could make durable.
+const writeFlags = uint32(os.O_WRONLY | os.O_RDWR | os.O_TRUNC | os.O_APPEND | os.O_CREATE)
+
 func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	writes := flags&uint32(os.O_WRONLY|os.O_RDWR|os.O_TRUNC|os.O_APPEND|os.O_CREATE) != 0
+	writes := flags&writeFlags != 0
 	p := n.currentPath()
 	switch n.src.kind {
 	case sourceHost:
@@ -655,7 +784,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if err != nil {
 			return nil, 0, errnoFromErr(err)
 		}
-		return &handle{fd: fd, path: p, lay: n.lay, base: n.src.attr, readOnly: n.src.readOnly, appendOnly: flags&uint32(os.O_APPEND) != 0}, 0, 0
+		return &handle{fd: fd, path: p, lay: n.lay, base: n.src.attr, readOnly: n.src.readOnly, readOnlyOpen: !writes, appendOnly: flags&uint32(os.O_APPEND) != 0}, 0, 0
 	case sourceSynthetic:
 		if writes {
 			return nil, 0, syscall.EROFS
@@ -694,7 +823,7 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 func (n *Node) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	h, ok := f.(*handle)
 	if !ok {
-		return fuse.ReadResultData(nil), syscall.EBADF
+		return nil, syscall.EBADF
 	}
 	if h.phantom {
 		return fuse.ReadResultData(nil), 0
@@ -702,25 +831,25 @@ func (n *Node) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64
 	if h.fd != nil {
 		count, err := h.fd.ReadAt(dest, off)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return fuse.ReadResultData(dest[:count]), errnoFromErr(err)
+			return nil, errnoFromErr(err)
 		}
 		return fuse.ReadResultData(dest[:count]), 0
 	}
 	if h.rhandle == 0 {
-		return fuse.ReadResultData(nil), syscall.EBADF
+		return nil, syscall.EBADF
 	}
 	read := 0
 	for read < len(dest) {
 		chunk := min(len(dest)-read, int(proto.MaxIO))
 		resp, err := h.lay.Remote.Do(&proto.FxReq{Op: proto.FxPread, Handle: h.rhandle, Offset: off + int64(read), Size: uint32(chunk)})
 		if err != nil {
-			return fuse.ReadResultData(dest[:read]), errnoFromErr(err)
+			return nil, errnoFromErr(err)
 		}
 		if resp == nil || len(resp.Data) > chunk {
-			return fuse.ReadResultData(dest[:read]), syscall.EIO
+			return nil, syscall.EIO
 		}
 		if resp.Errno != 0 {
-			return fuse.ReadResultData(dest[:read]), syscall.Errno(resp.Errno)
+			return nil, syscall.Errno(resp.Errno)
 		}
 		read += copy(dest[read:], resp.Data)
 		if len(resp.Data) < chunk {
@@ -1147,11 +1276,12 @@ func (n *Node) openRemote(p string, flags uint32, mode uint32) (*handle, uint64,
 		return nil, 0, syscall.EIO
 	}
 	h := &handle{
-		rhandle:    resp.Handle,
-		path:       p,
-		lay:        n.lay,
-		appendOnly: flags&uint32(syscall.O_APPEND) != 0,
-		base:       resp.Attr,
+		rhandle:      resp.Handle,
+		path:         p,
+		lay:          n.lay,
+		appendOnly:   flags&uint32(syscall.O_APPEND) != 0,
+		readOnlyOpen: flags&writeFlags == 0,
+		base:         resp.Attr,
 	}
 	return h, remoteIno(resp.Attr, p), 0
 }
@@ -1185,6 +1315,7 @@ func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
+	n.state.forgetPath(p)
 	return n.newEntry(ctx, p, backing{kind: sourceRemote, attr: h.base}, out), h, fuse.FOPEN_DIRECT_IO, 0
 }
 
@@ -1222,7 +1353,8 @@ func (n *Node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	if errno := n.metaErr(&proto.FxReq{Op: proto.FxMkdir, Path: p, Mode: mode, Arg: strconv.FormatUint(uint64(mode), 10)}); errno != 0 {
 		return nil, errno
 	}
-	attr, errno := n.remoteStat(p)
+	n.state.forgetPath(p)
+	attr, _, _, errno := n.remoteStat(p)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1259,6 +1391,8 @@ func (n *Node) Unlink(ctx context.Context, name string) syscall.Errno {
 			node.mu.Unlock()
 		}
 	}
+	n.state.forgetPath(p)
+	n.state.forgetTree(p)
 	return 0
 }
 
@@ -1294,6 +1428,8 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 			node.mu.Unlock()
 		}
 	}
+	n.state.forgetPath(p)
+	n.state.forgetTree(p)
 	return 0
 }
 
@@ -1328,6 +1464,7 @@ func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 	default:
 		return nil, syscall.EROFS
 	}
+	n.state.forgetPath(p)
 	return n.newEntry(ctx, p, src, out), 0
 }
 
@@ -1374,6 +1511,7 @@ func (n *Node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 		if errno != 0 {
 			return nil, errno
 		}
+		n.state.forgetPath(p)
 		return n.newEntry(ctx, p, backing{kind: sourceRemote, attr: attr}, out), 0
 	default:
 		return nil, syscall.EPERM
@@ -1419,6 +1557,10 @@ func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	default:
 		return syscall.EROFS
 	}
+	n.state.forgetTree(from)
+	n.state.forgetTree(to)
+	n.state.forgetPath(from)
+	n.state.forgetPath(to)
 	n.repoint(moved(name, from, to))
 	return 0
 }
@@ -1438,7 +1580,8 @@ func (n *Node) pathAttr() (proto.Attr, syscall.Errno) {
 		}
 		return attr, 0
 	}
-	return n.remoteStat(n.currentPath())
+	attr, _, _, errno := n.remoteStat(n.currentPath())
+	return attr, errno
 }
 
 func (n *Node) repoint(m moveTarget) {

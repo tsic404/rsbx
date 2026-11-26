@@ -91,11 +91,13 @@ func TestEnsureWorkspaceReturnsWhenSessionIsCancelled(t *testing.T) {
 		close(accepted)
 		go func() {
 			defer c.Close()
-			if _, err := c.Read(make([]byte, 1)); err != nil {
-				return
-			}
+			// The cancellation may land before the client wrote its first
+			// request, so the harness must treat any end of the connection —
+			// an immediate EOF included — as the transport having been closed.
+			// Reading a byte first would turn that ordering into a spurious
+			// "transport was not closed" failure.
+			defer close(closed)
 			_, _ = io.Copy(io.Discard, c)
-			close(closed)
 		}()
 	}()
 	plan, _ := testPlan(t, []string{"/bin/sh"}, nil)
