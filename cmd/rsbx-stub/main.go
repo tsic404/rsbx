@@ -20,8 +20,19 @@ func run() int {
 		return 126
 	}
 	socket := os.Getenv("RSBX_STUB_SOCKET")
-	if socket == "" || !filepath.IsAbs(socket) {
-		fmt.Fprintln(os.Stderr, "rsbx-stub: missing absolute RSBX_STUB_SOCKET (no active sandbox session)")
+	if socket == "" {
+		fmt.Fprintln(os.Stderr, "rsbx-stub: missing absolute RSBX_STUB_SOCKET (no active sandbox session): RSBX_STUB_SOCKET is not set")
+		return 126
+	}
+	if !filepath.IsAbs(socket) {
+		fmt.Fprintf(os.Stderr, "rsbx-stub: missing absolute RSBX_STUB_SOCKET (no active sandbox session): %q is not an absolute path\n", socket)
+		return 126
+	}
+	if info, err := os.Stat(socket); err != nil {
+		fmt.Fprintf(os.Stderr, "rsbx-stub: no live sandbox session at %s: %v\n", socket, err)
+		return 126
+	} else if info.Mode()&os.ModeSocket == 0 {
+		fmt.Fprintf(os.Stderr, "rsbx-stub: no live sandbox session at %s: not a unix socket\n", socket)
 		return 126
 	}
 	dir, err := os.Getwd()

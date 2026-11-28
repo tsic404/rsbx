@@ -53,6 +53,26 @@ func (server *Server) ReverseHandshake(conn net.Conn, payload []byte) {
 		proto.WriteFrame(conn, proto.TErr, []byte(err.Error()))
 		return
 	}
+	created := dir
+	if !filepath.IsAbs(dir) {
+		// The stub accepts only an absolute path, and os.TempDir() passes a
+		// relative TMPDIR through unchanged. A lexical Abs would collapse a
+		// ".." that follows a symlinked component without following that
+		// link, so binding, publishing and cleanup could name a different
+		// directory than the one MkdirTemp created. Resolve against the real
+		// filesystem first, then make the symlink-free result absolute.
+		if dir, err = filepath.EvalSymlinks(dir); err == nil && !filepath.IsAbs(dir) {
+			dir, err = filepath.Abs(dir)
+		}
+		if err != nil {
+			os.RemoveAll(created)
+			proto.WriteFrame(conn, proto.TErr, []byte("resolve stub socket directory: "+err.Error()))
+			return
+		}
+	}
+	// An absolute TMPDIR is already a working name for the directory that was
+	// created, and keeping it verbatim preserves a short alias instead of
+	// expanding it past the unix socket path limit.
 	defer os.RemoveAll(dir)
 	socket := filepath.Join(dir, "session.sock")
 	listener, err := net.Listen("unix", socket)
