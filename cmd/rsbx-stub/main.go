@@ -21,7 +21,11 @@ func run() int {
 	}
 	socket := os.Getenv("RSBX_STUB_SOCKET")
 	if socket == "" {
-		fmt.Fprintln(os.Stderr, "rsbx-stub: missing absolute RSBX_STUB_SOCKET (no active sandbox session): RSBX_STUB_SOCKET is not set")
+		if len(os.Args) == 0 || filepath.Base(os.Args[0]) != "multica" {
+			fmt.Fprintln(os.Stderr, "rsbx-stub: missing absolute RSBX_STUB_SOCKET (no active sandbox session): RSBX_STUB_SOCKET is not set")
+		} else {
+			fmt.Fprintln(os.Stderr, "rsbx-stub is not a general-purpose CLI: RSBX_STUB_SOCKET is only set inside an active rsbx sandbox session; install the real multica CLI at MULTICA_CLI_PATH")
+		}
 		return 126
 	}
 	if !filepath.IsAbs(socket) {

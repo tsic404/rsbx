@@ -72,6 +72,43 @@ func TestRunRefusesWithDistinguishableReasons(t *testing.T) {
 	}
 }
 
+// A CLI path installed as the reverse stub has no session capability in a
+// local agent session. The refusal has to name the installation mistake:
+// telling the caller only that the variable is unset sends the operator to
+// the handshake, where there was no session in the first place.
+func TestRunNamesMisinstalledCLI(t *testing.T) {
+	setStubEnv(t, "", false)
+	code, stderr := runStubWithArgs(t, []string{"/opt/agent/multica", "--help"})
+	if code != 126 {
+		t.Fatalf("exit = %d, want 126 (stderr %q)", code, stderr)
+	}
+	for _, want := range []string{"rsbx-stub is not a general-purpose CLI", "RSBX_STUB_SOCKET", "install the real multica CLI at MULTICA_CLI_PATH"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr %q does not name %q", stderr, want)
+		}
+	}
+}
+
+// A daemon-side forwarding alias is a valid way to install the stub. When its
+// session capability is missing, the reason is the absent capability, not a
+// CLI installation: telling the operator to replace the alias hides the
+// failure the acceptance carrier is checking.
+func TestRunKeepsMissingCapabilityForForwardingAlias(t *testing.T) {
+	setStubEnv(t, "", false)
+	code, stderr := runStubWithArgs(t, []string{"tc17-echo", "PAYLOAD"})
+	if code != 126 {
+		t.Fatalf("exit = %d, want 126 (stderr %q)", code, stderr)
+	}
+	for _, want := range []string{"rsbx-stub: missing absolute RSBX_STUB_SOCKET", "RSBX_STUB_SOCKET is not set"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr %q does not name %q", stderr, want)
+		}
+	}
+	if strings.Contains(stderr, "not a general-purpose CLI") || strings.Contains(stderr, "install the real multica CLI") {
+		t.Errorf("stderr %q wrongly claims a CLI installation mistake", stderr)
+	}
+}
+
 func setStubEnv(t *testing.T, value string, set bool) {
 	t.Helper()
 	prev, had := os.LookupEnv("RSBX_STUB_SOCKET")
@@ -93,12 +130,17 @@ func setStubEnv(t *testing.T, value string, set bool) {
 
 func runStub(t *testing.T) (int, string) {
 	t.Helper()
+	return runStubWithArgs(t, []string{"rsbx-stub", "/usr/bin/true"})
+}
+
+func runStubWithArgs(t *testing.T, args []string) (int, string) {
+	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	oldArgs, oldStderr := os.Args, os.Stderr
-	os.Args = []string{"rsbx-stub", "/usr/bin/true"}
+	os.Args = args
 	os.Stderr = w
 	defer func() {
 		os.Args, os.Stderr = oldArgs, oldStderr
