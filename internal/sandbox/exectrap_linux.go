@@ -103,6 +103,9 @@ type tracer struct {
 	reverseJobs   chan reverseJob
 	reverseSpec   *launchSpec
 	acceptReverse bool
+	// session is the token every command routed to the daemon carries, so the
+	// daemon can announce it to this session's filesystem view.
+	session string
 }
 
 // localTarget reports whether a reverse caller asked for a program the
@@ -254,7 +257,7 @@ func runTraced(spec *launchSpec, server *gatewayServer) (int, error) {
 		reverse := newReverseListener(listener, spec.ReverseToken, jobs)
 		defer reverse.Close()
 	}
-	t := &tracer{policy: policy, server: server, tasks: map[int]*traceTask{}, permits: map[int]scriptPermit{}, decisions: map[int]execDecision{}, signals: make(chan os.Signal, 32), tick: time.NewTicker(time.Millisecond), reverseGroups: map[int]bool{}, reverseStatus: map[int]chan int{}, reverseJobs: jobs}
+	t := &tracer{policy: policy, server: server, tasks: map[int]*traceTask{}, permits: map[int]scriptPermit{}, decisions: map[int]execDecision{}, signals: make(chan os.Signal, 32), tick: time.NewTicker(time.Millisecond), reverseGroups: map[int]bool{}, reverseStatus: map[int]chan int{}, reverseJobs: jobs, session: spec.Session}
 	t.reverseSpec = spec
 	defer t.tick.Stop()
 	signal.Notify(t.signals, forwardedSignals...)
@@ -1120,7 +1123,7 @@ func (t *tracer) intercept(pid int, info traceSyscallInfo) error {
 			}
 			return t.returnExecError(pid, original, unix.EPERM, false, memory)
 		}
-		remote = &proto.ExecReq{Target: target, Argv: in.argv, Env: in.env, Dir: in.cwd}
+		remote = &proto.ExecReq{Target: target, Argv: in.argv, Env: in.env, Dir: in.cwd, Session: t.session}
 		if owned {
 			if err := t.closeInjectedFD(pid, original, fd); err != nil {
 				return err

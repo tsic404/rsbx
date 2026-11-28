@@ -80,7 +80,7 @@ func (s *gatewayServer) Publish(pid int, req *proto.ExecReq) error {
 	}
 	// Bound byte strings and their vector length prefixes before encoding.
 	// The final encoded-size check includes the protocol's fixed fields.
-	size := len(req.Target) + len(req.Dir)
+	size := len(req.Target) + len(req.Dir) + len(req.Session)
 	if size > maxGatewayRequestSize {
 		return fmt.Errorf("gateway request exceeds %d bytes", maxGatewayRequestSize)
 	}

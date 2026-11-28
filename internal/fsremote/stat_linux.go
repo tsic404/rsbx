@@ -5,8 +5,11 @@ package fsremote
 import (
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // Linux-only syscalls: utimensat with a descriptor, and raw fcntl OFD lock
@@ -138,6 +141,35 @@ func readDirHandle(f *os.File) ([]os.DirEntry, error) {
 	df := os.NewFile(uintptr(d), "")
 	defer df.Close()
 	return df.ReadDir(-1)
+}
+
+// statAt stats one child relative to an open directory descriptor. It never
+// resolves the name against the process's working directory, so a child is read
+// from the directory the descriptor holds even after that directory was renamed
+// or replaced at its old path.
+func statAt(f *os.File, name string) (syscall.Stat_t, bool) {
+	fd, err := unix.Openat(int(f.Fd()), name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return syscall.Stat_t{}, false
+	}
+	defer unix.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return syscall.Stat_t{}, false
+	}
+	return st, true
+}
+
+// handleDirPath names the directory a descriptor currently refers to. A listing
+// through a handle must stat its children by the directory's current name, not
+// by the name the caller opened it under: the directory may have been renamed
+// since, and its own entries are still the ones to report.
+func handleDirPath(f *os.File) (string, bool) {
+	target, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(int(f.Fd())))
+	if err != nil || !strings.HasPrefix(target, "/") {
+		return "", false
+	}
+	return target, true
 }
 
 // statTimes returns the native atime, mtime and ctime of a stat, nanoseconds

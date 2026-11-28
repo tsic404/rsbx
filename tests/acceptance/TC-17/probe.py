@@ -42,6 +42,11 @@ def exec_request(target, argv, env, cwd, tty):
     body += struct.pack(">I", len(env))
     for item in env:
         body += string(item)
+    # The exec request ends with the session token, which the daemon uses to
+    # tell a view that a command it runs may change names it retained. These
+    # crafted requests belong to no session, so the token is empty: the same
+    # shape a connection that never sends one produces.
+    body += string("")
     return body
 
 

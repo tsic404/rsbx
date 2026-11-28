@@ -10,6 +10,8 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -28,6 +30,18 @@ import (
 	"rsbx/internal/rpc"
 	"rsbx/internal/workspace"
 )
+
+// sessionToken mints one session's correlation key. It carries no authority:
+// the daemon serves the same tree with or without it. Its only use is letting
+// the daemon tell a session's view that a command the session ran may have
+// changed names the view retained.
+func sessionToken() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
 
 // Reserved sandbox paths. All of them are synthetic in the FUSE layout: the
 // launcher may mount over them, but nothing is ever created in the daemon
@@ -93,6 +107,11 @@ type Plan struct {
 	sessionID  string
 	sessionDir string
 	mountDir   string
+	// sessionToken names this session to the daemon. Every connection the
+	// session opens carries it, so a command the daemon runs on the session's
+	// behalf can be announced to the view that answers for the same session.
+	// It is an opaque correlation key, never an authorization.
+	sessionToken string
 }
 
 // Prepare validates and compiles a session plan without creating a mount or
@@ -154,8 +173,25 @@ func Prepare(cfg *config.Config, exeDir string) (*Plan, error) {
 		Exec:         pol,
 		reverseAllow: reverseAllow,
 	}
+	token, err := sessionToken()
+	if err != nil {
+		return nil, fmt.Errorf("session token: %w", err)
+	}
+	p.sessionToken = token
 	p.Remote = rpc.NewFS(p.Target)
+	p.Remote.SetSession(token)
 	return p, nil
+}
+
+// UseSession adopts the token the controller allocated for this session. The
+// filesystem worker builds its own plan, so it has to take the controller's
+// token rather than mint a second one: otherwise its connections would answer
+// for a session no command of this sandbox belongs to.
+func (p *Plan) UseSession(token string) {
+	p.sessionToken = token
+	if p.Remote != nil {
+		p.Remote.SetSession(token)
+	}
 }
 
 // StartupDiagnostics reports plan hazards a user could not see until a task
@@ -253,7 +289,10 @@ func (p *Plan) EnsureWorkspace(ctx context.Context) error {
 	}()
 	select {
 	case err := <-done:
-		if err != nil && ctx.Err() != nil {
+		if ctx.Err() != nil {
+			// The session ended, so its connection belongs to the session: close
+			// it whether the request failed first or the cancellation did.
+			_ = remote.Close()
 			return context.Cause(ctx)
 		}
 		return err
@@ -360,30 +399,7 @@ func (p *Plan) Layout() *fusefs.Layout {
 // mountRoot is private to the filesystem worker. The controller receives a
 // readiness result, not a server that it can accidentally serve or pivot into.
 func (p *Plan) mountRoot(layout *fusefs.Layout) (*fuse.Server, error) {
-	opts := &fs.Options{
-		MountOptions: fuse.MountOptions{
-			AllowOther:        false,
-			Debug:             os.Getenv("RSBX_FUSE_DEBUG") != "",
-			FsName:            "rsbx",
-			DisableSplice:     true,
-			EnableLocks:       true,
-			ExtraCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP,
-		},
-		// No dentry caching. A negative entry that lasts a moment is enough to
-		// hide a file the same process created microseconds earlier: git makes a
-		// directory, writes an object into it and reads it back, and the kernel
-		// answers the lookup from a cached "not found". Correctness here is worth
-		// the extra lookups, and the tree is remote anyway, so the kernel cache
-		// was never going to save the round trip that mattered.
-		EntryTimeout: durp(0),
-		// The same argument applies to attributes and to the data behind them.
-		// A cached mtime or size is a claim about a file another process may
-		// already have replaced, and a rename the kernel has not invalidated
-		// reads back as the old bytes. Every lookup costs one round trip on a
-		// tree that is remote either way.
-		AttrTimeout:     durp(0),
-		NullPermissions: true,
-	}
+	opts := mountOptions()
 	root := fusefs.NewRoot(layout)
 	if err := root.Err(); err != nil {
 		_ = root.Close()
@@ -398,6 +414,42 @@ func (p *Plan) mountRoot(layout *fusefs.Layout) (*fuse.Server, error) {
 	// fs.Mount already completes INIT and WaitMount. A second probe adds no
 	// readiness guarantee; only this filesystem worker serves the mount.
 	return srv, nil
+}
+
+// mountOptions carries the cache windows the mount serves. They are split out
+// so the numbers a caller observes can be checked without a mount.
+func mountOptions() *fs.Options {
+	return &fs.Options{
+		MountOptions: fuse.MountOptions{
+			AllowOther:        false,
+			Debug:             os.Getenv("RSBX_FUSE_DEBUG") != "",
+			FsName:            "rsbx",
+			DisableSplice:     true,
+			EnableLocks:       true,
+			ExtraCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP,
+		},
+		// The filesystem decides every retention window itself, so both
+		// mount-wide values must stay unset: go-fuse substitutes a mount-wide
+		// value into any reply that leaves the field at zero. A local source is
+		// kept by the kernel for one second. A result that came from the daemon
+		// is retained by the view instead, which drops it when the connection is
+		// lost; the kernel is told nothing for those, so it asks again and the
+		// view answers without a round trip while the result is still valid.
+		// Without the window every component of every path costs a round trip,
+		// and a program that probes its environment during startup loses the
+		// handshake to the resulting latency.
+		EntryTimeout: nil,
+		// Attributes follow the same split as resolutions: the kernel may keep a
+		// local tree's attributes, while a daemon-derived attribute set is kept
+		// by the view and must not survive a disconnect.
+		AttrTimeout: nil,
+		// A missing name is deliberately not remembered. Caching "not found"
+		// would let a program that creates a file and reads it straight back
+		// observe its own earlier negative answer, which is the shape git has
+		// when it writes an object and immediately opens it.
+		NegativeTimeout: durp(0),
+		NullPermissions: true,
+	}
 }
 
 func durp(sec float64) *time.Duration {

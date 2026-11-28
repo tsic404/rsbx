@@ -29,6 +29,12 @@ func readDirHandle(f *os.File) ([]os.DirEntry, error) {
 	return f.ReadDir(-1)
 }
 
+// statAt cannot be expressed portably; callers omit the child attributes when
+// it reports nothing.
+func statAt(*os.File, string) (syscall.Stat_t, bool) { return syscall.Stat_t{}, false }
+
+func handleDirPath(*os.File) (string, bool) { return "", false }
+
 func statTimes(st *syscall.Stat_t) (a, m, c syscall.Timespec) {
 	return st.Atimespec, st.Mtimespec, st.Ctimespec
 }

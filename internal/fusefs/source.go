@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -76,6 +77,62 @@ type mountState struct {
 	links       map[string]string
 	children    map[string][]proto.DirEntry
 	err         error
+
+	// retained holds results the view may answer without the daemon: one entry
+	// per sandbox path, and one listing per enumerated directory. Both are read
+	// only while connected, so a lost connection turns the next query into an
+	// explicit failure instead of a retained answer.
+	cacheMu  sync.Mutex
+	resolved map[string]retainedResult
+	listings map[dirID]retainedListing
+	// dirIDs is the inode each directory path was last confirmed to name, and
+	// the request that confirmed it. A child that travelled with a listing is
+	// answerable only while its parent path still names the directory the
+	// listing was read from, and an answer sent before that confirmation must
+	// not put the older identity back.
+	dirIDs map[string]dirFact
+	// epoch moves forward every time the retained results stop being
+	// answerable. A result is published only under the epoch its request was
+	// sent in, so a reply delivered just before a disconnect cannot refill what
+	// that disconnect dropped.
+	epoch uint64
+	// seq numbers the requests this view has sent. Replies may arrive out of
+	// order, so a fact learned by a later request is not overwritten by a reply
+	// to an earlier one.
+	seq uint64
+}
+
+// dirFact is an inode identity and the request that confirmed it.
+type dirFact struct {
+	id  dirID
+	seq uint64
+}
+
+type retainedResult struct {
+	src   backing
+	until time.Time
+	seq   uint64
+	// parent and prefilled mark a child that came with a directory listing:
+	// it answers for that directory, not for whichever directory the path
+	// names later.
+	parent    dirID
+	prefilled bool
+}
+
+// dirID is a directory's inode identity. Listings are keyed by it rather than
+// by path: a handle answers for the inode it opened, which may have been
+// replaced at that path by another directory with its own children.
+type dirID struct {
+	dev, ino uint64
+}
+
+type retainedListing struct {
+	ents  []proto.DirEntry
+	until time.Time
+	seq   uint64
+	// at is the name the directory had when the listing was taken, so a change
+	// to that name can drop the listing.
+	at string
 }
 
 func newMountState(l *Layout) *mountState {
@@ -84,6 +141,9 @@ func newMountState(l *Layout) *mountState {
 		directories: map[string]bool{"/": true}, synthetic: map[string]uint32{},
 		protected: map[[2]uint64]bool{},
 		links:     map[string]string{}, children: map[string][]proto.DirEntry{},
+		resolved: map[string]retainedResult{},
+		listings: map[dirID]retainedListing{},
+		dirIDs:   map[string]dirFact{},
 	}
 	if l.Local != nil {
 		for _, prefix := range l.Local.Roots() {
@@ -246,6 +306,293 @@ func (s *mountState) route(filename string) route {
 		}
 	}
 	return route{kind: sourceRemote}
+}
+
+// freshness is the generation a daemon request was sent in. A result may be
+// retained only when no invalidation happened in between: the reply may have
+// been produced before that invalidation and delivered after it.
+type freshness struct {
+	epoch uint64
+	// seq orders requests, so a reply to an earlier one cannot replace a fact
+	// that a later one already established.
+	seq uint64
+}
+
+// beginRequest records the generation the caller's request is about to be sent
+// in. Pass the value to the corresponding retain call.
+func (s *mountState) beginRequest() freshness {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.seq++
+	return freshness{epoch: s.epoch, seq: s.seq}
+}
+
+// retainedResolve answers a path from a result the view already holds. Only a
+// result obtained from the daemon is ever stored here; the window starts when
+// that result arrived and a hit never extends it.
+func (s *mountState) retainedResolve(p string) (backing, bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	held, ok := s.resolved[p]
+	if !ok {
+		return backing{}, false
+	}
+	if !time.Now().Before(held.until) {
+		delete(s.resolved, p)
+		return backing{}, false
+	}
+	if held.prefilled {
+		if cur, known := s.dirIDs[path.Dir(p)]; !known || cur.id != held.parent {
+			delete(s.resolved, p)
+			return backing{}, false
+		}
+	}
+	return held.src, true
+}
+
+// retainResolve stores a resolution result. Two replies are never stored: one
+// that says this session established the name, and one produced while a command
+// of this session was running. In both cases the session may delete or rename
+// the name next, so the next query has to reach the daemon.
+//
+// A reply sent before a disconnect belongs to a connection that is gone: it is
+// neither stored nor allowed to change what the current connection has since
+// obtained. Below the lock, a stale generation returns before any write or
+// deletion, so a late reply cannot evict a result that arrived after it.
+func (s *mountState) retainResolve(p string, src backing, created, volatile bool, sent freshness) {
+	if src.kind != sourceRemote && src.kind != sourceUnion {
+		return
+	}
+	now := time.Now()
+	s.cacheMu.Lock()
+	if sent.epoch != s.epoch {
+		s.cacheMu.Unlock()
+		return
+	}
+	if created || volatile {
+		delete(s.resolved, p)
+		s.cacheMu.Unlock()
+		return
+	}
+	if cur, ok := s.resolved[p]; ok && cur.seq > sent.seq {
+		// A reply to an earlier request must not replace what a later one has
+		// already established.
+		s.cacheMu.Unlock()
+		return
+	}
+	s.resolved[p] = retainedResult{src: src, until: now.Add(EntryRetention), seq: sent.seq}
+	if kind(src.attr.Mode) == proto.SIFDIR && src.attr.Ino != 0 {
+		s.confirmDirLocked(p, dirID{dev: src.attr.Dev, ino: src.attr.Ino}, sent.seq)
+	}
+	s.pruneLocked(now)
+	s.cacheMu.Unlock()
+}
+
+func (s *mountState) forgetResolve(p string) {
+	s.cacheMu.Lock()
+	delete(s.resolved, p)
+	s.cacheMu.Unlock()
+}
+
+// forgetPath drops the retained result for one name and the retained listing of
+// its parent: the session just changed that entry through the view, so the next
+// query must show the change rather than a result obtained before it.
+func (s *mountState) forgetPath(p string) {
+	s.cacheMu.Lock()
+	delete(s.resolved, p)
+	s.forgetListingLocked(path.Dir(p))
+	s.cacheMu.Unlock()
+}
+
+// forgetTree drops retained results at or below p, for a renamed or removed
+// directory whose children are addressed through the old prefix.
+func (s *mountState) forgetTree(p string) {
+	s.cacheMu.Lock()
+	for name := range s.resolved {
+		if name == p || strings.HasPrefix(name, p+"/") {
+			delete(s.resolved, name)
+		}
+	}
+	for id, held := range s.listings {
+		if held.at == p || strings.HasPrefix(held.at, p+"/") {
+			delete(s.listings, id)
+		}
+	}
+	s.cacheMu.Unlock()
+}
+
+// retainedListing answers a directory enumeration for the inode the handle
+// opened. A listing is a single result: reusing it does not restart its window.
+func (s *mountState) retainedListing(id dirID) ([]proto.DirEntry, bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	held, ok := s.listings[id]
+	if !ok {
+		return nil, false
+	}
+	if !time.Now().Before(held.until) {
+		delete(s.listings, id)
+		return nil, false
+	}
+	return held.ents, true
+}
+
+// retainListing stores one enumeration for the inode it was read from, together
+// with the child attributes that travelled with it. Every stored child shares
+// the listing's expiry, so a later lookup of a listed child neither asks the
+// daemon nor starts a new window.
+//
+// Path-keyed child results are stored only when the daemon confirmed that the
+// path the caller named still holds the listed inode: a listing taken through a
+// handle describes the inode that handle opened, which another directory may
+// have replaced at that path. Names whose creation the daemon attributed to
+// this session are skipped, as is any name the local overlay covers: only a
+// positive answer that still belongs to the daemon may be reused. A listing
+// produced while a session command ran is not stored at all: that command may
+// change any of the children next.
+func (s *mountState) retainListing(id dirID, at string, ents []proto.DirEntry, volatile bool, sent freshness) {
+	until := time.Now().Add(EntryRetention)
+	kept := append([]proto.DirEntry(nil), ents...)
+	s.cacheMu.Lock()
+	if sent.epoch != s.epoch {
+		// A reply from a connection that is gone neither stores its listing nor
+		// removes what the current connection has already obtained.
+		s.cacheMu.Unlock()
+		return
+	}
+	if volatile {
+		delete(s.listings, id)
+		if at != "" {
+			s.forgetListingLocked(at)
+		}
+		s.cacheMu.Unlock()
+		return
+	}
+	if at != "" {
+		covered := make(map[string]bool, len(s.children[at]))
+		for _, entry := range s.children[at] {
+			covered[entry.Name] = true
+		}
+		for _, entry := range kept {
+			if entry.Created || covered[entry.Name] || entry.Attr.Ino == 0 {
+				continue
+			}
+			child := path.Join(at, entry.Name)
+			// The listing describes the daemon's tree, but not every name below
+			// that path belongs to it in this view: a declared local tree, an
+			// asset or a mount point keeps its own source. Filing the daemon's
+			// answer for such a name would answer the next lookup with remote
+			// attributes before the route is consulted.
+			switch s.route(child).kind {
+			case sourceRemote, sourceUnion:
+			default:
+				continue
+			}
+			if cur, exists := s.resolved[child]; exists && cur.seq > sent.seq {
+				continue
+			}
+			s.resolved[child] = retainedResult{
+				src:       backing{kind: sourceRemote, attr: entry.Attr},
+				until:     until,
+				seq:       sent.seq,
+				parent:    id,
+				prefilled: true,
+			}
+		}
+	}
+	if cur, ok := s.listings[id]; !ok || cur.seq <= sent.seq {
+		s.listings[id] = retainedListing{ents: kept, until: until, seq: sent.seq, at: at}
+	}
+	if at != "" {
+		s.confirmDirLocked(at, id, sent.seq)
+	}
+	s.pruneLocked(time.Now())
+	s.cacheMu.Unlock()
+}
+
+// pruneLocked drops expired entries once a session has touched enough paths
+// that the maps would otherwise keep growing with results nobody reads again.
+func (s *mountState) pruneLocked(now time.Time) {
+	if len(s.resolved) > 4096 {
+		for p, held := range s.resolved {
+			if !now.Before(held.until) {
+				delete(s.resolved, p)
+			}
+		}
+	}
+	if len(s.listings) > 512 {
+		for p, held := range s.listings {
+			if !now.Before(held.until) {
+				delete(s.listings, p)
+			}
+		}
+	}
+}
+
+// forgetListing drops every enumeration taken at dir, for a change the view
+// made to its children. Listings are keyed by inode, so the name is matched
+// against the name each listing was taken under.
+func (s *mountState) forgetListing(dir string) {
+	s.cacheMu.Lock()
+	s.forgetListingLocked(dir)
+	s.cacheMu.Unlock()
+}
+
+func (s *mountState) forgetListingLocked(dir string) {
+	// A listing read from a handle whose name the daemon could not confirm has
+	// no path, so no path change can make it stale.
+	if dir == "" {
+		return
+	}
+	for id, held := range s.listings {
+		if held.at == dir {
+			delete(s.listings, id)
+		}
+	}
+}
+
+// invalidate drops every retained result and moves the generation forward. It
+// runs when the daemon connection is lost: a retained answer must not outlive
+// the connection it came from, or a disconnected session would keep reporting
+// that remote paths still exist. Moving the generation under the same lock is
+// what keeps a reply delivered just before the loss from being stored after it.
+func (s *mountState) invalidate() {
+	s.cacheMu.Lock()
+	s.epoch++
+	s.resolved = map[string]retainedResult{}
+	s.listings = map[dirID]retainedListing{}
+	s.dirIDs = map[string]dirFact{}
+	s.cacheMu.Unlock()
+}
+
+// confirmDirLocked records that this path names id, unless a later request has
+// already established a newer fact. A listing delivered late must not put the
+// directory it was read from back over a replacement the view has since
+// resolved.
+func (s *mountState) confirmDirLocked(p string, id dirID, seq uint64) {
+	if cur, ok := s.dirIDs[p]; ok && cur.seq > seq {
+		return
+	}
+	s.dirIDs[p] = dirFact{id: id, seq: seq}
+}
+
+// forgetNames drops the answers for the names a command of this session
+// changed. Only those names leave the cache: the command reported them, so no
+// other name is affected.
+func (s *mountState) forgetNames(names []string) {
+	s.cacheMu.Lock()
+	for _, p := range names {
+		delete(s.resolved, p)
+		delete(s.dirIDs, p)
+		s.forgetListingLocked(p)
+		s.forgetListingLocked(path.Dir(p))
+		for held := range s.resolved {
+			if strings.HasPrefix(held, p+"/") {
+				delete(s.resolved, held)
+			}
+		}
+	}
+	s.cacheMu.Unlock()
 }
 
 func (s *mountState) resolveHost(filename string, r route) (*hostObject, bool, error) {

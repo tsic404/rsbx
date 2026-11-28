@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -252,9 +253,20 @@ func TestLookupSourceNeverSwitchesAfterReplacement(t *testing.T) {
 	if err != nil || string(got) != "replacement" {
 		t.Fatalf("identity check ran after truncating replacement: %q, %v", got, err)
 	}
+	// Inside the retention window the view still describes the inode it
+	// resolved, which is the old one: that is a retained answer, not a switch
+	// to the replacement. Once the window has passed the identity check runs
+	// and reports the replacement as ESTALE.
 	var attr fuse.AttrOut
+	if errno := node.Getattr(context.Background(), nil, &attr); errno != 0 {
+		t.Fatalf("old inode stat inside the window = %v", errno)
+	}
+	if want := node.StableAttr().Ino; attr.Ino != want {
+		t.Fatalf("the old node reported inode %d inside the window, want the one it resolved (%d)", attr.Ino, want)
+	}
+	time.Sleep(EntryRetention + 150*time.Millisecond)
 	if errno := node.Getattr(context.Background(), nil, &attr); errno != syscall.ESTALE {
-		t.Fatalf("old inode stat = %v, want ESTALE", errno)
+		t.Fatalf("old inode stat after the window = %v, want ESTALE", errno)
 	}
 }
 

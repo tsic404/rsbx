@@ -79,6 +79,11 @@ type launchSpec struct {
 	// local commands and turn the allowlist into a general exec service.
 	ReverseToken string   `json:"reverse_token"`
 	ReverseAllow []string `json:"reverse_allow"`
+
+	// Session names this sandbox session to the daemon. Every command routed to
+	// the daemon carries it, so the daemon can announce that command to the
+	// view that answers for the same session. It grants nothing on its own.
+	Session string `json:"session"`
 }
 
 // MaybeRunLauncher checks whether this process is the reexecuted launcher
@@ -832,6 +837,7 @@ func (p *Plan) launchSpec(argv []string, b *broker) (*launchSpec, error) {
 		UnshareUser: p.Cfg.Sandbox.UnshareUser,
 		UID:         os.Getuid(),
 		GID:         os.Getgid(),
+		Session:     p.sessionToken,
 	}
 	if p.Exec != nil {
 		spec.LocalAllow = p.Exec.ExecPaths()

@@ -152,6 +152,20 @@ type FS struct {
 	wmu       sync.Mutex
 	next      uint32
 	pending   map[uint32]chan fxResult
+	// onForget runs with the names the daemon says are no longer answerable.
+	onForget []func([]string)
+	// onLost runs when the current connection dies. The filesystem view uses it
+	// to stop answering from retained results the moment the daemon is gone,
+	// instead of serving them until the next request happens to fail.
+	onLost []func()
+	// session names the session this client belongs to. Every connection sends
+	// it before its first request, so the daemon can announce that session's
+	// command starts to the views that answer for it.
+	session string
+	// epoch is the newest mutation epoch this client has adopted. A reply
+	// stamped with an older one was produced before a command the view has
+	// already been told about, so it is not retainable.
+	epoch     uint64
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -173,6 +187,23 @@ const connectionCauseWait = 200 * time.Millisecond
 func NewFS(t Target) *FS {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &FS{dial: t.DialContext, ctx: ctx, cancel: cancel, pending: make(map[uint32]chan fxResult)}
+}
+
+// OnLost registers fn to run whenever a live connection is lost. Callbacks run
+// after the client's lock is released, so they may call back into the client.
+func (c *FS) OnLost(fn func()) {
+	c.mu.Lock()
+	c.onLost = append(c.onLost, fn)
+	c.mu.Unlock()
+}
+
+// SetSession names the session this client belongs to. It must be called
+// before the first request; the token is an opaque correlation key, never an
+// authorization.
+func (c *FS) SetSession(token string) {
+	c.mu.Lock()
+	c.session = token
+	c.mu.Unlock()
 }
 
 // Do performs one filesystem request.
@@ -220,6 +251,7 @@ func (c *FS) Do(req *proto.FxReq) (*proto.FxResp, error) {
 			return nil, res.err
 		}
 		resp := res.resp
+		c.markStale(resp)
 		if resp.Kind == proto.KErr || resp.Errno != 0 {
 			errno := syscall.Errno(resp.Errno)
 			if errno == 0 {
@@ -228,6 +260,19 @@ func (c *FS) Do(req *proto.FxReq) (*proto.FxResp, error) {
 			return resp, errno
 		}
 		return resp, nil
+	}
+}
+
+// markStale refuses to let the view retain a reply produced before a command
+// the client has already been told about. The daemon stamps each reply with the
+// epoch its operation started under; a lower epoch means the session's tree may
+// have changed since.
+func (c *FS) markStale(resp *proto.FxResp) {
+	c.mu.Lock()
+	epoch := c.epoch
+	c.mu.Unlock()
+	if resp.Epoch < epoch {
+		resp.Volatile = true
 	}
 }
 
@@ -281,6 +326,26 @@ func (c *FS) register() (chan fxResult, uint32, net.Conn, uint64, error) {
 			c.mu.Unlock()
 			return nil, 0, nil, 0, fmt.Errorf("rsbx: connect to daemon: %w", err)
 		}
+		session := c.session
+		c.mu.Unlock()
+		// The session frame must precede the first request on this connection,
+		// so it is written under the same lock request writers take before the
+		// connection becomes visible to them.
+		if session != "" {
+			c.wmu.Lock()
+			werr := proto.WriteFrame(conn, proto.TSession, proto.SessionPayload(session))
+			c.wmu.Unlock()
+			if werr != nil {
+				conn.Close()
+				return nil, 0, nil, 0, fmt.Errorf("rsbx: open session connection: %w", werr)
+			}
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			conn.Close()
+			return nil, 0, nil, 0, net.ErrClosed
+		}
 		c.conn = conn
 		c.gen++
 		go c.readLoop(conn, c.gen)
@@ -309,6 +374,13 @@ func (c *FS) readLoop(conn net.Conn, gen uint64) {
 			c.dropConn(conn, gen, err)
 			return
 		}
+		if f.Type == proto.TInvalidate {
+			epoch, names, derr := proto.DecodeInvalidate(f.Payload)
+			if derr == nil {
+				c.adoptEpoch(epoch, names)
+			}
+			continue
+		}
 		if f.Type != proto.TFxResp {
 			continue
 		}
@@ -327,6 +399,35 @@ func (c *FS) readLoop(conn net.Conn, gen uint64) {
 		if ch != nil {
 			ch <- fxResult{resp: resp}
 		}
+	}
+}
+
+// OnForget registers fn to run with the names the daemon reports as changed by
+// one of this session's commands. Only those names leave the view's cache; a
+// command that changed nothing reports none.
+func (c *FS) OnForget(fn func([]string)) {
+	c.mu.Lock()
+	c.onForget = append(c.onForget, fn)
+	c.mu.Unlock()
+}
+
+// adoptEpoch records a mutation epoch announced by the daemon. Replies produced
+// before it are marked volatile when they arrive, so they are not retained; the
+// view keeps what it already holds, because a command that changed nothing must
+// not cost the answers of names it never touched. The names that did change are
+// dropped by their own callback.
+func (c *FS) adoptEpoch(epoch uint64, names []string) {
+	c.mu.Lock()
+	if epoch > c.epoch {
+		c.epoch = epoch
+	}
+	callbacks := append([]func([]string){}, c.onForget...)
+	c.mu.Unlock()
+	if len(names) == 0 {
+		return
+	}
+	for _, fn := range callbacks {
+		fn(names)
 	}
 }
 
@@ -357,11 +458,18 @@ func (c *FS) dropConn(conn net.Conn, gen uint64, cause error) {
 	}
 	c.conn = nil
 	c.gen++
+	// The next connection starts from whatever epoch its session reports; the
+	// retained results this one answered for are already being dropped.
+	c.epoch = 0
 	for id, ch := range c.pending {
 		delete(c.pending, id)
 		ch <- fxResult{err: fmt.Errorf("rsbx: filesystem connection lost: %w", cause)}
 	}
+	lost := append([]func(){}, c.onLost...)
 	c.mu.Unlock()
+	for _, fn := range lost {
+		fn()
+	}
 	conn.Close()
 }
 
